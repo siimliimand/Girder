@@ -101,6 +101,7 @@ class ModelRole(BaseModel):
     max_output_tokens: int = 4096
     price_in_per_mtok: float = 0.0
     price_out_per_mtok: float = 0.0
+    base_url: str | None = None  # override the provider default endpoint; None = provider default
 
     @property
     def price_in_per_tok(self) -> float:
@@ -111,8 +112,24 @@ class ModelRole(BaseModel):
         return self.price_out_per_mtok / 1_000_000
 
 
+class SpecsConfig(BaseModel):
+    """Spec engine source (impl-plan §6.9/R7): shell out to the openspec CLI
+    instead of the native generator when cli is true."""
+
+    cli: bool = False
+    cli_bin: str = "openspec"
+
+
+class WebConfig(BaseModel):
+    """Approval web UI bind address (impl-plan §10): loopback-only by default."""
+
+    host: str = "127.0.0.1"
+    port: int = 8787
+
+
 class ModelsConfig(BaseModel):
     roles: list[ModelRole] = Field(default_factory=list)
+    request_timeout_s: float = 300.0  # per-call HTTP timeout
 
     @model_validator(mode="after")
     def _check_tiers(self) -> ModelsConfig:
@@ -159,6 +176,8 @@ class Settings(BaseSettings):
     github: GithubConfig = Field(default_factory=GithubConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    specs: SpecsConfig = Field(default_factory=SpecsConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
 
     def __repr__(self) -> str:  # pragma: no cover - defensive, exercised in tests
         # Settings holds no secrets, but keep the habit: repr never grows a

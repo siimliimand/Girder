@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from girder import __version__
+from girder.api.app import create_app
 from girder.config import Settings, load_secrets, load_settings
 from girder.db.engine import Database, default_migrations_dir
 from girder.gitops.worktree import DEFAULT_BASE
@@ -80,6 +81,24 @@ async def cmd_gc(args: argparse.Namespace) -> int:
         await db.close()
 
 
+async def cmd_web(args: argparse.Namespace) -> int:
+    """Serve the approval web console (impl-plan §10) until interrupted."""
+    import uvicorn
+
+    settings = load_settings()
+    app = create_app(
+        db_path=Path(args.db),
+        settings=settings,
+        migrations_dir=Path(args.migrations_dir) if args.migrations_dir else None,
+    )
+    host = args.host if args.host is not None else settings.web.host
+    port = args.port if args.port is not None else settings.web.port
+    log.info("girder web listening on http://%s:%s (db=%s)", host, port, args.db)
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+    return 0
+
+
 async def cmd_daemon(args: argparse.Namespace) -> int:
     settings = load_settings()
     db = await _open_db(args)
@@ -129,6 +148,13 @@ def main(argv: list[str] | None = None) -> int:
     gc_parser = sub.add_parser("gc", help="run the worktree garbage collector")
     gc_parser.add_argument("--once", action="store_true", help="single pass instead of a loop")
     sub.add_parser("daemon", help="run the orchestrator daemon (recovery + GC loop)")
+    web_parser = sub.add_parser("web", help="serve the approval web console (impl-plan §10)")
+    web_parser.add_argument(
+        "--host", default=None, help="bind address (default: settings.web.host)"
+    )
+    web_parser.add_argument(
+        "--port", type=int, default=None, help="bind port (default: settings.web.port)"
+    )
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -147,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         "recover": cmd_recover,
         "gc": cmd_gc,
         "daemon": cmd_daemon,
+        "web": cmd_web,
     }
     try:
         return asyncio.run(handlers[args.command](args))

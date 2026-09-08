@@ -1,0 +1,25 @@
+{# Project list + create form (impl-plan §10). #}
+{% extends "base.html" %}
+{% block content %}
+<h1>Projects</h1>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="/api/projects">
+  <label>Name <input type="text" name="name" value="{{ form.name if form else '' }}" required></label>
+  <label>Repo path <input type="text" name="repo_path" value="{{ form.repo_path if form else '' }}" required></label>
+  <button type="submit">Create project</button>
+</form>
+<table>
+  <thead><tr><th>Name</th><th>Repo path</th><th>Autonomy tier</th></tr></thead>
+  <tbody>
+  {% for p in projects %}
+    <tr>
+      <td><a href="/projects/{{ p.id }}">{{ p.name }}</a></td>
+      <td><code>{{ p.repo_path }}</code></td>
+      <td>T{{ p.autonomy_tier }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="3">No projects yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

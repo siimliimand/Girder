@@ -1,0 +1,28 @@
+{# Project detail: runs table + new-run form (impl-plan §10). #}
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ project.name }}</h1>
+<p>Repo: <code>{{ project.repo_path }}</code></p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<h2>New run</h2>
+<form method="post" action="/api/projects/{{ project.id }}/runs">
+  <label>Intent<br><textarea name="intent" rows="4" cols="80" required></textarea></label><br>
+  <button type="submit">Create run</button>
+</form>
+<h2>Runs</h2>
+<table>
+  <thead><tr><th>Run</th><th>Status</th><th>Branch</th><th>Spec</th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td><a href="/runs/{{ r.id }}"><code>{{ r.id[:8] }}</code></a></td>
+      <td><span class="badge badge-{{ r.status.value }}">{{ r.status.value }}</span></td>
+      <td><code>{{ r.branch }}</code></td>
+      <td>{% if r.spec_hash %}<code>{{ r.spec_hash[:12] }}</code>{% else %}—{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4">No runs yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

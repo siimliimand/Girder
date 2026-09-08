@@ -148,3 +148,44 @@ def test_load_secrets_permissive_warns_but_loads(
     assert str(f) in warnings[0].getMessage()
     assert "644" in warnings[0].getMessage()
     assert "chmod 600" in warnings[0].getMessage()
+
+
+def test_specs_and_web_defaults(tmp_path: Path) -> None:
+    settings = load_settings(start_dir=tmp_path)
+    assert settings.specs.cli is False
+    assert settings.specs.cli_bin == "openspec"
+    assert settings.web.host == "127.0.0.1"  # impl-plan §10: loopback bind
+    assert settings.web.port == 8787
+
+
+def test_model_role_base_url_defaults_to_none() -> None:
+    from girder.config import ModelRole
+
+    r = ModelRole(role="tier1", provider="openrouter", model="m")
+    assert r.base_url is None
+
+
+def test_models_config_accepts_request_timeout_s() -> None:
+    from girder.config import ModelsConfig
+
+    cfg = ModelsConfig(request_timeout_s=12.5)
+    assert cfg.request_timeout_s == 12.5
+
+
+def test_toml_roundtrips_specs_web_and_base_url(tmp_path: Path) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text(
+        "[web]\nport = 9000\n"
+        "[[models.roles]]\n"
+        'role = "tier1"\nprovider = "openrouter"\nmodel = "a"\n'
+        'base_url = "http://localhost:9999/v1"\n'
+        "[[models.roles]]\n"
+        'role = "tier2"\nprovider = "openrouter"\nmodel = "b"\n'
+        "[[models.roles]]\n"
+        'role = "tier3"\nprovider = "openrouter"\nmodel = "c"\n'
+    )
+    settings = load_settings(config_path=cfg)
+    assert settings.web.port == 9000
+    assert settings.web.host == "127.0.0.1"  # untouched key keeps default
+    assert len(settings.models.roles) == 3
+    assert settings.models.roles[0].base_url == "http://localhost:9999/v1"

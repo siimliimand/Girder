@@ -230,6 +230,7 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         ("spec_pending", "spec_approved"),
         ("spec_pending", "failed"),
         ("spec_pending", "aborted"),
+        ("spec_pending", "budget_exhausted"),
         ("spec_approved", "baseline_running"),
         ("spec_approved", "aborted"),
         ("baseline_running", "active"),
@@ -384,3 +385,17 @@ async def test_transition_is_atomic_crash_between_statements(db, monkeypatch) ->
     assert fresh is not None and fresh.status == RunStatus.DRAFT  # neither landed
     events = await db.fetchall("SELECT * FROM agent_events WHERE event_type='state_transition'")
     assert len(events) == 0
+
+
+async def test_spec_pending_may_go_budget_exhausted(db) -> None:  # type: ignore[no-untyped-def]
+    """Spec generation is spend-bearing (plan.md §5.1 'any spend-bearing')."""
+    _, run, _, _, _ = await _seed(db)
+    await _force_status(db, "runs", run.id, RunStatus.SPEC_PENDING.value)
+    new = await transition_run(db, run.id, RunStatus.BUDGET_EXHAUSTED)
+    assert new == "budget_exhausted"
+
+
+async def test_draft_cannot_go_budget_exhausted(db) -> None:  # type: ignore[no-untyped-def]
+    _, run, _, _, _ = await _seed(db)
+    with pytest.raises(InvalidTransition, match="draft -> budget_exhausted"):
+        await transition_run(db, run.id, RunStatus.BUDGET_EXHAUSTED)

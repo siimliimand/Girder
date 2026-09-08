@@ -1,0 +1,81 @@
+{# Pollable run-panel fragment (impl-plan §10). Standalone — no base.html.
+
+data-poll="true" only while status is spec_pending AND no proposal AND no
+generation-failure event: the run.html inline script polls every 2s until the
+attribute disappears.
+#}
+<div data-poll="{{ 'true' if poll else 'false' }}">
+  <p>
+    Status: <span class="badge badge-{{ run.status.value }}">{{ run.status.value }}</span>
+    {% if run.spec_hash %}
+      | frozen <span class="badge badge-frozen">frozen</span>
+      <code>{{ run.spec_hash[:12] }}</code>
+    {% endif %}
+    | branch <code>{{ run.branch }}</code>
+  </p>
+  <p>Intent: {{ run.intent }}</p>
+
+  <div class="spend">
+    Spend: ${{ '%.4f'|format(spend.spend_usd) }} /
+    ${{ '%.2f'|format(spend.cap) }} cap
+    (projected ${{ '%.4f'|format(spend.projected_spend_usd) }})
+  </div>
+
+  {% if generation_error %}
+    <p class="error">Generation failed ({{ generation_error.ts }}):
+      {{ generation_error.payload.error }}</p>
+  {% endif %}
+
+  {% if errors %}
+    <ul class="error">
+      {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+  {% endif %}
+
+  {% if run.proposal_md %}
+    <h2>Proposal</h2>
+    <pre>{{ run.proposal_md }}</pre>
+  {% elif poll %}
+    <p class="muted">Generating proposal…</p>
+  {% else %}
+    <p class="muted">No proposal.</p>
+  {% endif %}
+
+  {% if run.status.value == "spec_pending" %}
+    <div class="actions">
+      <form method="post" action="/api/runs/{{ run.id }}/approve">
+        <button type="submit">Approve</button>
+      </form>
+      <form method="post" action="/api/runs/{{ run.id }}/edit">
+        <label>Edit proposal<br>
+          <textarea name="proposal" rows="12" cols="80">{{ run.proposal_md if run.proposal_md else '' }}</textarea>
+        </label><br>
+        <button type="submit">Save</button>
+      </form>
+      <form method="post" action="/api/runs/{{ run.id }}/regenerate">
+        <label>Feedback (optional)
+          <input type="text" name="feedback">
+        </label>
+        <button type="submit">Regenerate</button>
+      </form>
+    </div>
+  {% endif %}
+
+  {% if usage %}
+    <h2>Token usage</h2>
+    <table>
+      <thead><tr><th>Role</th><th>Model</th><th>Prompt</th><th>Completion</th><th>Cost</th></tr></thead>
+      <tbody>
+      {% for u in usage %}
+        <tr>
+          <td>{{ u.model_role }}</td>
+          <td>{{ u.model_id }}</td>
+          <td>{{ u.prompt_tokens }}</td>
+          <td>{{ u.completion_tokens }}</td>
+          <td>${{ '%.4f'|format(u.cost_usd) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>

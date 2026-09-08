@@ -26,8 +26,17 @@ _TABLE = {"run": "runs", "task": "tasks", "attempt": "attempts"}
 # Run states (impl-plan §5.1). Terminal: merged / failed / aborted.
 _RUN_EDGES: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.DRAFT: frozenset({RunStatus.SPEC_PENDING, RunStatus.ABORTED}),
+    # spec_pending is spend-bearing (generation calls the model), so the
+    # BudgetGuard tripwire routes it to budget_exhausted (plan.md §5.1);
+    # Sprint 1 omitted the edge because nothing spent money yet.
     RunStatus.SPEC_PENDING: frozenset(
-        {RunStatus.SPEC_PENDING, RunStatus.SPEC_APPROVED, RunStatus.FAILED, RunStatus.ABORTED}
+        {
+            RunStatus.SPEC_PENDING,
+            RunStatus.SPEC_APPROVED,
+            RunStatus.FAILED,
+            RunStatus.ABORTED,
+            RunStatus.BUDGET_EXHAUSTED,
+        }
     ),
     RunStatus.SPEC_APPROVED: frozenset({RunStatus.BASELINE_RUNNING, RunStatus.ABORTED}),
     RunStatus.BASELINE_RUNNING: frozenset(

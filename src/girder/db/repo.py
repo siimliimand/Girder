@@ -44,6 +44,8 @@ _RUN_WRITABLE_FIELDS = frozenset(
         "projected_spend_usd",
         "baseline_run_id",
         "pr_number",
+        "proposal_md",
+        "branch",
         "integrity_violations",
     }
 )
@@ -168,6 +170,7 @@ def _row_to_run(r: Row) -> Run:
         projected_spend_usd=r["projected_spend_usd"],
         baseline_run_id=r["baseline_run_id"],
         pr_number=r["pr_number"],
+        proposal_md=r["proposal_md"],
         integrity_violations=r["integrity_violations"],
     )
 
@@ -199,6 +202,57 @@ async def add_spend(db: Database, run_id: str, actual_delta: float, projected_to
             " updated_at = ? WHERE id = ?",
             (actual_delta, projected_total, utcnow_iso(), run_id),
         )
+
+
+# ------------------------------------------------------------------ token usage
+
+
+async def insert_token_usage(
+    db: Database,
+    *,
+    run_id: str | None,
+    attempt_id: str | None,
+    model_role: str,
+    model_id: str,
+    estimated_before_call: float,
+) -> int:
+    """Pre-dispatch estimate row (impl-plan §6.8 step 2): state is persisted
+    before the model call goes out; actuals overwrite it in reconcile."""
+    cur = await db.execute(
+        "INSERT INTO token_usage (attempt_id, run_id, model_role, model_id,"
+        " prompt_tokens, completion_tokens, cost_usd, estimated_before_call, created_at)"
+        " VALUES (?, ?, ?, ?, 0, 0, 0.0, ?, ?)",
+        (attempt_id, run_id, model_role, model_id, estimated_before_call, utcnow_iso()),
+    )
+    await db.conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+async def update_token_usage_actual(
+    db: Database,
+    usage_id: int,
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cost_usd: float,
+) -> None:
+    """Reconcile a pre-dispatch estimate row with the call's actual usage."""
+    await db.execute(
+        "UPDATE token_usage SET prompt_tokens = ?, completion_tokens = ?, cost_usd = ?"
+        " WHERE id = ?",
+        (prompt_tokens, completion_tokens, cost_usd, usage_id),
+    )
+    await db.conn.commit()
+
+
+async def list_token_usage_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetchall(
+        "SELECT id, run_id, attempt_id, model_role, model_id, prompt_tokens,"
+        " completion_tokens, cost_usd, estimated_before_call, created_at"
+        " FROM token_usage WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    return [dict(r) for r in rows]
 
 
 # ------------------------------------------------------------------------ waves
@@ -544,3 +598,27 @@ async def insert_integrity_violation(
             " (SELECT project_id FROM runs WHERE id = ?)",
             (utcnow_iso(), run_id),
         )
+
+
+# ------------------------------------------------------- web console (§10)
+
+
+async def list_runs_for_project(db: Database, project_id: str) -> list[Run]:
+    rows = await db.fetchall(
+        "SELECT * FROM runs WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
+    )
+    return [_row_to_run(r) for r in rows]
+
+
+async def get_latest_event(
+    db: Database, run_id: str, event_type: str
+) -> dict[str, Any] | None:
+    """Most recent event of *event_type* for a run, as {payload, ts}."""
+    r = await db.fetchone(
+        "SELECT payload_json, ts FROM agent_events WHERE run_id = ? AND event_type = ?"
+        " ORDER BY id DESC LIMIT 1",
+        (run_id, event_type),
+    )
+    if r is None:
+        return None
+    return {"payload": json.loads(r["payload_json"]), "ts": r["ts"]}

@@ -149,6 +149,7 @@ class Run:
     projected_spend_usd: float = 0.0
     baseline_run_id: str | None = None
     pr_number: int | None = None
+    proposal_md: str | None = None
     integrity_violations: int = 0
 
 

@@ -1,0 +1,34 @@
+{# Run detail page (impl-plan §10). Includes the pollable panel fragment.
+
+Polling is plain-vanilla JS re-fetching /runs/{id}/panel every 2s while the
+fragment carries data-poll="true"; HTMX/SSE replace this in the Sprint 6
+console. No CDN assets are used.
+#}
+{% extends "base.html" %}
+{% block content %}
+<h1>Run <code>{{ run.id[:8] }}</code></h1>
+<p>Project: <a href="/projects/{{ project.id }}">{{ project.name }}</a></p>
+<div id="run-panel">
+  {% include "_run_panel.html" %}
+</div>
+<script>
+(function () {
+  var el = document.getElementById("run-panel");
+  var timer = null;
+  function tick() {
+    fetch("/runs/{{ run.id }}/panel")
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        el.innerHTML = html;
+        if (html.indexOf('data-poll="true"') === -1 && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      });
+  }
+  if (document.querySelector('[data-poll="true"]') && !timer) {
+    timer = setInterval(tick, 2000);
+  }
+})();
+</script>
+{% endblock %}

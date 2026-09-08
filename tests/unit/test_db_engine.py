@@ -16,7 +16,7 @@ async def test_fresh_boot_applies_all_migrations(tmp_path: Path) -> None:
     try:
         rows = await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         versions = [r["version"] for r in rows]
-        assert versions == [1, 2, 3, 4, 5, 6, 7]
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         # every table from the DDL exists
         for table in (
             "projects",
@@ -41,6 +41,13 @@ async def test_fresh_boot_applies_all_migrations(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
             )
             assert r is not None, f"missing table {table}"
+
+        # Sprint 2 columns landed by 008/009 (plan.md Phase 1).
+        run_cols = {r["name"] for r in await db.fetchall("PRAGMA table_info(runs)")}
+        usage_cols = {r["name"] for r in await db.fetchall("PRAGMA table_info(token_usage)")}
+        assert "proposal_md" in run_cols
+        assert "run_id" in usage_cols
+        assert "attempt_id" in usage_cols
     finally:
         await db.close()
 
@@ -51,7 +58,7 @@ async def test_open_creates_missing_parent_dirs(tmp_path: Path) -> None:
     db = await Database.open(path, migrations_dir=default_migrations_dir())
     try:
         applied = await db.fetchall("SELECT version FROM schema_migrations")
-        assert [r["version"] for r in applied] == [1, 2, 3, 4, 5, 6, 7]
+        assert [r["version"] for r in applied] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     finally:
         await db.close()
     assert path.is_file()
@@ -61,7 +68,7 @@ async def test_memory_db_creates_no_file(tmp_path: Path) -> None:
     db = await Database.open(":memory:", migrations_dir=default_migrations_dir())
     try:
         r = await db.fetchone("SELECT COUNT(*) AS c FROM schema_migrations")
-        assert r["c"] == 7
+        assert r["c"] == 9
     finally:
         await db.close()
     assert list(tmp_path.iterdir()) == []  # noqa: ASYNC240
@@ -74,7 +81,7 @@ async def test_reopen_is_idempotent(tmp_path: Path) -> None:
     db2 = await Database.open(path, migrations_dir=default_migrations_dir())
     try:
         applied = await db2.fetchall("SELECT version FROM schema_migrations")
-        assert len(applied) == 7  # nothing re-applied
+        assert len(applied) == 9  # nothing re-applied
     finally:
         await db2.close()
 
