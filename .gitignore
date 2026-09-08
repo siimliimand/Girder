@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local state stores (the orchestrator's DB and any test databases)
+*.db
+*.db-wal
+*.db-shm

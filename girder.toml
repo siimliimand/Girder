@@ -1,0 +1,60 @@
+# Development configuration for girder-on-girder (this very repo).
+# Secrets live in ~/.config/girder/secrets.toml and are NEVER committed here.
+
+[project]
+name = "girder"
+stack = "python-3.12"
+test_directories = ["tests"]
+test_signal_patterns = [
+  "tests/**",
+  "**/test_*.py",
+  "**/*_test.py",
+  "**/conftest.py",
+]
+protected_read_paths = [
+  ".github/**",
+  "openspec/**",
+  ".git/**",
+  ".env*",
+  "**/*.pem",
+  "**/*credentials*",
+]
+strict_read_scope = false
+
+[autonomy]
+tier = 0
+t2_required_streak = 10
+t1_review_window = 3
+
+[budget]
+run_cap_usd = 5.00
+
+[limits]
+attempt_wallclock_s = 600
+attempt_max_turns = 20
+task_max_attempts = 3
+ci_fix_attempts = 3
+conflict_resolution_attempts = 2
+tool_output_max_lines = 100
+tool_output_max_tokens = 4000
+
+[sandbox]
+runtime = "podman"   # falls back to docker when podman is absent
+network = "none"
+memory = "4g"
+cpus = 2.0
+pids_limit = 512
+
+[github]
+remote = "origin"
+
+[notify]
+channels = []
+
+# [models.roles] — declare tier1/tier2/tier3 when Sprint 2 wires the gateway:
+# [[models.roles]]
+# role = "tier1"
+# provider = "openrouter"
+# model = "<frontier-reasoning-model-id>"
+# price_in_per_mtok = 0.0
+# price_out_per_mtok = 0.0

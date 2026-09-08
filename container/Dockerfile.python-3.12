@@ -1,0 +1,30 @@
+# girder-runner:python-3.12 — runner image mirroring the GitHub Actions
+# ubuntu-24.04 + Python 3.12 environment (impl-plan §9.1 CI parity).
+#
+# The agent inside runs as a non-root user whose uid maps to the worktree
+# owner (see girder/sandbox/podman.py). Cache mounts target /cache/* because
+# /root is not traversable for a non-root user with CAP_DAC_OVERRIDE dropped.
+#
+# Build:  docker build -t girder-runner:python-3.12 -f container/Dockerfile.python-3.12 container/
+# (context is the container/ directory)
+
+FROM python:3.12-slim
+
+# Tooling the agent runtime and test suite rely on (mirrors CI runner deps).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ripgrep fd-find procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(command -v fdfind)" /usr/local/bin/fd
+
+# Agent user; uid/gid are overridden at container start to the worktree owner.
+RUN useradd --create-home --uid 10001 agent
+ENV HOME=/home/agent \
+    PIP_CACHE_DIR=/cache/pip \
+    npm_config_cache=/cache/npm \
+    CARGO_HOME=/cache/cargo
+
+# World-traversable cache mount points (contents arrive read-only from host).
+RUN mkdir -p /cache/pip /cache/npm /cache/cargo && chmod 755 /cache
+
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

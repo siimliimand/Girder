@@ -432,7 +432,8 @@ To prevent agents from passing builds by deleting assertions, protection is laye
   # worktree's git history — the agent has no path to influence this check.
   changed = subprocess.run(
       ["git", "-C", worktree_path, "diff", "--name-only", base_commit, "HEAD"],
-      capture_output=True, text=True
+      capture_output=True,
+      text=True,
   ).stdout.splitlines()
   violates = [f for f in changed if matches_test_pattern(f, project.config.test_directories)]
   if violates and task.task_type == "code_change":

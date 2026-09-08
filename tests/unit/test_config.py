@@ -1,0 +1,150 @@
+"""WP-1.2 — Settings: defaults, TOML merge order, env overrides, secrets repr safety."""
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from girder.config import (
+    DEFAULT_SECRETS_PATH,
+    ModelsConfig,
+    Secrets,
+    load_secrets,
+    load_settings,
+)
+
+
+def test_defaults_when_no_toml_found(tmp_path: Path) -> None:
+    settings = load_settings(start_dir=tmp_path)
+    assert settings.budget.run_cap_usd == 5.00
+    assert settings.limits.attempt_max_turns == 20
+    assert settings.limits.attempt_wallclock_s == 600
+    assert settings.limits.task_max_attempts == 3
+    assert settings.autonomy.tier == 0  # every project starts supervised (§2.3)
+    assert settings.sandbox.runtime == "podman"
+    assert settings.models.roles == []
+
+
+def test_toml_overrides_defaults(tmp_path: Path) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text(
+        '[budget]\nrun_cap_usd = 9.5\n[project]\nname = "myapp"\nstrict_read_scope = true\n'
+    )
+    settings = load_settings(config_path=cfg)
+    assert settings.budget.run_cap_usd == 9.5
+    assert settings.project.name == "myapp"
+    assert settings.project.strict_read_scope is True
+    # untouched sections keep defaults
+    assert settings.limits.attempt_max_turns == 20
+
+
+def test_env_overrides_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text("[budget]\nrun_cap_usd = 9.5\n")
+    monkeypatch.chdir(tmp_path)  # pick up the toml via directory walk-up
+    monkeypatch.setenv("GIRDER_BUDGET__RUN_CAP_USD", "12.0")
+    settings = load_settings()
+    assert settings.budget.run_cap_usd == 12.0
+
+
+def test_toml_found_by_directory_walkup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text('[project]\nname = "walkup"\n')
+    nested = tmp_path / "a" / "b"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    settings = load_settings()
+    assert settings.project.name == "walkup"
+
+
+def test_model_roles_must_be_complete_when_declared() -> None:
+    with pytest.raises(ValueError, match="tier1"):
+        ModelsConfig(roles=[{"role": "tier2", "provider": "x", "model": "y"}])
+    ok = ModelsConfig(
+        roles=[
+            {"role": "tier1", "provider": "x", "model": "a"},
+            {"role": "tier2", "provider": "x", "model": "b"},
+            {"role": "tier3", "provider": "x", "model": "c"},
+        ]
+    )
+    assert len(ok.roles) == 3
+
+
+def test_model_role_token_prices() -> None:
+    role = dict(
+        role="tier1",
+        provider="openrouter",
+        model="m",
+        price_in_per_mtok=3.0,
+        price_out_per_mtok=15.0,
+    )
+    from girder.config import ModelRole
+
+    r = ModelRole(**role)
+    assert r.price_in_per_tok == pytest.approx(3e-6)
+    assert r.price_out_per_tok == pytest.approx(15e-6)
+
+
+def test_settings_repr_contains_no_secret_values(tmp_path: Path) -> None:
+    settings = load_settings(start_dir=tmp_path)
+    r = repr(settings)
+    assert "Secrets" not in r
+
+
+def test_secrets_repr_masks_values() -> None:
+    secrets = Secrets(
+        github_token="ghp_supersecretvalue123456",
+        notify_telegram_bot_token="1234:ABCDtelegramtoken",
+        redaction_secret_env_names=["GITHUB_TOKEN"],
+    )
+    r = repr(secrets)
+    assert "ghp_supersecret" not in r
+    assert "ABCDtelegramtoken" not in r
+    assert r.count("***") == 2
+    assert "redaction_secret_env_names=1 entries" in r
+    assert str(secrets) == r
+
+
+def test_load_secrets_missing_file(tmp_path: Path) -> None:
+    secrets = load_secrets(tmp_path / "nope.toml")
+    assert secrets.github_token is None
+    assert "GITHUB_TOKEN" in secrets.redaction_secret_env_names
+
+
+def test_load_secrets_flat_and_table_forms(tmp_path: Path) -> None:
+    f = tmp_path / "secrets.toml"
+    f.write_text(
+        'github_token = "ghp_flat"\n'
+        "[github]\ntoken = 'ghp_table'\n"
+        '[notify]\ntelegram_bot_token = "tg-xyz"\n'
+    )
+    secrets = load_secrets(f)
+    assert secrets.github_token == "ghp_flat"  # flat wins over table form
+    assert secrets.notify_telegram_bot_token == "tg-xyz"
+    assert DEFAULT_SECRETS_PATH.name == "secrets.toml"
+
+
+def test_load_secrets_0600_no_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    f = tmp_path / "secrets.toml"
+    f.write_text('github_token = "ghp_x"\n')
+    f.chmod(0o600)
+    with caplog.at_level(logging.WARNING, logger="girder.config"):
+        secrets = load_secrets(f)
+    assert secrets.github_token == "ghp_x"
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_load_secrets_permissive_warns_but_loads(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    f = tmp_path / "secrets.toml"
+    f.write_text('github_token = "ghp_x"\n')
+    f.chmod(0o644)
+    with caplog.at_level(logging.WARNING, logger="girder.config"):
+        secrets = load_secrets(f)
+    assert secrets.github_token == "ghp_x"  # warn, don't refuse
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(f) in warnings[0].getMessage()
+    assert "644" in warnings[0].getMessage()
+    assert "chmod 600" in warnings[0].getMessage()

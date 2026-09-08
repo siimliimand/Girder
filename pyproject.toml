@@ -1,0 +1,58 @@
+[project]
+name = "girder"
+version = "0.1.0"
+description = "Personal AI development orchestrator: spec-driven autonomous software delivery"
+requires-python = ">=3.12"
+readme = "README.md"
+dependencies = [
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+]
+
+[project.scripts]
+girder = "girder.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/girder"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: requires a container runtime and git on the host",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "ASYNC", "RUF"]
+# N818: InvalidTransition / SandboxTimeout keep their spec-vocabulary names
+# from docs/implementation-plan.md rather than an Error suffix.
+ignore = ["N818"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/girder"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = "aiosqlite.*"
+ignore_missing_imports = true
