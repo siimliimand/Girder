@@ -75,6 +75,13 @@ class PodmanEngine(SandboxEngine):
             argv += ["-v", f"{host}:{container}:ro"]
         if spec.worktree is not None:
             argv += ["-v", f"{spec.worktree}:/workspace"]
+            # Pin the workdir only when the workspace mount guarantees it
+            # exists: podman fails the whole `run` (exit 126, "workdir does
+            # not exist") when `-w` names a path missing from the image,
+            # while docker silently creates it — a divergence first caught
+            # by CI (alpine has no /workspace; the girder runner image does).
+            if spec.workdir:
+                argv += ["-w", spec.workdir]
         if spec.test_snapshot is not None:
             snapshot, rel = spec.test_snapshot
             rel = rel.strip("/")
@@ -85,8 +92,6 @@ class PodmanEngine(SandboxEngine):
             argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
         elif self.runtime == "podman":
             argv += ["--userns=keep-id"]
-        if spec.workdir:
-            argv += ["-w", spec.workdir]
         argv += [spec.image, "sleep", "infinity"]
         return argv
 
