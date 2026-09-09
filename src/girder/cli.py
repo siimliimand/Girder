@@ -22,6 +22,7 @@ from girder.config import Secrets, Settings, load_secrets, load_settings
 from girder.db import repo
 from girder.db.engine import Database, default_migrations_dir
 from girder.db.models import Run
+from girder.github.client import GitHubClient
 from girder.gitops.worktree import DEFAULT_BASE
 from girder.guard.redact import Redactor
 from girder.models.gateway import ModelGateway
@@ -119,6 +120,17 @@ def _build_gateway(
     return ModelGateway(settings, secrets, db, redactor, BudgetGuard(db), notifier)
 
 
+def _build_github(
+    settings: Settings, secrets: Secrets, db: Database, redactor: Redactor
+) -> GitHubClient:
+    """Delivery client for the invocation directory's project (impl-plan §6.11).
+
+    The token travels only inside this process (and a temp GIT_ASKPASS helper
+    at push time) — never into containers, git config, or argv.
+    """
+    return GitHubClient(settings, secrets, redactor, db, repo_path=Path.cwd())
+
+
 async def _pumpable_runs(db: Database) -> list[Run]:
     """Runs the pump may act on, across every project (SQL lives in db.repo)."""
     runs: list[Run] = []
@@ -160,6 +172,7 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
             sandbox=_build_sandbox(args, settings),
             notifier=notifier,
             redactor=redactor,
+            github=_build_github(settings, secrets, db, redactor),
         )
         poll_s = 5.0
         while not stop.is_set():
@@ -202,6 +215,7 @@ async def cmd_pump(args: argparse.Namespace) -> int:
             sandbox=_build_sandbox(args, settings),
             notifier=notifier,
             redactor=redactor,
+            github=_build_github(settings, secrets, db, redactor),
         )
         try:
             if args.wait:

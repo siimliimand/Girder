@@ -903,3 +903,68 @@ async def consume_steering_events(
         }
         for r in rows
     ]
+
+
+# --------------------------------------------- CI checks & merge (Sprint 4)
+
+
+async def insert_ci_check_result(
+    db: Database,
+    run_id: str,
+    check_name: str,
+    status: str,
+    *,
+    conclusion: str | None = None,
+    url: str | None = None,
+    log_excerpt_redacted: str | None = None,
+) -> int:
+    """Persist one observed CI check (impl-plan §6.11: redacted excerpts only)."""
+    async with db.tx() as conn:
+        cur = await conn.execute(
+            "INSERT INTO ci_check_results (run_id, check_name, status, conclusion, url,"
+            " log_excerpt_redacted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, check_name, status, conclusion, url, log_excerpt_redacted, utcnow_iso()),
+        )
+        lastrowid: Any = cur.lastrowid
+        row_id = int(lastrowid)
+    return row_id
+
+
+async def list_ci_check_results_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetchall(
+        "SELECT * FROM ci_check_results WHERE run_id = ? ORDER BY id", (run_id,)
+    )
+    return [dict(r) for r in rows]
+
+
+async def bump_clean_merge_streak(db: Database, project_id: str) -> int:
+    """Increment and return the project's clean-merge streak (§2.3 T2 gate).
+
+    Zeroing on integrity violations already happens inside
+    :func:`insert_integrity_violation`; escalated/clean bookkeeping lives here.
+    """
+    async with db.tx() as conn:
+        await conn.execute(
+            "UPDATE projects SET clean_merge_streak = clean_merge_streak + 1, updated_at = ?"
+            " WHERE id = ?",
+            (utcnow_iso(), project_id),
+        )
+        async with conn.execute(
+            "SELECT clean_merge_streak FROM projects WHERE id = ?", (project_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    streak: Any = row["clean_merge_streak"] if row else 0
+    return int(streak)
+
+
+async def count_unreviewed_merges(db: Database, project_id: str) -> int:
+    """Merged runs of *project* with no ``merge_reviewed`` event (§2.3 T1
+    rolling review window: "pause new merges if I haven't reviewed the last N")."""
+    row = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM runs r WHERE r.project_id = ? AND r.status = 'merged'"
+        " AND NOT EXISTS (SELECT 1 FROM agent_events e WHERE e.run_id = r.id"
+        " AND e.event_type = 'merge_reviewed')",
+        (project_id,),
+    )
+    n: Any = row["n"] if row else 0
+    return int(n)

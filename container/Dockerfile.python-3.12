@@ -16,6 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(command -v fdfind)" /usr/local/bin/fd
 
+# Pre-baked test toolchain (impl-plan §9.1: deps are baked so --network=none
+# testing works). PIN these to the exact versions the project's GitHub Actions
+# workflow installs — `container/parity-check.sh <image> ci-env-dump.txt`
+# fails the build when image and CI diverge.
+RUN pip install --no-cache-dir pytest==8.3.2
+
 # Agent user; uid/gid are overridden at container start to the worktree owner.
 RUN useradd --create-home --uid 10001 agent
 ENV HOME=/home/agent \

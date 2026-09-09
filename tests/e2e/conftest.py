@@ -18,9 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from girder.config import (
+    GithubConfig,
     LimitsConfig,
     ProjectConfig,
     SandboxNetwork,
@@ -30,6 +32,7 @@ from girder.config import (
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Project, Run, RunStatus
+from girder.github.client import GitHubClient
 from girder.guard.redact import Redactor
 from girder.orchestrator.run_engine import RunEngine
 from girder.sandbox.engine import ExecResult
@@ -165,6 +168,8 @@ class E2eCtx:
     settings: Settings
     redactor: Redactor
     notifier: FakeNotifier
+    github: Any = None  # GitHubClient (delivery ctxs only)
+    api: Any = None  # FakeGitHub transport (delivery ctxs only)
 
     def engine(self, gateway: Any, sandbox: LocalExecSandbox | None = None) -> RunEngine:
         return RunEngine(
@@ -175,6 +180,21 @@ class E2eCtx:
             sandbox=sandbox or HostSuiteSandbox(),
             notifier=self.notifier,
             redactor=self.redactor,
+            repo_path=self.repo_path,
+        )
+
+    def delivery_engine(self, gateway: Any, sandbox: LocalExecSandbox | None = None) -> RunEngine:
+        """Full pipeline (spec → … → PR → CI → conformance → merge)."""
+        assert self.github is not None, "delivery_engine requires a delivery ctx"
+        return RunEngine(
+            db=self.db,
+            settings=self.settings,
+            secrets=Secrets(models_openrouter_api_key="sk-test-nonsecret"),
+            gateway=gateway,
+            sandbox=sandbox or HostSuiteSandbox(),
+            notifier=self.notifier,
+            redactor=self.redactor,
+            github=self.github,
             repo_path=self.repo_path,
         )
 
@@ -257,3 +277,174 @@ async def make_ctx(
         )
 
     yield _make
+
+
+# ------------------------------------------------------------------ Sprint 4
+
+
+GH_OWNER = "acme"
+GH_NAME = "widget"
+E2E_GITHUB_TOKEN = "github_pat_e2etoken1234567890ABCDEF"
+
+
+def gh_check(
+    name: str, conclusion: str, *, summary: str = "", text: str = ""
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": "completed",
+        "conclusion": conclusion,
+        "html_url": f"https://github.com/{GH_OWNER}/{GH_NAME}/runs/1",
+        "output": {"summary": summary, "text": text},
+    }
+
+
+class FakeGitHub(httpx.MockTransport):
+    """The GitHub REST surface the delivery pump touches, in-process.
+
+    Same semantics as the unit-suite copy in tests/unit/test_delivery.py;
+    duplicated (not imported) so the suites stay decoupled. ``checks`` stays
+    mutable after client construction: tests flip ``ctx.api.checks`` mid-run.
+    """
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]],
+        *,
+        pr_number: int = 7,
+        pr_merged: bool = False,
+    ) -> None:
+        super().__init__(self._handle)
+        self.checks = checks
+        self.pr_number = pr_number
+        self.pr_merged = pr_merged
+        self.api_calls: list[tuple[str, str]] = []
+        self.comments: list[dict[str, Any]] = []
+        self.merge_calls = 0
+        self.merge_refused = False
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        method, path = request.method, request.url.path
+        self.api_calls.append((method, path))
+        base = f"/repos/{GH_OWNER}/{GH_NAME}"
+        if method == "GET" and path.startswith(f"{base}/commits/") and path.endswith(
+            "/check-runs"
+        ):
+            return httpx.Response(
+                200, json={"total_count": len(self.checks), "check_runs": self.checks}
+            )
+        if method == "GET" and path == f"{base}/pulls":
+            return httpx.Response(200, json=[])
+        if method == "POST" and path == f"{base}/pulls":
+            return httpx.Response(201, json={"number": self.pr_number})
+        if method == "GET" and path == f"{base}/pulls/{self.pr_number}":
+            return httpx.Response(
+                200,
+                json={
+                    "number": self.pr_number,
+                    "state": "closed" if self.pr_merged else "open",
+                    "merged": self.pr_merged,
+                    "mergeable": True,
+                    "merge_commit_sha": "f00dface" if self.pr_merged else None,
+                },
+            )
+        if method == "PUT" and path == f"{base}/pulls/{self.pr_number}/merge":
+            self.merge_calls += 1
+            if self.merge_refused:
+                return httpx.Response(405, json={"message": "pull request is not mergeable"})
+            return httpx.Response(200, json={"merged": True, "sha": "f00dface"})
+        if method == "POST" and "/comments" in path:
+            self.comments.append(json.loads(request.content))
+            return httpx.Response(201, json={})
+        return httpx.Response(404, json={"message": f"unhandled {method} {path}"})
+
+
+MakeDeliveryCtx = Callable[..., Awaitable[E2eCtx]]
+
+
+@pytest.fixture
+async def make_delivery_ctx(
+    db: Database,
+    e2e_repo: Path,
+    settings: Settings,
+    redactor: Redactor,
+    tmp_path: Path,
+) -> AsyncIterator[MakeDeliveryCtx]:
+    """Delivery-capable factory: bare origin remote + FakeGitHub + client."""
+    clients: list[Any] = []
+    counter = 0
+
+    async def _make(
+        proposal_text: str,
+        *,
+        autonomy_tier: int = 1,
+        clean_merge_streak: int | None = None,
+        budget_cap_usd: float = 5.0,
+        branch: str = "run/e2e1",
+    ) -> E2eCtx:
+        origin = tmp_path / "origin.git"
+        await run_host_cmd(["git", "init", "--bare", "-b", "main", str(origin)], timeout_s=30)
+        remotes = (await git(e2e_repo, "remote")).split()
+        if "origin" in remotes:
+            await git(e2e_repo, "remote", "set-url", "origin", str(origin))
+        else:
+            await git(e2e_repo, "remote", "add", "origin", str(origin))
+        await git(e2e_repo, "push", "origin", "main")
+
+        nonlocal counter
+        counter += 1
+        project = await repo.create_project(
+            db, f"e2e-target-{counter}", str(e2e_repo), autonomy_tier=autonomy_tier
+        )
+        if clean_merge_streak is not None:
+            await db.execute(
+                "UPDATE projects SET clean_merge_streak = ? WHERE id = ?",
+                (clean_merge_streak, project.id),
+            )
+            await db.conn.commit()
+        run = await repo.create_run(db, project.id, "e2e intent", branch, budget_cap_usd)
+        await seed_run_status(db, run.id, RunStatus.SPEC_PENDING.value)
+        fresh = await repo.get_run(db, run.id)
+        assert fresh is not None
+        await approve_and_freeze(
+            db,
+            project=project,
+            run=fresh,
+            proposal_text=proposal_text,
+            repo_path=e2e_repo,
+            worktree_base=tmp_path / "freeze-wt",
+        )
+        fresh = await repo.get_run(db, run.id)
+        assert fresh is not None and fresh.status is RunStatus.SPEC_APPROVED
+
+        delivery_settings = settings.model_copy(
+            update={"github": GithubConfig(poll_interval_s=0.0)}
+        )
+        api = FakeGitHub([gh_check("ci", "success")])
+        github = GitHubClient(
+            delivery_settings,
+            Secrets(github_token=E2E_GITHUB_TOKEN),
+            redactor,
+            db,
+            repo_path=e2e_repo,
+            transport=api,
+            owner_repo=(GH_OWNER, GH_NAME),  # remote is a local bare repo
+        )
+        clients.append(github)
+        return E2eCtx(
+            db=db,
+            project=project,
+            run=fresh,
+            repo_path=e2e_repo,
+            settings=delivery_settings,
+            redactor=redactor,
+            notifier=FakeNotifier(),
+            github=github,
+            api=api,
+        )
+
+    try:
+        yield _make
+    finally:
+        for client in clients:
+            await client.aclose()

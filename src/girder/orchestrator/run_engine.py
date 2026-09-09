@@ -17,9 +17,16 @@ active, task executed                   "task_completed" / "failed" /
                                         "amendment_pending"→"awaiting_amendment" /
                                         "budget_exhausted"
 active, no tasks yet                    decompose, then proceed as above
-active, all tasks completed             "local_green" (Sprint 3 terminal;
-                                        run stays ``active`` for Sprint 4 PR)
+active, all tasks completed             "local_green" (no GitHub client) or
+                                        "pr_opened" → delivery pump (Sprint 4):
+                                        pr_open/ci_running/ci_fixing/
+                                        conformance_review/merge_pending_human
+                                        → "ci_pending" / "ci_green" /
+                                        "ci_red_fixing" / "ci_fix_pushed" /
+                                        "merge_pending_human" / "merged"
 awaiting_amendment                      "awaiting_amendment"
+github client missing in a delivery     "github_unavailable"
+state
 budget_exhausted / escalated / terminal status string as-is
 ======================================  =====================================
 
@@ -41,6 +48,7 @@ from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Project, Run, RunStatus, SteeringKind, Task, TaskStatus
 from girder.fsm import transition_run
+from girder.github.client import GitHubClient
 from girder.gitops.branch import BranchOps
 from girder.guard.redact import Redactor
 from girder.models.gateway import ModelGateway
@@ -59,6 +67,10 @@ log = logging.getLogger(__name__)
 STOP_DESCRIPTORS = frozenset(
     {
         "local_green",
+        "github_unavailable",
+        "ci_pending",
+        "merge_pending_human",
+        "merged",
         "failed",
         "aborted",
         "escalated",
@@ -68,8 +80,24 @@ STOP_DESCRIPTORS = frozenset(
     }
 )
 
+# States the delivery engine (Sprint 4) takes over from local green onward.
+DELIVERY_STATUSES = frozenset(
+    {
+        RunStatus.PR_OPEN,
+        RunStatus.CI_RUNNING,
+        RunStatus.CI_FIXING,
+        RunStatus.CONFORMANCE_REVIEW,
+        RunStatus.MERGE_PENDING_HUMAN,
+    }
+)
+
 _PUMPABLE_RUN_STATUSES = frozenset(
-    {RunStatus.SPEC_APPROVED, RunStatus.BASELINE_RUNNING, RunStatus.ACTIVE}
+    {
+        RunStatus.SPEC_APPROVED,
+        RunStatus.BASELINE_RUNNING,
+        RunStatus.ACTIVE,
+        *DELIVERY_STATUSES,
+    }
 )
 
 _PROPOSAL_PATH = "openspec/proposals/{run_id}.md"
@@ -86,6 +114,7 @@ class RunEngine:
         sandbox: SandboxEngine,
         notifier: Notifier | None,
         redactor: Redactor,
+        github: GitHubClient | None = None,
         repo_path: Path | None = None,
     ) -> None:
         self.db = db
@@ -97,6 +126,28 @@ class RunEngine:
         self.redactor = redactor
         self._repo_path = Path(repo_path) if repo_path else None
         self._scheduler = Scheduler(db)
+        # Sprint 4: with a GitHub client the pump continues past local green
+        # (PR → CI → conformance → merge per tier). Without one it parks at
+        # the Sprint 3 terminal "local_green" (runs stay `active`).
+        # Imported lazily: delivery -> task_engine -> orchestrator/__init__
+        # -> run_engine would be circular at module import time.
+        from girder.github.delivery import DeliveryEngine
+
+        self.delivery: DeliveryEngine | None = (
+            DeliveryEngine(
+                db=db,
+                settings=settings,
+                secrets=secrets,
+                gateway=gateway,
+                sandbox=sandbox,
+                notifier=notifier,
+                redactor=redactor,
+                github=github,
+                repo_path=self._repo_path,
+            )
+            if github is not None
+            else None
+        )
 
     async def pump_once(self, run_id: str) -> str:
         run = await repo.get_run(self.db, run_id)
@@ -108,6 +159,11 @@ class RunEngine:
 
         if run.status is RunStatus.ACTIVE:
             return await self._pump_active(run)
+
+        if run.status in DELIVERY_STATUSES:
+            if self.delivery is None:
+                return "github_unavailable"
+            return await self.delivery.pump(run)
 
         if run.status is RunStatus.AWAITING_AMENDMENT:
             return "awaiting_amendment"
@@ -209,7 +265,9 @@ class RunEngine:
         assert fresh is not None
         if await self._scheduler.all_completed(fresh):
             await self._announce_local_green(fresh)
-            return "local_green"
+            if self.delivery is None:
+                return "local_green"
+            return await self.delivery.enter_delivery(fresh)
         # Tasks exist but none schedulable and not all completed: dropped or
         # leaked task — the run cannot proceed.
         reason = "no schedulable task and not all tasks completed"

@@ -84,6 +84,10 @@ class SandboxNetwork(BaseModel):
 class GithubConfig(BaseModel):
     remote: str = "origin"
     pr_template: str | None = None
+    api_url: str = "https://api.github.com"  # overridable for tests / proxies
+    poll_interval_s: float = 30.0  # CI checks poll cadence (impl-plan §6.11)
+    poll_timeout_s: float = 3600.0  # exceeded ⇒ escalate, never poll forever
+    merge_method: str = "squash"  # merge | squash | rebase (§9.2 T1/T2)
 
 
 class NotifyConfig(BaseModel):

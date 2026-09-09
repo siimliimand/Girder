@@ -7,8 +7,9 @@ verify, and deliver it to `main`.
 - **Specification:** [`docs/plan.md`](docs/plan.md) (v2.2)
 - **Engineering blueprint:** [`docs/implementation-plan.md`](docs/implementation-plan.md)
 
-Status: Sprint 1 (infrastructure & sandboxing) — see the implementation plan's
-delivery table.
+Status: Sprints 1–4 complete (infrastructure, spec engine, sequential
+autonomous loop, GitHub delivery pipeline with tiered merge) — see the
+implementation plan's delivery table.
 
 ## Development
 

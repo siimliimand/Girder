@@ -47,6 +47,10 @@ pids_limit = 512
 
 [github]
 remote = "origin"
+# api_url = "https://api.github.com"  # override for proxies/tests
+poll_interval_s = 30.0   # CI checks poll cadence
+poll_timeout_s = 3600.0  # exceeded ⇒ escalate, never poll forever
+merge_method = "squash"  # merge | squash | rebase (T1/T2 auto-merge)
 
 [notify]
 channels = []

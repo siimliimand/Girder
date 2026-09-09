@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import uuid
 from datetime import UTC, datetime
@@ -35,17 +36,22 @@ async def run_host_cmd(
     cwd: Path | None = None,
     check: bool = True,
     timeout_s: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a host command asynchronously, capturing text output.
 
     The orchestrator always drives git / container CLIs from its own process —
-    this is the only subprocess helper the host side should use.
+    this is the only subprocess helper the host side should use. ``env`` is
+    merged over ``os.environ`` (used e.g. for GIT_ASKPASS so tokens never
+    appear in argv).
     """
+    merged_env = {**os.environ, **env} if env else None
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd) if cwd else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=merged_env,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
