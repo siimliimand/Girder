@@ -13,13 +13,24 @@ Verdict policy (resolved ambiguity R2 of the implementation plan):
   steering the agent toward CI configuration or credentials.
 * ``strict_read_scope = true`` restores the literal §8.5 behavior: any read
   outside ``scope_globs`` is a ``VIOLATION`` too.
+* ``run_command`` gets the same write policy on "any argument that resolves
+  to a path" (§6.6 R2): shell redirect operands (``>`` ``>>`` ``2>`` ``&>``)
+  and ``tee`` operands are write targets — out-of-scope or protected targets
+  hold the whole call. Any *other* token with path syntax that resolves to an
+  existing path under the worktree root is treated as a read (protected paths
+  still violation; ordinary out-of-scope reads stay allowed — R2). Tokens that
+  do not look like paths (commands, flags, pipes, heredoc text) are ignored:
+  this stays a path-argument policy, and `python -c "open(...)"`-style
+  indirection remains the Layer 2/3 audits' backstop.
 * Path escapes (``..`` out of the worktree, absolute paths outside the root)
   are always ``VIOLATION``.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath
@@ -42,9 +53,19 @@ _READ_TOOLS = {
     "ripgrep": "path",
     "find_files": "glob",
 }
-# Tools with no path argument at all (run_command's command screening is a
-# Sprint 3 concern — the tool registry — not a scope question).
-_NO_PATH_TOOLS = {"mark_task_complete", "request_spec_amendment", "run_command"}
+# Tools with no path argument at all.
+_NO_PATH_TOOLS = {"mark_task_complete", "request_spec_amendment"}
+
+# run_command: redirect operators whose operand is a WRITE target, and those
+# whose operand is a read/here-doc delimiter (not a write).
+_WRITE_REDIRECTS = {">", ">>", "2>", "&>", "1>", "2>>", "1>>"}
+_READ_REDIRECTS = {"<", "<<", "<<<"}
+# Attached forms (">out", "2>err") — longest first so "2>>" wins over "2>".
+_REDIRECT_PREFIXES = ("2>>", "1>>", "&>", ">>", "2>", "1>", ">")
+_FD_DUP = re.compile(r"^&\d+$")
+# Tokens that end an operand run for `tee` (and other multi-operand scanning).
+_SHELL_BREAKS = {"|", "||", "&&", ";", "&", "(", ")", "<", "<<", "<<<",
+                 ">", ">>", "2>", "&>", "1>", "2>>", "1>>"}
 
 
 @dataclass
@@ -127,11 +148,116 @@ def resolve_path(raw: str, root: str = "/workspace") -> str | None:
     return "/".join(parts)
 
 
+def run_command_path_args(cmd: str) -> tuple[list[str], list[str]]:
+    """Split a run_command shell string into (write targets, other path tokens).
+
+    Per impl-plan §6.6 R2 ("any run_command argument that resolves to a path"):
+
+    * write targets — redirect operands (``>``/``>>``/``2>``/``&>``, attached
+      or separate, fd-duplicates like ``2>&1`` excluded) and every non-flag
+      operand of ``tee`` up to the next shell break;
+    * other path tokens — any remaining token with path syntax (a ``/``
+      separator or a dotted segment, excluding flags). Resolution/existence is
+      decided by the caller; this function is purely lexical.
+
+    Unparsable shell (unbalanced quotes) yields no paths — the registry
+    denylist and the Layer 2/3 audits remain the backstop.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return [], []
+    writes: list[str] = []
+    consumed: set[int] = set()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _WRITE_REDIRECTS and i + 1 < len(tokens):
+            if not _FD_DUP.match(tokens[i + 1]):
+                writes.append(tokens[i + 1])
+                consumed.add(i + 1)
+            i += 2
+            continue
+        if tok in _READ_REDIRECTS and i + 1 < len(tokens):
+            consumed.add(i + 1)
+            i += 2
+            continue
+        attached = _attached_redirect_target(tok)
+        if attached is not None:
+            writes.append(attached)
+            consumed.add(i)
+            i += 1
+            continue
+        if tok == "tee":
+            j = i + 1
+            while j < len(tokens) and tokens[j] not in _SHELL_BREAKS:
+                if not tokens[j].startswith("-"):
+                    writes.append(tokens[j])
+                    consumed.add(j)
+                j += 1
+            i = j
+            continue
+        i += 1
+    others = [
+        t for k, t in enumerate(tokens) if k not in consumed and _looks_like_path(t)
+    ]
+    return writes, others
+
+
+def _attached_redirect_target(tok: str) -> str | None:
+    """``">out"`` → ``"out"``; fd-dups (``2>&1``) and non-redirects → None."""
+    for prefix in _REDIRECT_PREFIXES:
+        if tok.startswith(prefix) and len(tok) > len(prefix):
+            target = tok[len(prefix):]
+            if not _FD_DUP.match(target):
+                return target
+            return None
+    return None
+
+
+def _looks_like_path(tok: str) -> bool:
+    """Path syntax heuristic: flags aren't paths; ``/`` or a dotted segment is."""
+    return bool(tok) and not tok.startswith("-") and ("/" in tok or "." in tok)
+
+
+def _check_run_command(cmd: str, scopes: TaskScopes) -> Verdict:
+    """Write-policy on path arguments (§6.6 R2); reads are not write-gated."""
+    writes, others = run_command_path_args(cmd)
+    for raw in writes:
+        rel = resolve_path(raw, scopes.root)
+        if rel is None:
+            return Verdict.VIOLATION  # escape attempt via redirect
+        if _matches_any(rel, scopes.protected_globs):
+            return Verdict.VIOLATION
+        if not _matches_any(rel, scopes.write_globs):
+            return Verdict.VIOLATION
+    for raw in others:
+        rel = resolve_path(raw, scopes.root)
+        if rel is None:
+            return Verdict.VIOLATION  # path escape, even read-shaped
+        if _matches_any(rel, scopes.protected_globs):
+            return Verdict.VIOLATION
+        # Existing in-worktree paths behave like read_file (R2: reads are
+        # ALLOW_LOGGED). Non-existent / unresolvable-on-host tokens are
+        # ignored — Layer 2/3 audits cover the indirection gap.
+        if _exists_under_root(rel, scopes.root):
+            return Verdict.ALLOW_LOGGED
+    return Verdict.ALLOW
+
+
+def _exists_under_root(rel: str, root: str) -> bool:
+    base = root.rstrip("/") or "/"
+    p = os.path.join(base, rel)
+    return os.path.exists(p) or os.path.isdir(os.path.dirname(p) or "/")
+
+
 def check_tool_call(tool: str, args: dict[str, object], scopes: TaskScopes) -> Verdict:
     """The single scope decision point run before any tool executes."""
     arg_name = _WRITE_TOOLS.get(tool) or _READ_TOOLS.get(tool)
     if tool in _NO_PATH_TOOLS:
         return Verdict.ALLOW
+    if tool == "run_command":
+        return _check_run_command(str(args.get("cmd", "")), scopes)
     if arg_name is None:
         return Verdict.ALLOW  # unknown tool: not a scope question (registry rejects later)
 

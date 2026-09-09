@@ -20,6 +20,7 @@ Production runs use :class:`girder.sandbox.podman.PodmanEngine`.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from girder.sandbox.engine import (
@@ -104,3 +105,16 @@ class LocalExecSandbox(SandboxEngine):
 
     async def exists(self, name: str) -> bool:
         return name in self._specs
+
+    # ------------------------------------------------------------------- logs
+
+    async def stream_logs(self, name: str) -> AsyncIterator[str]:
+        """Empty stream: there is no container log to tail.
+
+        ``LocalExecSandbox`` runs each ``exec`` argv directly on the host and
+        returns its output inline via :class:`ExecResult`; nothing writes to a
+        per-sandbox log file, so there is nothing to follow. Satisfies the
+        §6.4 interface with a no-op iterator.
+        """
+        return
+        yield ""  # pragma: no cover — makes this an async generator

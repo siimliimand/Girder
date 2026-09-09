@@ -79,6 +79,9 @@ class SandboxNetwork(BaseModel):
     cpus: float = 2.0
     pids_limit: int = 512
     runtime: str = "podman"  # podman | docker (identical flag surface)
+    # Interpreter used to run project test suites (baseline + verify loop).
+    # "python3" is the portable default; the CI parity image may pin another.
+    python_bin: str = "python3"
 
 
 class GithubConfig(BaseModel):
@@ -137,13 +140,13 @@ class ModelsConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_tiers(self) -> ModelsConfig:
-        # Sprint 1 runs zero model calls, so an empty registry is tolerated;
-        # as soon as any role is declared the tier1-tier3 set must be complete.
-        if self.roles:
-            have = {r.role for r in self.roles}
-            missing = {"tier1", "tier2", "tier3"} - have
-            if missing:
-                raise ValueError(f"model roles incomplete, missing: {sorted(missing)}")
+        # A partial registry is always an error: every sprint's pipeline calls
+        # all three roles, so a missing tier would fail mid-run (issue 16).
+        # An *empty* registry still passes construction — load_settings warns.
+        have = {r.role for r in self.roles}
+        missing = {"tier1", "tier2", "tier3"} - have
+        if self.roles and missing:
+            raise ValueError(f"model roles incomplete, missing: {sorted(missing)}")
         return self
 
 
@@ -182,6 +185,21 @@ class Settings(BaseSettings):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     specs: SpecsConfig = Field(default_factory=SpecsConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+
+    @model_validator(mode="after")
+    def _check_ranges(self) -> Settings:
+        # impl-plan §6.1: budget > 0, limits positive, test_directories non-empty.
+        errors: list[str] = []
+        if self.budget.run_cap_usd <= 0:
+            errors.append(f"budget.run_cap_usd must be > 0 (got {self.budget.run_cap_usd})")
+        for name, value in self.limits.__dict__.items():
+            if value <= 0:
+                errors.append(f"limits.{name} must be > 0 (got {value})")
+        if not self.project.test_directories:
+            errors.append("project.test_directories must be a non-empty list")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
 
     def __repr__(self) -> str:  # pragma: no cover - defensive, exercised in tests
         # Settings holds no secrets, but keep the habit: repr never grows a
@@ -266,19 +284,25 @@ class _TomlSettingsSource(PydanticBaseSettingsSource):
         return {k: v for k, v in data.items() if k in self.settings_cls.model_fields}
 
 
+class SecretsPermissionError(RuntimeError):
+    """The secrets file is readable/writable by group or others (impl-plan §3.2)."""
+
+
 def load_secrets(path: Path | None = None) -> Secrets:
-    """Load secrets from TOML; missing file yields an empty (but usable) model."""
+    """Load secrets from TOML; missing file yields an empty (but usable) model.
+
+    impl-plan §3.2: the secrets file must be owner-only (mode 0600, host-only).
+    A permissive file is *refused*, not merely warned about — credentials must
+    never be group/world readable.
+    """
     path = (path or DEFAULT_SECRETS_PATH).expanduser()
     if not path.is_file():
         return Secrets()
-    # impl-plan §3.2: secrets must be owner-only (0600) — warn, don't refuse.
     mode = path.stat().st_mode & 0o777
     if mode & 0o077:
-        log.warning(
-            "%s is mode %o; secrets may be readable by others — run: chmod 600 %s",
-            path,
-            mode,
-            path,
+        raise SecretsPermissionError(
+            f"{path} is mode {mode:o}; the secrets file must be owner-only (0600)"
+            f" — run: chmod 600 {path}"
         )
     data = tomllib.loads(path.read_text())
     # Accept both table form ([github] token = "…") and flat keys (github_token = "…").
@@ -320,7 +344,15 @@ def load_settings(
     else:
         token = None
     try:
-        return Settings()
+        settings = Settings()
+        if not settings.models.roles:
+            # Issue 16: an empty registry validates but every sprint's pipeline
+            # calls models — say so loudly instead of failing later mid-run.
+            log.warning(
+                "no model roles configured; model calls will fail —"
+                " declare [[models.roles]] (tier1..tier3) in girder.toml"
+            )
+        return settings
     finally:
         if token is not None:
             _TOML_PATH.reset(token)

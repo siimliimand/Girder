@@ -313,3 +313,149 @@ async def test_consume_steering_events_kind_filter(db) -> None:  # type: ignore[
     remaining = await repo.consume_steering_events(db, run.id)
     assert [e["kind"] for e in remaining] == ["pause"]
     assert [e["kind"] for e in await repo.consume_steering_events(db, other.id)] == ["skip"]
+
+
+# ---------------------------------------------------------- sprint 5: waves
+
+
+async def test_get_or_create_wave_is_idempotent(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave = await repo.get_or_create_wave(db, run.id, 0)
+    again = await repo.get_or_create_wave(db, run.id, 0)
+    assert again.id == wave.id
+    assert again.sequence_order == 0
+    assert again.run_id == run.id
+
+
+async def test_get_or_create_wave_distinct_sequence_orders(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    w0 = await repo.get_or_create_wave(db, run.id, 0)
+    w1 = await repo.get_or_create_wave(db, run.id, 1)
+    assert w0.id != w1.id
+    waves = await repo.list_waves_for_run(db, run.id)
+    assert [w.sequence_order for w in waves] == [0, 1]
+
+
+async def test_list_waves_for_run_orders_by_sequence(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    other = await repo.create_run(db, project.id, "intent", "run/abc2", 5.0)
+    await repo.get_or_create_wave(db, run.id, 2)
+    await repo.get_or_create_wave(db, run.id, 0)
+    await repo.get_or_create_wave(db, run.id, 1)
+    await repo.get_or_create_wave(db, other.id, 0)
+
+    waves = await repo.list_waves_for_run(db, run.id)
+    assert [w.sequence_order for w in waves] == [0, 1, 2]
+    assert all(w.run_id == run.id for w in waves)
+
+
+async def test_set_wave_status(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave = await repo.get_or_create_wave(db, run.id, 0)
+    assert wave.status == "pending"
+    await repo.set_wave_status(db, wave.id, "running")
+    waves = await repo.list_waves_for_run(db, run.id)
+    assert waves[0].status == "running"
+
+
+async def test_list_tasks_for_wave_orders_and_isolates(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave_a = await repo.get_or_create_wave(db, run.id, 0)
+    wave_b = await repo.get_or_create_wave(db, run.id, 1)
+    await repo.create_task(db, wave_a.id, 2, "b", TaskType.CODE_CHANGE)
+    await repo.create_task(db, wave_a.id, 1, "a", TaskType.CODE_CHANGE)
+    await repo.create_task(db, wave_b.id, 1, "other-wave", TaskType.TEST_CHANGE)
+
+    tasks_a = await repo.list_tasks_for_wave(db, wave_a.id)
+    assert [t.seq for t in tasks_a] == [1, 2]
+    assert [t.title for t in tasks_a] == ["a", "b"]
+    assert all(t.wave_id == wave_a.id for t in tasks_a)
+
+    tasks_b = await repo.list_tasks_for_wave(db, wave_b.id)
+    assert [t.title for t in tasks_b] == ["other-wave"]
+
+
+async def test_list_attempts_for_task_orders_by_attempt_num(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave = await repo.get_or_create_wave0(db, run.id)
+    task = await repo.create_task(db, wave.id, 1, "t", TaskType.CODE_CHANGE)
+    other = await repo.create_task(db, wave.id, 2, "u", TaskType.CODE_CHANGE)
+    a1 = await repo.create_attempt(db, task.id, "abc123")
+    a2 = await repo.create_attempt(db, task.id, "abc123")
+    await repo.create_attempt(db, other.id, "abc123")
+
+    attempts = await repo.list_attempts_for_task(db, task.id)
+    assert [a.attempt_num for a in attempts] == [1, 2]
+    assert [a.id for a in attempts] == [a1.id, a2.id]
+    assert all(a.task_id == task.id for a in attempts)
+
+
+async def test_update_task_fields_wave_id_moves_task(db) -> None:  # type: ignore[no-untyped-def]
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave0 = await repo.get_or_create_wave(db, run.id, 0)
+    wave1 = await repo.get_or_create_wave(db, run.id, 1)
+    task = await repo.create_task(db, wave0.id, 1, "t", TaskType.CODE_CHANGE)
+
+    await repo.update_task_fields(db, task.id, wave_id=wave1.id)
+    fresh = await repo.get_task(db, task.id)
+    assert fresh is not None
+    assert fresh.wave_id == wave1.id
+    assert [t.id for t in await repo.list_tasks_for_wave(db, wave1.id)] == [task.id]
+    assert await repo.list_tasks_for_wave(db, wave0.id) == []
+
+
+async def test_tool_call_verdict_roundtrip(db) -> None:  # type: ignore[no-untyped-def]
+    """Migration 011: ScopeGuard verdict per tool call is persisted and read
+    back by the post-mortem listing."""
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave = await repo.get_or_create_wave0(db, run.id)
+    task = await repo.create_task(db, wave.id, 1, "t", TaskType.CODE_CHANGE)
+    attempt = await repo.create_attempt(db, task.id, "abc123")
+
+    await repo.insert_tool_call(
+        db,
+        attempt_id=attempt.id,
+        tool_name="write_file",
+        input_json="{}",
+        verdict="violation",
+    )
+    await repo.insert_tool_call(db, attempt_id=attempt.id, tool_name="shell", input_json="{}")
+    await repo.insert_tool_call(
+        db, attempt_id=attempt.id, tool_name="shell", input_json="{}", verdict="allow"
+    )
+
+    rows = await repo.list_tool_calls_for_attempt(db, attempt.id)
+    assert [r["verdict"] for r in rows] == ["violation", None, "allow"]
+
+
+async def test_attempt_prompts_roundtrip(db) -> None:  # type: ignore[no-untyped-def]
+    """Migration 011 / plan.md Phase 5 task 5: per-turn prompt snapshots,
+    ordered by (turn, id), redaction owned by the caller."""
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave = await repo.get_or_create_wave0(db, run.id)
+    task = await repo.create_task(db, wave.id, 1, "t", TaskType.CODE_CHANGE)
+    attempt = await repo.create_attempt(db, task.id, "abc123")
+
+    await repo.record_attempt_prompt(db, attempt.id, 1, "user", "fix the bug", run_id=run.id)
+    await repo.record_attempt_prompt(db, attempt.id, 1, "assistant", "on it")
+    await repo.record_attempt_prompt(db, attempt.id, 2, "user", "sk: REDACTED")
+
+    prompts = await repo.list_attempt_prompts(db, attempt.id)
+    assert [(p.turn, p.role, p.content_redacted) for p in prompts] == [
+        (1, "user", "fix the bug"),
+        (1, "assistant", "on it"),
+        (2, "user", "sk: REDACTED"),
+    ]
+    assert prompts[0].run_id == run.id
+    assert prompts[1].run_id is None
+    assert all(p.ts for p in prompts)
+    assert await repo.list_attempt_prompts(db, "nope") == []

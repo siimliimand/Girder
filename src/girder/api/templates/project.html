@@ -4,6 +4,11 @@
 <h1>{{ project.name }}</h1>
 <p>Repo: <code>{{ project.repo_path }}</code></p>
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if review_window and review_window.exceeded %}
+<p class="error">T1 review window exceeded — mark recent merges reviewed first
+   ({{ review_window.unreviewed }} unreviewed / window {{ review_window.window }}).
+   See the <a href="/projects/{{ project.id }}/tier">tier console</a>.</p>
+{% endif %}
 <h2>New run</h2>
 <form method="post" action="/api/projects/{{ project.id }}/runs">
   <label>Intent<br><textarea name="intent" rows="4" cols="80" required></textarea></label><br>

@@ -38,6 +38,12 @@ def build_system_prompt(*, task: Task, spec_slice: str) -> str:
     return _SYSTEM_INVARIANTS
 
 
+def build_directive_message(directive: str) -> str:
+    """Mid-flight steering from the operator (§Phase 5): tagged [TRUSTED] so the
+    model can tell operator authority apart from untrusted repo content (D11)."""
+    return "[TRUSTED] Steering directive (user-authored):\n" + directive.strip()
+
+
 def build_task_message(*, task: Task, spec_slice: str, guidance: str | None = None) -> str:
     """The initial trusted user message: frozen spec slice + task identity."""
     parts = [
@@ -49,11 +55,7 @@ def build_task_message(*, task: Task, spec_slice: str, guidance: str | None = No
         f"Write scope: {', '.join(task.scope_globs) or '(none declared)'}",
     ]
     if guidance:
-        parts += [
-            "",
-            "[TRUSTED] Steering directive (user-authored):",
-            guidance.strip(),
-        ]
+        parts += ["", build_directive_message(guidance)]
     return "\n".join(parts)
 
 

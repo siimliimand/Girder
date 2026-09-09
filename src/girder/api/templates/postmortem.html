@@ -1,0 +1,138 @@
+{# Post-mortem explorer (WP 6.5): per task → per attempt tool/token/event
+   timelines plus run-level violations, notifications, amendments, spend.
+   All dynamic strings were re-redacted in the route (plan §10). #}
+{% extends "base.html" %}
+{% block content %}
+<h1>Post-mortem — run <code>{{ run.id[:8] }}</code></h1>
+<p>Project: <a href="/projects/{{ project.id }}">{{ project.name }}</a>
+   | <a href="/runs/{{ run.id }}">run page</a>
+   | status <span class="badge badge-{{ run.status.value }}">{{ run.status.value }}</span>
+   | branch <code>{{ run.branch }}</code></p>
+<p>Intent: {{ run.intent }}</p>
+
+<h2>Spend</h2>
+<p>Actual ${{ '%.4f'|format(spend.spend_usd) }} · projected
+   ${{ '%.4f'|format(spend.projected_spend_usd) }} · cap
+   ${{ '%.2f'|format(spend.cap) }}</p>
+{% if roles %}
+<table>
+  <thead><tr><th>Role</th><th>Model</th><th>Calls</th><th>Prompt</th><th>Completion</th>
+      <th>Cost</th><th>Estimated</th></tr></thead>
+  <tbody>
+  {% for r in roles %}
+    <tr><td>{{ r.model_role }}</td><td>{{ r.model_id }}</td><td>{{ r.calls }}</td>
+      <td>{{ r.prompt_tokens }}</td><td>{{ r.completion_tokens }}</td>
+      <td>${{ '%.4f'|format(r.cost_usd) }}</td>
+      <td>${{ '%.4f'|format(r.estimated_usd) }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Integrity violations</h2>
+<table>
+  <thead><tr><th>Kind</th><th>Task</th><th>Attempt</th><th>Detail</th><th>When</th></tr></thead>
+  <tbody>
+  {% for v in violations %}
+    <tr><td><code>{{ v.kind }}</code></td><td>{{ v.task_id or '—' }}</td>
+      <td>{{ v.attempt_id or '—' }}</td><td>{{ v.detail }}</td><td>{{ v.ts }}</td></tr>
+  {% else %}
+    <tr><td colspan="5">None.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Notifications</h2>
+<table>
+  <thead><tr><th>Channel</th><th>Status</th><th>Payload</th><th>When</th></tr></thead>
+  <tbody>
+  {% for n in notifications %}
+    <tr><td>{{ n.channel }}</td><td>{{ n.status }}</td>
+      <td><code>{{ n.payload_redacted }}</code></td><td>{{ n.ts }}</td></tr>
+  {% else %}
+    <tr><td colspan="4">None.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Spec amendments</h2>
+<table>
+  <thead><tr><th>Status</th><th>Reason</th><th>Change</th><th>Guidance</th></tr></thead>
+  <tbody>
+  {% for a in amendments %}
+    <tr><td>{{ a.status }}</td><td>{{ a.reason }}</td>
+      <td><code>{{ a.suggested_change }}</code></td><td>{{ a.guidance or '—' }}</td></tr>
+  {% else %}
+    <tr><td colspan="4">None.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Tasks & attempts</h2>
+{% for tv in tasks %}
+  <section class="wave">
+    <h3>#{{ tv.task.seq }} {{ tv.task.title }}
+      <span class="badge">{{ tv.task.task_type.value }}</span>
+      <span class="badge">{{ tv.task.status.value }}</span></h3>
+    {% for av in tv.attempts %}
+      <h4>Attempt {{ av.attempt.attempt_num }} — {{ av.attempt.status.value }}
+        ({{ av.attempt.turns_used }} turns)</h4>
+      {% if av.attempt.failure_reason %}
+        <p class="error">Failure: {{ av.attempt.failure_reason }}</p>
+      {% endif %}
+      <h5>Tool calls</h5>
+      <table>
+        <thead><tr><th>When</th><th>Tool</th><th>ms</th><th>Scope violation</th>
+            <th>Held</th><th>Verdict</th><th>Output (excerpt)</th></tr></thead>
+        <tbody>
+        {% for c in av.tool_calls %}
+          <tr><td>{{ c.ts }}</td><td><code>{{ c.tool_name }}</code></td>
+            <td>{{ c.duration_ms if c.duration_ms is not none else '—' }}</td>
+            <td>{{ "yes" if c.scope_violation else "" }}</td>
+            <td>{{ "yes" if c.held else "" }}</td>
+            <td>{% if c.verdict %}
+                  <span class="verdict verdict-{{ c.verdict }}">{{ c.verdict }}</span>
+                {% else %}—{% endif %}</td>
+            <td><code>{{ c.output_excerpt or '' }}</code></td></tr>
+        {% else %}
+          <tr><td colspan="7">No tool calls.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <h5>Prompts (per turn)</h5>
+      {% for p in av.prompts %}
+        <details class="prompt">
+          <summary>turn {{ p.turn }} — {{ p.role }} <span class="muted">{{ p.ts }}</span></summary>
+          <pre>{{ p.content }}</pre>
+        </details>
+      {% else %}
+        <p class="muted">No persisted prompts.</p>
+      {% endfor %}
+      <h5>Token usage</h5>
+      <table>
+        <thead><tr><th>Role</th><th>Model</th><th>Prompt</th><th>Completion</th>
+            <th>Cost</th><th>Estimated before call</th></tr></thead>
+        <tbody>
+        {% for u in av.usage %}
+          <tr><td>{{ u.model_role }}</td><td>{{ u.model_id }}</td>
+            <td>{{ u.prompt_tokens }}</td><td>{{ u.completion_tokens }}</td>
+            <td>${{ '%.4f'|format(u.cost_usd) }}</td>
+            <td>${{ '%.4f'|format(u.estimated_before_call) }}</td></tr>
+        {% else %}
+          <tr><td colspan="6">None.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <h5>Events</h5>
+      {% for e in av.events %}
+        <div class="evt evt-info">{{ e.ts }} {{ e.event_type }}
+          <code>{{ e.payload }}</code></div>
+      {% else %}
+        <p class="muted">No attempt-scoped events.</p>
+      {% endfor %}
+    {% endfor %}
+  </section>
+{% else %}
+  <p class="muted">No tasks.</p>
+{% endfor %}
+{% endblock %}

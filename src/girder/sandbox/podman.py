@@ -8,6 +8,10 @@ Every mechanical property of the sandbox is expressed in the ``run`` argv the
   cannot be remounted writable (plan.md §8.2 Layer 1).
 * ``--network none`` by default — dependencies come from RO cache mounts and
   the pre-baked runner image, never the internet (§8.1).
+* ``network="private"`` (spec §3.1: "slirp4netns, loopback only") currently
+  maps to the *default bridge* — host-local connectivity, not loopback-only.
+  Rootless podman has no clean loopback-only flag, so this is a documented
+  deviation from §3.1, not an implementation of it.
 * the test snapshot shadows the worktree's own test directory at the same
   path: writes there fail with ``EROFS`` even though ``/workspace`` is RW.
 * timeouts are enforced *here*, orchestrator-side, by killing the container.
@@ -21,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from girder.sandbox.engine import (
@@ -63,6 +68,10 @@ class PodmanEngine(SandboxEngine):
             "--security-opt",
             "no-new-privileges",
             "--network",
+            # spec §3.1 describes network="private" as "slirp4netns, loopback
+            # only", but rootless podman offers no loopback-only flag, so it
+            # maps to the default bridge (host-local, NOT loopback-only) — a
+            # documented deviation, not a faithful implementation of §3.1.
             spec.network if spec.network != "private" else "bridge",
             "--pids-limit",
             str(spec.pids_limit),
@@ -148,3 +157,32 @@ class PodmanEngine(SandboxEngine):
 
     async def remove(self, name: str) -> None:
         await run_host_cmd([self.runtime, "rm", "-f", name], check=False)
+
+    # ------------------------------------------------------------------- logs
+
+    async def stream_logs(self, name: str) -> AsyncIterator[str]:
+        """Yield combined stdout+stderr lines from ``<runtime> logs --follow``.
+
+        Breaking out of the iterator (GeneratorExit / task cancellation)
+        terminates the streaming subprocess; the container itself is left
+        running — kill() remains the owner of its lifecycle.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            self.runtime,
+            "logs",
+            "--follow",
+            name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        try:
+            async for raw in proc.stdout:
+                yield raw.decode(errors="replace").rstrip("\n")
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.shield(proc.wait())
+                except asyncio.CancelledError:
+                    pass

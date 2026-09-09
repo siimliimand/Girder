@@ -9,6 +9,7 @@ import pytest
 
 from girder.db.models import TaskType
 from girder.gitops.audit import DiffAudit, GitOpsError
+from girder.gitops.audit import TestManifest as Manifest
 from girder.util import run_host_cmd
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
@@ -154,3 +155,97 @@ async def test_snapshot_invalid_path_raises(repo: Path, tmp_path: Path) -> None:
         await _audit().materialize_test_snapshot(
             repo, "HEAD", ["no/such/path.py"], tmp_path / "dest"
         )
+
+
+# --- commit-level audit (Sprint 5: integrator gate, no worktree) ---
+
+
+async def test_manifest_from_commit_matches_capture(repo: Path, tmp_path: Path) -> None:
+    commit = (await _git(repo, "rev-parse", "HEAD")).strip()
+    from_commit = await _audit().manifest_from_commit(repo, commit)
+    from_worktree = await _audit().capture_test_manifest(repo)
+    assert from_commit.root_hash == from_worktree.root_hash
+    assert from_commit.files == from_worktree.files
+
+
+async def test_audit_commit_test_path_violation(repo: Path) -> None:
+    base = (await _git(repo, "rev-parse", "HEAD")).strip()
+    (repo / "tests" / "test_app.py").write_text("def test_a(): assert False\n")
+    head = await _commit_all(repo, "weaken test")
+    result = await _audit().audit_commit(
+        repo,
+        task_type=TaskType.CODE_CHANGE,
+        scope_globs=["**"],
+        base_commit=base,
+        commit=head,
+    )
+    assert not result.passed
+    assert result.test_path_violations == ["tests/test_app.py"]
+    assert result.uncommitted_leftovers == []
+
+
+async def test_audit_commit_out_of_scope(repo: Path) -> None:
+    base = (await _git(repo, "rev-parse", "HEAD")).strip()
+    (repo / "app.py").write_text("x = 12\n")
+    head = await _commit_all(repo, "change app")
+    result = await _audit().audit_commit(
+        repo,
+        task_type=TaskType.CODE_CHANGE,
+        scope_globs=["tests/**"],
+        base_commit=base,
+        commit=head,
+    )
+    assert not result.passed
+    assert result.out_of_scope_writes == ["app.py"]
+
+
+async def test_audit_commit_content_hash_mismatch_with_files(repo: Path) -> None:
+    base = (await _git(repo, "rev-parse", "HEAD")).strip()
+    start = await _audit().capture_test_manifest(repo)
+    (repo / "conftest.py").write_text("# sneaky root conftest\n")
+    head = await _commit_all(repo, "add root conftest")
+    result = await _audit().audit_commit(
+        repo,
+        task_type=TaskType.CODE_CHANGE,
+        scope_globs=["**"],
+        base_commit=base,
+        commit=head,
+        start_manifest=start,
+    )
+    assert not result.passed
+    assert result.content_hash_mismatches == ["conftest.py"]
+
+
+async def test_audit_commit_content_hash_mismatch_root_hash_only(repo: Path) -> None:
+    """start_manifest carries only the root hash (files={}) — best-effort path
+    attribution: every changed test-signal path is reported."""
+    base = (await _git(repo, "rev-parse", "HEAD")).strip()
+    start = await _audit().capture_test_manifest(repo)
+    assert start.files  # sanity: populated before stripping
+    stripped = Manifest(root_hash=start.root_hash, files={})
+    (repo / "tests" / "test_app.py").write_text("def test_hacked(): pass\n")
+    head = await _commit_all(repo, "weaken test")
+    result = await _audit().audit_commit(
+        repo,
+        task_type=TaskType.CODE_CHANGE,
+        scope_globs=["**"],
+        base_commit=base,
+        commit=head,
+        start_manifest=stripped,
+    )
+    assert not result.passed
+    assert result.content_hash_mismatches == ["tests/test_app.py"]
+
+
+async def test_audit_commit_clean_when_no_manifest(repo: Path) -> None:
+    base = (await _git(repo, "rev-parse", "HEAD")).strip()
+    (repo / "app.py").write_text("x = 13\n")
+    head = await _commit_all(repo, "change app")
+    result = await _audit().audit_commit(
+        repo,
+        task_type=TaskType.CODE_CHANGE,
+        scope_globs=["**"],
+        base_commit=base,
+        commit=head,
+    )
+    assert result.passed, result

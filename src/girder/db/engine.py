@@ -6,8 +6,12 @@ Guarantees (impl-plan §6.2 / plan.md §5.5):
   single :class:`asyncio.Lock` — exactly one writer at a time, no lost updates.
 * Migrations are ordered, hash-recorded SQL files. Editing an already-applied
   migration file changes its hash and **fails the next boot** (history is
-  tamper-evident). All shipped DDL is idempotent so a crash between applying a
-  script and recording its version is safe to re-apply.
+  tamper-evident). Each migration is applied inside ONE ``BEGIN IMMEDIATE``
+  transaction together with its ``schema_migrations`` version-row insert, so a
+  crash mid-migration rolls back atomically (§4.1). Self-heal: a database
+  poisoned by the pre-transaction runner (a bare ``ALTER TABLE ... ADD COLUMN``
+  applied but the version row lost) is repaired at boot by re-applying the
+  script while skipping statements that fail with duplicate-column errors.
 * State is committed before the caller proceeds — the ``tx()`` context manager
   is the single write path.
 """
@@ -16,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,6 +32,8 @@ from typing import Any
 import aiosqlite
 
 from girder.util import utcnow_iso
+
+log = logging.getLogger(__name__)
 
 
 class MigrationError(RuntimeError):
@@ -82,7 +90,14 @@ class Database:
             await conn.execute(pragma)
         db = cls(conn)
         if run_migrations:
-            await db.migrate(migrations_dir or default_migrations_dir())
+            try:
+                await db.migrate(migrations_dir or default_migrations_dir())
+            except BaseException:
+                # A leaked unclosed connection keeps the aiosqlite worker
+                # thread alive, which blocks interpreter shutdown forever —
+                # every migration failure would look like a mystery hang.
+                await conn.close()
+                raise
         return db
 
     async def close(self) -> None:
@@ -104,7 +119,19 @@ class Database:
             await self.conn.execute("COMMIT")
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
-        return await self.conn.execute(sql, params)
+        """Ad-hoc single-statement write: execute + commit, serialized with tx().
+
+        The connection runs with ``isolation_level=None`` (autocommit), so the
+        statement is its own transaction — but it must hold the same write
+        lock as :meth:`tx`, otherwise a concurrent wave task's plain write
+        lands inside someone else's open ``BEGIN IMMEDIATE`` and its commit
+        would commit a half-finished transaction (Sprint 5: concurrent wave
+        engines are the first concurrent users of one Database).
+        """
+        async with self._write_lock:
+            cur = await self.conn.execute(sql, params)
+            await self.conn.commit()
+            return cur
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
         async with self.conn.execute(sql, params) as cur:
@@ -147,11 +174,7 @@ class Database:
                 continue
             script = f.read_text()
             try:
-                await self.conn.executescript(script)
-                await self.conn.execute(
-                    "INSERT INTO schema_migrations (version, sha256, applied_at) VALUES (?, ?, ?)",
-                    (version, digest, utcnow_iso()),
-                )
+                await self._apply_migration(version, digest, script)
             except Exception as exc:
                 raise MigrationError(f"migration {f.name} failed: {exc}") from exc
             newly_applied.append(version)
@@ -163,9 +186,99 @@ class Database:
             raise MigrationError(f"applied migrations missing from disk: {sorted(missing)}")
         return newly_applied
 
+    async def _apply_migration(self, version: int, digest: str, script: str) -> None:
+        """Apply one migration atomically (impl-plan §4.1).
+
+        The script is split into individual statements (``executescript``
+        implicitly COMMITs and cannot run inside an explicit transaction) and
+        executed inside a single ``BEGIN IMMEDIATE`` together with the
+        ``schema_migrations`` version-row insert — a crash mid-script rolls
+        back completely, leaving no partial state.
+
+        Self-heal for databases poisoned by the pre-transaction runner (which
+        used ``executescript`` on an autocommit connection): if the version
+        row is absent but a statement fails with ``duplicate column name``
+        (i.e. a partial application survived a crash), roll back and re-apply
+        skipping statements that fail with duplicate-column errors, logging
+        each skip. Any other error hard-fails boot.
+        """
+        statements = _split_statements(script)
+        skip: set[int] = set()
+        while True:
+            async with self._write_lock:
+                await self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for i, stmt in enumerate(statements):
+                        if i in skip:
+                            continue
+                        try:
+                            await self.conn.execute(stmt)
+                        except aiosqlite.OperationalError as exc:
+                            if "duplicate column name" not in str(exc).lower():
+                                raise
+                            log.warning(
+                                "migration v%d: statement already applied by a crashed"
+                                " pre-transaction run; skipping: %s",
+                                version,
+                                _first_line(stmt),
+                            )
+                            raise _DuplicateColumn(i) from exc
+                    await self.conn.execute(
+                        "INSERT INTO schema_migrations (version, sha256, applied_at)"
+                        " VALUES (?, ?, ?)",
+                        (version, digest, utcnow_iso()),
+                    )
+                except _DuplicateColumn as exc:
+                    await self.conn.execute("ROLLBACK")
+                    skip.add(exc.index)
+                    continue
+                except aiosqlite.Error:
+                    await self.conn.execute("ROLLBACK")
+                    raise
+                await self.conn.execute("COMMIT")
+            return
+
     @staticmethod
     def _version_of(f: Path) -> int:
         m = _VERSION_RE.match(f.name)
         if not m:
             raise MigrationError(f"migration file {f.name} must be named NNN_description.sql")
         return int(m.group(1))
+
+
+class _DuplicateColumn(Exception):
+    """Internal: a statement failed with 'duplicate column name' (self-heal)."""
+
+    def __init__(self, index: int) -> None:
+        super().__init__(index)
+        self.index = index
+
+
+def _split_statements(script: str) -> list[str]:
+    """Split a SQL script into complete statements.
+
+    ``executescript`` cannot run inside an explicit transaction (it implicitly
+    COMMITs), so scripts are applied statement-by-statement instead.
+    ``sqlite3.complete_statement`` handles comments and string literals.
+    """
+    statements: list[str] = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt:
+                statements.append(stmt)
+            buf = ""
+    tail = buf.strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _first_line(sql: str) -> str:
+    """Compact one-line summary of a statement, leading comments stripped."""
+    body = "\n".join(
+        line for line in sql.splitlines() if not line.lstrip().startswith("--")
+    ).strip()
+    return " ".join(body.split())[:80]

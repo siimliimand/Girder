@@ -39,53 +39,71 @@ Narrative.
 
 async def test_sc02_test_write_held_then_direct_mutation_fails_run(make_ctx: MakeCtx) -> None:
     ctx = await make_ctx(PROPOSAL)
+    # Sprint 5: both tasks run concurrently in wave 0, so each task's turns
+    # are routed by title instead of relying on FIFO order.
     gateway = FakeGateway(
-        responses=[
+        responses=[],
+        routes={
             # Task 1: first try to tamper with the frozen test file — held.
-            resp(
-                calls=[
-                    tc(
-                        "1",
-                        "write_file",
-                        json.dumps(
-                            {
-                                "path": "tests/test_arithmetic.py",
-                                "content": "def test_hacked():\n    assert False\n",
-                            }
-                        ),
-                    )
-                ]
-            ),
-            # ...then comply legitimately.
-            resp(
-                calls=[
-                    tc(
-                        "2",
-                        "write_file",
-                        json.dumps({"path": "src/util.py", "content": "x = 1\n"}),
-                    )
-                ]
-            ),
-            resp(calls=[tc("2-c", "run_command", '{"cmd":"git add -A && git commit -m work"}')]),
-            resp(calls=[tc("2-d", "mark_task_complete", '{"summary":"added util"}')]),
+            "Add util module": [
+                resp(
+                    calls=[
+                        tc(
+                            "1",
+                            "write_file",
+                            json.dumps(
+                                {
+                                    "path": "tests/test_arithmetic.py",
+                                    "content": "def test_hacked():\n    assert False\n",
+                                }
+                            ),
+                        )
+                    ]
+                ),
+                # ...then comply legitimately.
+                resp(
+                    calls=[
+                        tc(
+                            "2",
+                            "write_file",
+                            json.dumps({"path": "src/util.py", "content": "x = 1\n"}),
+                        )
+                    ]
+                ),
+                resp(
+                    calls=[tc("2-c", "run_command", '{"cmd":"git add -A && git commit -m work"}')]
+                ),
+                resp(calls=[tc("2-d", "mark_task_complete", '{"summary":"added util"}')]),
+            ],
             # Task 2 (scope INCLUDES tests/**): the registry lets the write
             # through, but the mechanical audit must fail it without retry.
-            resp(
-                calls=[
-                    tc(
-                        "3",
-                        "write_file",
-                        json.dumps(
-                            {"path": "tests/new_test.py", "content": "def test_x():\n    pass\n"}
-                        ),
-                    )
-                ]
-            ),
-            resp(calls=[tc("3-c", "run_command", '{"cmd":"git add -A && git commit -m sneaky"}')]),
-            resp(calls=[tc("3-d", "mark_task_complete", '{"summary":"sneaky"}')]),
-        ]
+            "Touch the test tree": [
+                resp(
+                    calls=[
+                        tc(
+                            "3",
+                            "write_file",
+                            json.dumps(
+                                {
+                                    "path": "tests/new_test.py",
+                                    "content": "def test_x():\n    pass\n",
+                                }
+                            ),
+                        )
+                    ]
+                ),
+                resp(
+                    calls=[
+                        tc("3-c", "run_command", '{"cmd":"git add -A && git commit -m sneaky"}')
+                    ]
+                ),
+                resp(calls=[tc("3-d", "mark_task_complete", '{"summary":"sneaky"}')]),
+            ],
+        },
     )
-    tip_before = (await git(ctx.repo_path, "rev-parse", "main")).strip()
+    # Baseline for "nothing merged": the run branch's own tip (it carries the
+    # spec-freeze commit, so main's tip is not a meaningful comparator).
+    tip_before = (await git(ctx.repo_path, "rev-parse", ctx.run.branch)).strip()
 
     descriptor = await ctx.engine(gateway).run_to_completion(ctx.run.id)
     assert descriptor == "failed"
@@ -93,9 +111,12 @@ async def test_sc02_test_write_held_then_direct_mutation_fails_run(make_ctx: Mak
     fresh = await repo.get_run(ctx.db, ctx.run.id)
     assert fresh is not None and fresh.status is RunStatus.FAILED
     tasks = await repo.list_tasks_for_run(ctx.db, ctx.run.id)
-    assert [t.status for t in tasks] == [TaskStatus.COMPLETED, TaskStatus.FAILED]
+    # Sprint 5 wave mode: both tasks run concurrently in wave 0; task 2's
+    # integrity violation fails the run BEFORE integration, so task 1 is left
+    # verified-but-unintegrated and the run branch never moves.
+    assert [t.status for t in tasks] == [TaskStatus.VERIFY_PASSED, TaskStatus.FAILED]
     tip_after = (await git(ctx.repo_path, "rev-parse", fresh.branch)).strip()
-    assert tip_after != tip_before  # task 1 merged; task 2 never did
+    assert tip_after == tip_before  # an integrity-violating run never merges
 
     # Task 1's attempt: exactly one held tool_call row (the test write)
     attempts1 = await ctx.db.fetchall(

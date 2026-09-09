@@ -28,6 +28,7 @@ import logging
 import shutil
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from girder.budget.guard import BudgetExceeded
@@ -40,7 +41,7 @@ from girder.github.ci import CiPoller, CiSnapshot, extract_test_ids
 from girder.github.client import GitHubClient
 from girder.github.conformance import ConformanceError, ConformanceReviewer
 from girder.github.diagnostic import DiagnosticEngine
-from girder.github.flaky import FlakyBreaker
+from girder.github.flaky import FlakeClassification, FlakyBreaker
 from girder.gitops.branch import BranchOps
 from girder.gitops.worktree import WorktreeManager
 from girder.guard.redact import Redactor
@@ -136,7 +137,7 @@ class DeliveryEngine:
             )
             return await transition_run(self.db, run.id, RunStatus.FAILED,
                                         payload={"reason": reason})
-        green, tail = await self._final_suite_green(run, repo_path)
+        green, tail, _red_ids = await self._final_suite_green(run, repo_path)
         await repo.insert_event(
             self.db, "delivery_suite", {"green": green, "tail_redacted": tail}, run_id=run.id
         )
@@ -187,6 +188,24 @@ class DeliveryEngine:
         return await self._classify_and_route(run, sha, snapshot)
 
     async def _pump_ci_running(self, run: Run) -> str:
+        # Poll deadline (impl-plan §6.11: timeout ⇒ escalated, never poll
+        # forever). Measured from the run's FIRST entry into ci_running —
+        # ci_fixing → ci_running re-entries do not reset it — and derived
+        # from the persisted state_transition event, so it survives a
+        # restart (fresh boot re-derives the same deadline).
+        ts = await repo.get_first_transition_ts_to(
+            self.db, run.id, RunStatus.CI_RUNNING.value
+        )
+        if ts is not None:
+            entered = datetime.fromisoformat(ts)
+            waited_s = (datetime.now(UTC) - entered).total_seconds()
+            timeout_s = self.settings.github.poll_timeout_s
+            if waited_s > timeout_s:
+                return await self._escalate(
+                    run,
+                    f"CI checks still pending after {waited_s:.0f}s in ci_running "
+                    f"(budget {timeout_s:.0f}s) — poll timeout ⇒ escalated",
+                )
         sha = await self._head_of(run)
         snapshot = await self._observe(run, sha)
         if snapshot is None:
@@ -209,45 +228,93 @@ class DeliveryEngine:
             *[excerpt for check in snapshot.failed
               for excerpt in (check.output_summary, check.output_text)]
         )
+        repo_path = await self._repo_path_of(run)
+        project = await self._project_of(run)
+        breaker = FlakyBreaker(
+            db=self.db, sandbox=self.sandbox, settings=self.settings,
+            redactor=self.redactor,
+        )
+        classifications: list[FlakeClassification]
         if test_ids:
-            repo_path = await self._repo_path_of(run)
-            project = await self._project_of(run)
-            breaker = FlakyBreaker(
-                db=self.db, sandbox=self.sandbox, settings=self.settings,
-                redactor=self.redactor,
-            )
             classifications = await breaker.classify(
                 project=project, run=run, test_ids=test_ids,
                 commit_sha=sha, repo_path=repo_path,
             )
-            verdicts = {c.verdict for c in classifications}
-            if "regression" in verdicts:
-                return await self._escalate(
-                    run,
-                    "new flake regression: nondeterminism appeared with the agent's diff "
-                    f"(SC-10): {[c.test_id for c in classifications if c.verdict == 'regression']}",
-                )
-            if "baseline_broken" in verdicts:
-                return await self._escalate(
-                    run,
-                    "CI failures pre-exist on the baseline — never auto-fixed: "
-                    f"{[c.test_id for c in classifications if c.verdict == 'baseline_broken']}",
-                )
-            if verdicts and verdicts <= {"known_flaky"}:
-                await repo.insert_event(
-                    self.db,
-                    "ci_green_known_flaky",
-                    {"known_flaky": sorted(test_ids)},
-                    run_id=run.id,
-                )
-                await transition_run(self.db, run.id, RunStatus.CONFORMANCE_REVIEW,
-                                     payload={"head_sha": sha, "flaky": sorted(test_ids)})
-                return "ci_green_flaky"
-            # real_failure ⇒ fall through to the diagnostic fix agent.
+        else:
+            # No nodeids extractable from the CI log — classification must not
+            # be skipped (impl-plan §6.11 guarantee: baseline-broken is never
+            # auto-fixed). Classify from a local suite run on the run head.
+            from_local = await self._classify_from_local_suite(
+                run, sha, breaker, project, repo_path
+            )
+            if from_local is None:
+                return "escalated"  # unattributable divergence — already escalated
+            classifications = from_local
+
+        verdicts = {c.verdict for c in classifications}
+        if "regression" in verdicts:
+            return await self._escalate(
+                run,
+                "new flake regression: nondeterminism appeared with the agent's diff "
+                f"(SC-10): {[c.test_id for c in classifications if c.verdict == 'regression']}",
+            )
+        if "baseline_broken" in verdicts:
+            return await self._escalate(
+                run,
+                "CI failures pre-exist on the baseline — never auto-fixed: "
+                f"{[c.test_id for c in classifications if c.verdict == 'baseline_broken']}",
+            )
+        if verdicts and verdicts <= {"known_flaky"}:
+            await repo.insert_event(
+                self.db,
+                "ci_green_known_flaky",
+                {"known_flaky": sorted(test_ids)},
+                run_id=run.id,
+            )
+            await transition_run(self.db, run.id, RunStatus.CONFORMANCE_REVIEW,
+                                 payload={"head_sha": sha, "flaky": sorted(test_ids)})
+            return "ci_green_flaky"
+        # real_failure ⇒ fall through to the diagnostic fix agent.
 
         await transition_run(self.db, run.id, RunStatus.CI_FIXING,
                              payload={"failed": [c.name for c in snapshot.failed]})
         return "ci_red_fixing"
+
+    async def _classify_from_local_suite(
+        self,
+        run: Run,
+        sha: str,
+        breaker: FlakyBreaker,
+        project: Project,
+        repo_path: Path,
+    ) -> list[FlakeClassification] | None:
+        """Classification source when the CI log yields no pytest nodeids.
+
+        Runs the full suite locally on the run head. Locally RED ⇒ classify
+        the failing set against the baseline/flake registry exactly as the
+        extracted-nodeid path would — this preserves the impl-plan §6.11
+        guarantee that a baseline-broken test failure is never auto-fixed,
+        even when its CI log formatting defeats nodeid extraction. Locally
+        GREEN ⇒ the CI failure is not a test failure at all (lint/env/
+        infra-shaped) ⇒ no test could be masked, so the failure is novel and
+        goes to the diagnostic fix agent (SC-09's linter-mismatch case). An
+        unparseable local report is unattributable: escalate, never auto-fix.
+        ``None`` ⇒ the run was escalated here.
+        """
+        green, _tail, red_ids = await self._final_suite_green(run, repo_path)
+        if green:
+            return []
+        if not red_ids:
+            await self._escalate(
+                run,
+                "CI is red and the local junit report yielded no test results — "
+                "cannot classify the failure; human review required",
+            )
+            return None
+        return await breaker.classify(
+            project=project, run=run, test_ids=red_ids,
+            commit_sha=sha, repo_path=repo_path,
+        )
 
     async def _pump_ci_fixing(self, run: Run) -> str:
         """One diagnostic fix episode: build failure report, run the fix agent,
@@ -331,13 +398,16 @@ class DeliveryEngine:
         return await self._merge(run, project)
 
     async def _park_for_human(self, run: Run, project: Project, reason: str) -> str:
-        await self._notify(
-            "info",
-            "Girder: PR ready to merge",
+        body = (
             f"run {run.id} (project {project.name}, tier {project.autonomy_tier}): "
-            f"PR #{run.pr_number} — {reason}",
-            run,
+            f"PR #{run.pr_number} — {reason}"
         )
+        # §9.2: the parked-for-human notification carries the diff summary,
+        # same as the T1 merged notification.
+        stat = await self._diff_stat(run, await self._repo_path_of(run))
+        if stat:
+            body += f"\n{stat}"
+        await self._notify("info", "Girder: PR ready to merge", body, run)
         await transition_run(self.db, run.id, RunStatus.MERGE_PENDING_HUMAN,
                              payload={"reason": reason})
         return "merge_pending_human"
@@ -357,6 +427,10 @@ class DeliveryEngine:
             fresh.pr_number, commit_title=f"{fresh.branch}: {fresh.intent.strip()[:60]}"
         )
         if not outcome.merged:
+            # §9.2: a refused/escalated merge is not a clean merge — reset the
+            # streak (regression/baseline escalations are not merges and keep
+            # their current behavior).
+            await repo.reset_clean_merge_streak(self.db, project.id)
             return await self._escalate(
                 run, f"GitHub merge refused for PR #{fresh.pr_number}: {outcome.reason}"
             )
@@ -412,12 +486,19 @@ class DeliveryEngine:
         self._last_poll[run.id] = time.monotonic()
         return await self._poller.observe(run=run, head_sha=sha)
 
-    async def _final_suite_green(self, run: Run, repo_path: Path) -> tuple[bool, str | None]:
-        """Run the full suite on the run branch in a sandbox (D4 check 1)."""
+    async def _final_suite_green(
+        self, run: Run, repo_path: Path
+    ) -> tuple[bool, str | None, list[str]]:
+        """Run the full suite on the run branch in a sandbox (D4 check 1).
+
+        Returns ``(green, redacted tail when red, failing nodeids)`` — the
+        nodeids feed baseline/flaky classification when the CI log itself
+        yields none (impl-plan §6.11).
+        """
         branch_ops = BranchOps(repo_path)
         tip = await branch_ops.run_branch_tip(run.branch)
         if tip is None:
-            return False, f"run branch missing: {run.branch}"
+            return False, f"run branch missing: {run.branch}", []
         tmp = Path(tempfile.mkdtemp(prefix="girder-delivery-"))
         worktree = tmp / "wt"
         container: str | None = None
@@ -441,21 +522,21 @@ class DeliveryEngine:
             )
             xml = worktree / DELIVERY_XML
             if exec_res.timed_out:
-                return False, "delivery suite exceeded wall-clock limit"
+                return False, "delivery suite exceeded wall-clock limit", []
             if exec_res.exit_code != 0 and not xml.exists():
-                return False, self._tail(exec_res.stderr)
+                return False, self._tail(exec_res.stderr), []
             if not xml.exists():
-                return False, "junit report missing after delivery suite"
+                return False, "junit report missing after delivery suite", []
             results = parse_junit_xml(xml.read_text(errors="replace"))
             if not results:
-                return False, "delivery junit report contained zero testcases"
+                return False, "delivery junit report contained zero testcases", []
             red = sorted(
                 t for t, r in results.items() if r.status not in ("passed", "skipped")
             )
             tail = self._tail(exec_res.stdout + exec_res.stderr) if red else None
-            return (not red), tail
+            return (not red), tail, red
         except SandboxTimeout:
-            return False, "delivery suite sandbox timeout"
+            return False, "delivery suite sandbox timeout", []
         finally:
             if container is not None:
                 await self.sandbox.kill(container)

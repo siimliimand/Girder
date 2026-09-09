@@ -72,7 +72,7 @@ async def test_happy_path(db, run) -> None:  # type: ignore[no-untyped-def]
     assert by_seq[1].depends_on == []
     assert by_seq[2].task_type.value == "test_change"
     assert by_seq[2].scope_globs == ["tests/auth/**"]
-    assert by_seq[2].depends_on == ["auth-endpoint"]
+    assert by_seq[2].depends_on == [by_seq[1].id]
 
     # persisted, in seq order, under the run's wave 0
     stored = await repo.list_tasks_for_run(db, run.id)
@@ -149,6 +149,81 @@ async def test_synthesized_slice_fallback(db, run) -> None:  # type: ignore[no-u
         assert task_spec.type.value in task.spec_slice_md
         for glob in task_spec.scope_globs:
             assert glob in task.spec_slice_md
+
+
+def _multi_task_spec_text(task_block: str) -> str:
+    return (
+        "---\n"
+        "schema: girder.openspec/v1\n"
+        "title: Chain\n"
+        "intent: Dependency chain.\n"
+        "tasks:\n"
+        f"{task_block}"
+        "---\n"
+        "## Narrative\n\n"
+        "Context.\n"
+    )
+
+
+async def test_depends_on_resolved_to_db_ids_diamond(db, run) -> None:  # type: ignore[no-untyped-def]
+    spec = parse_spec(
+        _multi_task_spec_text(
+            "  - id: a\n"
+            "    title: A\n"
+            "    type: code_change\n"
+            '    scope_globs: ["a/**"]\n'
+            "    success_criteria: [works]\n"
+            "    depends_on: []\n"
+            "  - id: b\n"
+            "    title: B\n"
+            "    type: code_change\n"
+            '    scope_globs: ["b/**"]\n'
+            "    success_criteria: [works]\n"
+            "    depends_on: [a]\n"
+            "  - id: c\n"
+            "    title: C\n"
+            "    type: code_change\n"
+            '    scope_globs: ["c/**"]\n'
+            "    success_criteria: [works]\n"
+            "    depends_on: [a, b]\n"
+        )
+    )
+    tasks = await decompose_spec(db, run, spec)
+    by_id = {t.title: t for t in tasks}
+    assert by_id["C"].depends_on == [by_id["A"].id, by_id["B"].id]
+    assert by_id["B"].depends_on == [by_id["A"].id]
+    assert by_id["A"].depends_on == []
+
+    # persisted, not just in-memory
+    stored = {t.title: t for t in await repo.list_tasks_for_run(db, run.id)}
+    assert stored["C"].depends_on == [stored["A"].id, stored["B"].id]
+
+    event = await repo.get_latest_event(db, run.id, "spec_decomposed")
+    assert event is not None
+    assert event["payload"]["depends_on_edges"] == 3
+
+
+async def test_forward_reference_resolves(db, run) -> None:  # type: ignore[no-untyped-def]
+    spec = parse_spec(
+        _multi_task_spec_text(
+            "  - id: first\n"
+            "    title: First\n"
+            "    type: code_change\n"
+            '    scope_globs: ["x/**"]\n'
+            "    success_criteria: [works]\n"
+            "    depends_on: [second]\n"
+            "  - id: second\n"
+            "    title: Second\n"
+            "    type: code_change\n"
+            '    scope_globs: ["y/**"]\n'
+            "    success_criteria: [works]\n"
+            "    depends_on: []\n"
+        )
+    )
+    tasks = await decompose_spec(db, run, spec)
+    by_title = {t.title: t for t in tasks}
+    assert by_title["First"].depends_on == [by_title["Second"].id]
+    assert by_title["Second"].depends_on == []
 
 
 def test_template_task_sections_extractable() -> None:

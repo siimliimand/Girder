@@ -1,0 +1,77 @@
+{# Merge queue: T0 runs awaiting human merge + per-project tier table (WP 6.4). #}
+{% extends "base.html" %}
+{% block content %}
+<h1>Merge queue</h1>
+<table>
+  <thead><tr><th>Project</th><th>Run</th><th>PR</th><th>Branch</th>
+      <th>Spend / cap</th><th></th></tr></thead>
+  <tbody>
+  {% for q in queue %}
+    <tr>
+      <td><a href="/projects/{{ q.project_id }}">{{ q.project_name }}</a></td>
+      <td><a href="/runs/{{ q.run_id }}"><code>{{ q.run_id[:8] }}</code></a></td>
+      <td>{% if q.pr_number %}#{{ q.pr_number }}{% else %}—{% endif %}</td>
+      <td><code>{{ q.branch }}</code></td>
+      <td>${{ '%.4f'|format(q.spend_usd) }} / ${{ '%.2f'|format(q.budget_cap_usd) }}</td>
+      <td>
+        {% if q.pr_number %}
+        <form method="post" action="/api/runs/{{ q.run_id }}/merge"
+              onsubmit="return confirm('Merge PR #{{ q.pr_number }} for run {{ q.run_id[:8] }}?');">
+          <button type="submit">Merge</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6">Nothing awaiting human merge.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Projects</h2>
+<table>
+  <thead><tr><th>Project</th><th>Tier</th><th>Clean merge streak</th>
+      <th>Unreviewed merges</th></tr></thead>
+  <tbody>
+  {% for p in projects %}
+    <tr>
+      <td><a href="/projects/{{ p.id }}">{{ p.name }}</a></td>
+      <td>T{{ p.autonomy_tier }}</td>
+      <td>{{ p.clean_merge_streak }}
+        (<a href="/projects/{{ p.id }}/tier">tier console</a>)</td>
+      <td>{{ unreviewed.get(p.id, 0) }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Merged runs — review window</h2>
+<table>
+  <thead><tr><th>Run</th><th>Project</th><th>PR</th><th>Branch</th>
+      <th>Review</th><th></th></tr></thead>
+  <tbody>
+  {% for m in merged %}
+    <tr>
+      <td><a href="/runs/{{ m.run_id }}"><code>{{ m.run_id[:8] }}</code></a></td>
+      <td><a href="/projects/{{ m.project_id }}">{{ m.project_name }}</a></td>
+      <td>{% if m.pr_number %}#{{ m.pr_number }}{% else %}—{% endif %}</td>
+      <td><code>{{ m.branch }}</code></td>
+      <td>{% if m.reviewed %}
+            <span class="badge badge-merged">reviewed</span>
+          {% else %}
+            <span class="badge badge-spec_pending">unreviewed</span>
+          {% endif %}</td>
+      <td>
+        {% if not m.reviewed %}
+        <form method="post" action="/api/runs/{{ m.run_id }}/reviewed">
+          <button type="submit">Mark reviewed</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6">No merged runs.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,9 @@ from girder.util import run_host_cmd
 log = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://api.github.com"
+
+#: Cap on the Actions job-log tail kept as a check excerpt (§8.6: excerpts only).
+_LOG_TAIL_CHARS = 2000
 
 
 class GitHubError(RuntimeError):
@@ -49,6 +52,9 @@ class CheckRun:
     url: str | None = None
     output_summary: str | None = None
     output_text: str | None = None
+    # check-run id (== the Actions job id for GHA runs); used for the
+    # job-logs fallback when the check-run output is empty (impl-plan §6.11)
+    id: str | None = None
 
     @property
     def completed(self) -> bool:
@@ -121,14 +127,23 @@ class GitHubClient:
     # ------------------------------------------------------------- primitives
 
     async def _request(
-        self, method: str, path: str, *, json_body: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        ok: frozenset[int] | None = None,
     ) -> httpx.Response:
-        """One API call; raises :class:`GitHubError` on transport/HTTP failure."""
+        """One API call; raises :class:`GitHubError` on transport/HTTP failure.
+
+        ``ok`` lists extra HTTP status codes to return instead of raising
+        (e.g. the 405 a refused merge returns — the caller wants the reason).
+        """
         try:
             resp = await self._client.request(method, path, json=json_body)
         except httpx.TransportError as exc:
             raise GitHubError(f"{method} {path}: transport error: {exc}") from exc
-        if resp.status_code >= 400:
+        if resp.status_code >= 400 and (ok is None or resp.status_code not in ok):
             body = self._redact_sync(resp.text)
             raise GitHubError(f"{method} {path}: HTTP {resp.status_code}: {body[:300]}")
         await repo.insert_event(
@@ -266,7 +281,13 @@ class GitHubClient:
     # ------------------------------------------------------------------ checks
 
     async def fetch_checks(self, commit_sha: str) -> list[CheckRun]:
-        """All check runs on *commit_sha* (Checks API, impl-plan §6.11)."""
+        """All check runs on *commit_sha* (Checks API, impl-plan §6.11).
+
+        Real Actions check runs often carry an empty ``output.summary/text``;
+        when a *failed* check's output is empty we fall back to the Actions
+        job-logs API (the Actions check-run id doubles as the job id) so the
+        persisted excerpt and downstream classification keep their input.
+        """
         owner, name = await self.owner_repo()
         resp = await self._request(
             "GET", f"/repos/{owner}/{name}/commits/{commit_sha}/check-runs"
@@ -274,17 +295,39 @@ class GitHubClient:
         runs: list[CheckRun] = []
         for item in resp.json().get("check_runs", []):
             output = item.get("output") or {}
-            runs.append(
-                CheckRun(
-                    name=str(item.get("name", "unknown")),
-                    status=str(item.get("status", "queued")),
-                    conclusion=item.get("conclusion"),
-                    url=item.get("html_url"),
-                    output_summary=self._redact_sync(output.get("summary") or ""),
-                    output_text=self._redact_sync(output.get("text") or ""),
-                )
+            summary = self._redact_sync(output.get("summary") or "")
+            text = self._redact_sync(output.get("text") or "")
+            check = CheckRun(
+                name=str(item.get("name", "unknown")),
+                id=str(item["id"]) if item.get("id") is not None else None,
+                status=str(item.get("status", "queued")),
+                conclusion=item.get("conclusion"),
+                url=item.get("html_url"),
+                output_summary=summary,
+                output_text=text,
             )
+            if check.failed and not summary and not text:
+                logs = await self._job_logs(check)
+                if logs:
+                    check = replace(check, output_text=logs)
+            runs.append(check)
         return runs
+
+    async def _job_logs(self, check: CheckRun) -> str:
+        """Redacted tail of the Actions job logs for *check* ("" when unavailable)."""
+        if check.id is None:
+            return ""
+        owner, name = await self.owner_repo()
+        try:
+            resp = await self._client.get(
+                f"/repos/{owner}/{name}/actions/jobs/{check.id}/logs",
+                follow_redirects=True,  # the API 302s to the log blob
+            )
+        except httpx.TransportError:
+            return ""
+        if resp.status_code >= 400:
+            return ""
+        return self._redact_sync(resp.text[-_LOG_TAIL_CHARS:])
 
     async def fetch_failure_logs(self, commit_sha: str) -> list[CheckRun]:
         """Completed-and-failed checks with their (redacted) output excerpts."""
@@ -300,8 +343,13 @@ class GitHubClient:
         if commit_title:
             body["commit_title"] = commit_title
         resp = await self._request(
-            "PUT", f"/repos/{owner}/{name}/pulls/{pr_number}/merge", json_body=body
+            "PUT",
+            f"/repos/{owner}/{name}/pulls/{pr_number}/merge",
+            json_body=body,
+            ok=frozenset({405}),  # "not mergeable" — a refusal, not an error
         )
+        if resp.status_code == 405:
+            return MergeOutcome(False, None, str(resp.json().get("message", "merge refused")))
         payload = resp.json()
         if payload.get("merged"):
             return MergeOutcome(True, payload.get("sha"))

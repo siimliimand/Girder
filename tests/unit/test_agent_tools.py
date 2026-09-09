@@ -160,6 +160,50 @@ async def test_run_command_denied_vs_benign(seeded: tuple[Database, str, str]) -
     assert [v["kind"] for v in violations] == ["scope_violation"]
 
 
+async def test_run_command_redirect_out_of_scope_held_not_executed(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox()
+    result = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "run_command", {"cmd": "echo x > tests/test_new.py"}
+    )
+    assert not result.ok and result.held and result.scope_violation
+    assert sandbox.execs == []  # held at the scope gate — never reached sh -c
+    rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
+    assert rows[0]["scope_violation"] and rows[0]["held"]
+    violations = await db.fetchall("SELECT kind FROM integrity_violations")
+    assert [v["kind"] for v in violations] == ["scope_violation"]
+
+
+async def test_run_command_tee_in_scope_and_reads_execute(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "ok\n", ""), ExecResult(0, "body\n", "")])
+    registry = _registry(sandbox, db, run_id, attempt_id)
+
+    tee = await registry.execute("run_command", {"cmd": "tee src/allowed.py"})
+    assert tee.ok
+
+    # reads are NOT write-gated (R2): existing in-scope path passes the gate
+    cat = await registry.execute("run_command", {"cmd": "cat src/app.py"})
+    assert cat.ok
+    held = [r for r in await repo.list_tool_calls_for_attempt(db, attempt_id) if r["held"]]
+    assert held == []
+
+
+async def test_run_command_protected_redirect_held(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox()
+    result = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "run_command", {"cmd": "echo x > .github/x.yml"}
+    )
+    assert result.held and sandbox.execs == []
+
+
 async def test_output_redacted_and_truncated(seeded: tuple[Database, str, str]) -> None:
     db, run_id, attempt_id = seeded
     leaky = "\n".join(
@@ -248,3 +292,26 @@ async def test_unknown_tool_and_terminal_no_sandbox(
     assert not unknown.ok
     done = await registry.execute("mark_task_complete", {"summary": "did it"})
     assert done.ok and sandbox.execs == []
+
+
+async def test_verdict_column_reflects_scope_decision(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """One call per verdict class (impl-plan §6.6 R2): ALLOW, ALLOW_LOGGED and
+    VIOLATION must be distinguishable in the persisted ``tool_calls.verdict``
+    column (migration 011) instead of all looking identical."""
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "body\n", "")])
+    registry = _registry(sandbox, db, run_id, attempt_id)
+    # ALLOW: a write inside the declared write scope.
+    assert (await registry.execute("write_file", {"path": "src/a.py", "content": "x"})).ok
+    # ALLOW_LOGGED: a read inside the worktree (non-strict scopes).
+    assert (await registry.execute("read_file", {"path": "src/a.py"})).ok
+    # VIOLATION: a write outside the write scope — held, never executed.
+    held = await registry.execute("write_file", {"path": "tests/x.py", "content": "y"})
+    assert held.held and held.scope_violation
+    rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
+    verdicts = {r["tool_name"] + ":" + str(r["scope_violation"]): r["verdict"] for r in rows}
+    assert verdicts["write_file:0"] == "allow"
+    assert verdicts["read_file:0"] == "allow_logged"
+    assert verdicts["write_file:1"] == "violation"

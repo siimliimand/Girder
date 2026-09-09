@@ -9,6 +9,7 @@ atomic.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,7 @@ from girder.db.models import (
     TERMINAL_ATTEMPT_STATUSES,
     TERMINAL_TASK_STATUSES,
     Attempt,
+    AttemptPrompt,
     AttemptStatus,
     Project,
     Run,
@@ -48,6 +50,7 @@ _RUN_WRITABLE_FIELDS = frozenset(
         "proposal_md",
         "branch",
         "integrity_violations",
+        "paused",
     }
 )
 _TASK_WRITABLE_FIELDS = frozenset(
@@ -58,6 +61,7 @@ _TASK_WRITABLE_FIELDS = frozenset(
         "scope_globs_json",
         "spec_slice_md",
         "depends_on_json",
+        "wave_id",
     }
 )
 _ATTEMPT_WRITABLE_FIELDS = frozenset(
@@ -173,6 +177,7 @@ def _row_to_run(r: Row) -> Run:
         pr_number=r["pr_number"],
         proposal_md=r["proposal_md"],
         integrity_violations=r["integrity_violations"],
+        paused=bool(r["paused"]),
     )
 
 
@@ -192,7 +197,6 @@ async def update_run_fields(
         f"UPDATE runs SET {cols}, updated_at = ? WHERE id = ?",
         (*fields.values(), updated_at or utcnow_iso(), run_id),
     )
-    await db.conn.commit()
 
 
 async def add_spend(db: Database, run_id: str, actual_delta: float, projected_total: float) -> None:
@@ -225,7 +229,6 @@ async def insert_token_usage(
         " VALUES (?, ?, ?, ?, 0, 0, 0.0, ?, ?)",
         (attempt_id, run_id, model_role, model_id, estimated_before_call, utcnow_iso()),
     )
-    await db.conn.commit()
     return int(cur.lastrowid or 0)
 
 
@@ -243,7 +246,6 @@ async def update_token_usage_actual(
         " WHERE id = ?",
         (prompt_tokens, completion_tokens, cost_usd, usage_id),
     )
-    await db.conn.commit()
 
 
 async def list_token_usage_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
@@ -278,6 +280,62 @@ async def get_or_create_wave0(db: Database, run_id: str) -> Wave:
             id=r["id"], run_id=r["run_id"], sequence_order=r["sequence_order"], status=r["status"]
         )
     return await create_wave(db, run_id, 0)
+
+
+def _row_to_wave(r: Row) -> Wave:
+    return Wave(
+        id=r["id"], run_id=r["run_id"], sequence_order=r["sequence_order"], status=r["status"]
+    )
+
+
+async def get_or_create_wave(db: Database, run_id: str, sequence_order: int) -> Wave:
+    """Fetch the wave at (run_id, sequence_order), creating it if missing.
+
+    Concurrent creators race on the UNIQUE(run_id, sequence_order) constraint;
+    the loser re-selects instead of crashing.
+    """
+    r = await db.fetchone(
+        "SELECT * FROM waves WHERE run_id = ? AND sequence_order = ?",
+        (run_id, sequence_order),
+    )
+    if r:
+        return _row_to_wave(r)
+    wave = Wave(id=new_id(), run_id=run_id, sequence_order=sequence_order)
+    try:
+        async with db.tx() as conn:
+            await conn.execute(
+                "INSERT INTO waves (id, run_id, sequence_order, status)"
+                " VALUES (?, ?, ?, 'pending')",
+                (wave.id, run_id, sequence_order),
+            )
+    except sqlite3.IntegrityError:
+        existing = await db.fetchone(
+            "SELECT * FROM waves WHERE run_id = ? AND sequence_order = ?",
+            (run_id, sequence_order),
+        )
+        assert existing is not None  # the constraint winner's row
+        return _row_to_wave(existing)
+    return wave
+
+
+async def list_waves_for_run(db: Database, run_id: str) -> list[Wave]:
+    rows = await db.fetchall(
+        "SELECT * FROM waves WHERE run_id = ? ORDER BY sequence_order", (run_id,)
+    )
+    return [_row_to_wave(r) for r in rows]
+
+
+async def set_wave_status(db: Database, wave_id: str, status: str) -> None:
+    """Direct status write (waves intentionally have no FSM entity); callers
+    write their own audit events."""
+    await db.execute("UPDATE waves SET status = ? WHERE id = ?", (status, wave_id))
+
+
+async def list_tasks_for_wave(db: Database, wave_id: str) -> list[Task]:
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE wave_id = ? ORDER BY seq", (wave_id,)
+    )
+    return [_row_to_task(r) for r in rows]
 
 
 # ------------------------------------------------------------------------ tasks
@@ -360,7 +418,6 @@ async def update_task_fields(db: Database, task_id: str, **fields: Any) -> None:
     _validate_fields("tasks", fields, _TASK_WRITABLE_FIELDS)
     cols = ", ".join(f"{k} = ?" for k in fields)
     await db.execute(f"UPDATE tasks SET {cols} WHERE id = ?", (*fields.values(), task_id))
-    await db.conn.commit()
 
 
 # --------------------------------------------------------------------- attempts
@@ -420,7 +477,13 @@ async def update_attempt_fields(db: Database, attempt_id: str, **fields: Any) ->
     _validate_fields("attempts", fields, _ATTEMPT_WRITABLE_FIELDS)
     cols = ", ".join(f"{k} = ?" for k in fields)
     await db.execute(f"UPDATE attempts SET {cols} WHERE id = ?", (*fields.values(), attempt_id))
-    await db.conn.commit()
+
+
+async def list_attempts_for_task(db: Database, task_id: str) -> list[Attempt]:
+    rows = await db.fetchall(
+        "SELECT * FROM attempts WHERE task_id = ? ORDER BY attempt_num", (task_id,)
+    )
+    return [_row_to_attempt(r) for r in rows]
 
 
 async def find_attempts_in_status(db: Database, status: AttemptStatus) -> list[Attempt]:
@@ -549,7 +612,6 @@ async def insert_event(
         " VALUES (?, ?, ?, ?, ?)",
         (utcnow_iso(), event_type, run_id, attempt_id, json.dumps(payload)),
     )
-    await db.conn.commit()
 
 
 async def insert_redaction(
@@ -561,17 +623,21 @@ async def insert_redaction(
         " VALUES (?, ?, ?, ?)",
         (attempt_id, source_field, pattern_matched, utcnow_iso()),
     )
-    await db.conn.commit()
 
 
 async def insert_notification(
-    db: Database, channel: str, payload_redacted: str, status: str
+    db: Database,
+    channel: str,
+    payload_redacted: str,
+    status: str,
+    *,
+    run_id: str | None = None,
 ) -> None:
     await db.execute(
-        "INSERT INTO notifications_log (channel, payload_redacted, status, ts) VALUES (?, ?, ?, ?)",
-        (channel, payload_redacted, status, utcnow_iso()),
+        "INSERT INTO notifications_log (channel, payload_redacted, status, run_id, ts)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (channel, payload_redacted, status, run_id, utcnow_iso()),
     )
-    await db.conn.commit()
 
 
 async def insert_integrity_violation(
@@ -629,6 +695,26 @@ async def get_latest_event(
     if r is None:
         return None
     return {"payload": json.loads(r["payload_json"]), "ts": r["ts"]}
+
+
+async def get_first_transition_ts_to(
+    db: Database, run_id: str, to_state: str
+) -> str | None:
+    """Timestamp of the FIRST ``state_transition`` event that moved the run
+    into *to_state* (TEXT ISO, as stored), or ``None`` if it never did.
+
+    Used for the CI poll deadline (impl-plan §6.11): the clock starts when the
+    run first entered ``ci_running`` and is deliberately NOT reset by later
+    ``ci_fixing → ci_running`` re-entries — the failure mode being guarded
+    against is "CI stuck pending forever", not "fix cycles take long".
+    """
+    r = await db.fetchone(
+        "SELECT ts FROM agent_events WHERE run_id = ? AND event_type = 'state_transition'"
+        " AND json_extract(payload_json, '$.to') = ?"
+        " ORDER BY id ASC LIMIT 1",
+        (run_id, to_state),
+    )
+    return None if r is None else str(r["ts"])
 
 
 # ------------------------------------------------- sprint 3 aggregate row types
@@ -790,6 +876,23 @@ async def get_pending_amendment(db: Database, run_id: str) -> SpecAmendment | No
     return _row_to_spec_amendment(r) if r else None
 
 
+async def get_rejected_guidance(db: Database, run_id: str, task_id: str) -> str | None:
+    """Guidance from the most recent rejected amendment for this run+task
+    (falling back to a run-level amendment with ``task_id IS NULL``).
+
+    Returns None when no rejected amendment carried guidance. Used by the
+    TaskEngine to relay user-authored rejection guidance into the resumed
+    attempt's trusted steering (impl-plan §6.9)."""
+    r = await db.fetchone(
+        "SELECT guidance FROM spec_amendments"
+        " WHERE run_id = ? AND status = 'rejected' AND guidance IS NOT NULL"
+        " AND (task_id = ? OR task_id IS NULL)"
+        " ORDER BY (task_id = ?) DESC, rowid DESC LIMIT 1",
+        (run_id, task_id, task_id),
+    )
+    return r["guidance"] if r else None
+
+
 _RESOLVED_AMENDMENT_STATUSES = frozenset({"approved", "rejected", "aborted"})
 
 
@@ -829,11 +932,15 @@ async def insert_tool_call(
     duration_ms: int | None = None,
     scope_violation: bool = False,
     held: bool = False,
+    verdict: str | None = None,
 ) -> int:
+    """Insert one tool-call audit row. ``verdict`` (migration 011) is the
+    ScopeGuard decision — "allow", "allow_logged" or "violation" — persisted
+    for post-mortem auditability."""
     cur = await db.execute(
         "INSERT INTO tool_calls (attempt_id, ts, tool_name, input_json,"
-        " output_blob_redacted, duration_ms, scope_violation, held)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " output_blob_redacted, duration_ms, scope_violation, held, verdict)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             attempt_id,
             utcnow_iso(),
@@ -843,20 +950,65 @@ async def insert_tool_call(
             duration_ms,
             int(scope_violation),
             int(held),
+            verdict,
         ),
     )
-    await db.conn.commit()
     return int(cur.lastrowid or 0)
 
 
 async def list_tool_calls_for_attempt(db: Database, attempt_id: str) -> list[dict[str, Any]]:
     rows = await db.fetchall(
         "SELECT id, attempt_id, ts, tool_name, input_json, output_blob_redacted,"
-        " duration_ms, scope_violation, held"
+        " duration_ms, scope_violation, held, verdict"
         " FROM tool_calls WHERE attempt_id = ? ORDER BY id",
         (attempt_id,),
     )
     return [dict(r) for r in rows]
+
+
+# -------------------------------------------------------------- attempt prompts
+
+
+async def record_attempt_prompt(
+    db: Database,
+    attempt_id: str,
+    turn: int,
+    role: str,
+    content: str,
+    run_id: str | None = None,
+) -> None:
+    """Persist a per-turn prompt snapshot for the post-mortem explorer
+    (plan.md Phase 5 task 5).
+
+    ``content`` is stored exactly as given in ``attempt_prompts.content_redacted``
+    — the CALLER is responsible for redacting secrets before calling this
+    (the column name documents the expectation, enforcement lives upstream).
+    """
+    await db.execute(
+        "INSERT INTO attempt_prompts (attempt_id, run_id, turn, role,"
+        " content_redacted, ts) VALUES (?, ?, ?, ?, ?, ?)",
+        (attempt_id, run_id, turn, role, content, utcnow_iso()),
+    )
+
+
+async def list_attempt_prompts(db: Database, attempt_id: str) -> list[AttemptPrompt]:
+    """Return one attempt's prompt snapshots ordered by (turn, id)."""
+    rows = await db.fetchall(
+        "SELECT attempt_id, run_id, turn, role, content_redacted, ts"
+        " FROM attempt_prompts WHERE attempt_id = ? ORDER BY turn, id",
+        (attempt_id,),
+    )
+    return [
+        AttemptPrompt(
+            attempt_id=r["attempt_id"],
+            run_id=r["run_id"],
+            turn=int(r["turn"]),
+            role=r["role"],
+            content_redacted=r["content_redacted"],
+            ts=r["ts"],
+        )
+        for r in rows
+    ]
 
 
 # -------------------------------------------------------------- steering events
@@ -870,7 +1022,6 @@ async def insert_steering_event(
         " VALUES (?, ?, ?, ?)",
         (run_id, kind, json.dumps(payload), utcnow_iso()),
     )
-    await db.conn.commit()
     return int(cur.lastrowid or 0)
 
 
@@ -957,6 +1108,19 @@ async def bump_clean_merge_streak(db: Database, project_id: str) -> int:
     return int(streak)
 
 
+async def reset_clean_merge_streak(db: Database, project_id: str) -> None:
+    """Reset the project's clean-merge streak to zero.
+
+    Appended by the delivery-fix pass (impl-plan §9.2: any escalated merge
+    resets the streak) — previously the reset existed only inline inside
+    :func:`insert_integrity_violation`, with no reusable helper.
+    """
+    await db.execute(
+        "UPDATE projects SET clean_merge_streak = 0, updated_at = ? WHERE id = ?",
+        (utcnow_iso(), project_id),
+    )
+
+
 async def count_unreviewed_merges(db: Database, project_id: str) -> int:
     """Merged runs of *project* with no ``merge_reviewed`` event (§2.3 T1
     rolling review window: "pause new merges if I haven't reviewed the last N")."""
@@ -968,3 +1132,88 @@ async def count_unreviewed_merges(db: Database, project_id: str) -> int:
     )
     n: Any = row["n"] if row else 0
     return int(n)
+
+
+# ------------------------------------------------------- Sprint 6: console queries
+
+
+async def list_events_for_run(
+    db: Database, run_id: str, *, after_id: int = 0, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Agent events of *run* ordered by id, tail-pollable via ``after_id`` (§10 SSE)."""
+    rows = await db.fetchall(
+        "SELECT id, ts, event_type, run_id, attempt_id, payload_json FROM agent_events"
+        " WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?",
+        (run_id, after_id, limit),
+    )
+    return [dict(r) for r in rows]
+
+
+async def sum_token_usage_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
+    """Per-model-role usage totals behind the spend dashboard (§10)."""
+    rows = await db.fetchall(
+        "SELECT model_role, model_id, COUNT(*) AS calls,"
+        " SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens,"
+        " SUM(cost_usd) AS cost_usd, SUM(estimated_before_call) AS estimated_usd"
+        " FROM token_usage WHERE run_id = ? GROUP BY model_role, model_id ORDER BY model_role",
+        (run_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_token_usage_for_attempt(db: Database, attempt_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetchall(
+        "SELECT id, model_role, model_id, prompt_tokens, completion_tokens,"
+        " cost_usd, estimated_before_call, created_at FROM token_usage"
+        " WHERE attempt_id = ? ORDER BY id",
+        (attempt_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_runs_in_status(
+    db: Database, status: str, *, project_id: str | None = None
+) -> list[Run]:
+    sql = "SELECT * FROM runs WHERE status = ?"
+    params: list[Any] = [status]
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params.append(project_id)
+    sql += " ORDER BY updated_at"
+    rows = await db.fetchall(sql, tuple(params))
+    return [_row_to_run(r) for r in rows]
+
+
+async def list_notifications_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetchall(
+        "SELECT id, channel, payload_redacted, status, run_id, ts FROM notifications_log"
+        " WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_integrity_violations_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetchall(
+        "SELECT id, run_id, task_id, attempt_id, kind, detail_json, ts"
+        " FROM integrity_violations WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def set_run_paused(db: Database, run_id: str, paused: bool) -> None:
+    """Persist the pump-level suspend flag (Phase 5 pause/resume steering)."""
+    await update_run_fields(db, run_id, paused=int(paused))
+
+
+async def set_project_tier(db: Database, project_id: str, tier: int) -> None:
+    """Autonomy-tier override (§2.3). Demotion is instant; promotion gating is
+    the caller's job (tier console route enforces the T2 streak threshold)."""
+    if tier not in (0, 1, 2):
+        raise ValueError(f"invalid autonomy tier: {tier}")
+    await db.execute(
+        "UPDATE projects SET autonomy_tier = ?, updated_at = ? WHERE id = ?",
+        (tier, utcnow_iso(), project_id),
+    )
+    await db.conn.commit()

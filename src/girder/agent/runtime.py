@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 
 from girder.agent import prompts
@@ -29,8 +30,8 @@ from girder.agent.tools import TOOL_SCHEMAS, ToolExecResult, ToolRegistry
 from girder.config import LimitsConfig
 from girder.db import repo
 from girder.db.engine import Database
-from girder.db.models import Attempt, Task
-from girder.guard.redact import Redactor
+from girder.db.models import Attempt, SteeringKind, Task
+from girder.guard.redact import Redactor, redact_and_log
 from girder.guard.scope import TaskScopes
 from girder.models.gateway import Message, ModelGateway, ModelToolCall
 from girder.sandbox.engine import SandboxEngine
@@ -42,6 +43,12 @@ _NO_TOOL_NUDGE = (
     "You must act via tools; call mark_task_complete when the task is done "
     "(or request_spec_amendment if the frozen spec cannot be satisfied)."
 )
+
+logger = logging.getLogger(__name__)
+
+
+class _MidTurnDeadline(RuntimeError):
+    """Internal: the wall-clock ceiling expired mid-turn (§8.3.2)."""
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,7 @@ class AgentRuntime:
         self.attempt = attempt
         self.task = task
         self.model_role = model_role
+        self._redactor = redactor
         self._context_window = gateway.role_config(model_role).context_window
         self._registry = ToolRegistry(
             sandbox=sandbox,
@@ -118,8 +126,10 @@ class AgentRuntime:
         """Run the turn loop to a terminal tool, the turn cap, or the deadline.
 
         ``deadline_s`` is an absolute ``asyncio.get_running_loop().time()``
-        value; per-turn model headroom is whatever remains when the turn
-        starts. Killing the container remains the caller's job.
+        value; the ceiling is enforced both between turns and *within* a turn
+        — the gateway call and each tool execution run under
+        ``asyncio.wait_for`` bounded by the remaining wall-clock (§8.3.2).
+        Killing the container remains the caller's job.
         """
         messages = [
             Message(
@@ -136,7 +146,9 @@ class AgentRuntime:
         loop = asyncio.get_running_loop()
         turns_used = 0
         while turns_used < self.limits.attempt_max_turns:
-            if deadline_s is not None and loop.time() >= deadline_s:
+            messages = await self._absorb_steering(messages)
+            remaining = self._remaining_s(deadline_s, loop)
+            if remaining is not None and remaining <= 0:
                 return await self._finish(
                     "timeout", None, "wall-clock deadline exhausted", turns_used
                 )
@@ -149,13 +161,26 @@ class AgentRuntime:
                 attempt_id=self.attempt.id,
             )
 
-            response = await self.gateway.complete(
-                self.model_role,
-                messages,
-                tools=TOOL_SCHEMAS,
-                run_id=self.run_id,
-                attempt_id=self.attempt.id,
-            )
+            # Persist the exact outgoing prompt BEFORE the gateway call
+            # (state-before-action, §5.5); redacted per §8.6 since prompts
+            # embed tool output. Observability only: fail open.
+            await self._persist_prompt(turns_used, messages)
+
+            try:
+                response = await asyncio.wait_for(
+                    self.gateway.complete(
+                        self.model_role,
+                        messages,
+                        tools=TOOL_SCHEMAS,
+                        run_id=self.run_id,
+                        attempt_id=self.attempt.id,
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                return await self._finish(
+                    "timeout", None, "wall-clock deadline exhausted mid-turn", turns_used
+                )
 
             if not response.tool_calls:
                 # No action: nudge and count the turn; cap handled by the loop.
@@ -164,7 +189,12 @@ class AgentRuntime:
                 messages = self._maybe_compact(messages)
                 continue
 
-            calls = await self._run_calls(response.tool_calls)
+            try:
+                calls = await self._run_calls(response.tool_calls, deadline_s=deadline_s)
+            except _MidTurnDeadline:
+                return await self._finish(
+                    "timeout", None, "wall-clock deadline exhausted mid-turn", turns_used
+                )
             messages.append(
                 Message(
                     role="assistant",
@@ -204,14 +234,51 @@ class AgentRuntime:
 
     # ------------------------------------------------------------ internals
 
+    async def _absorb_steering(self, messages: list[Message]) -> list[Message]:
+        """Mid-flight operator steering (Sprint 6 WP 6.2): consume pending
+        ``inject`` events at the top of each turn and append them as trusted
+        user messages (tagged by :func:`prompts.build_directive_message`).
+        Blank/malformed directives are skipped and logged, never raise."""
+        events = await repo.consume_steering_events(
+            self.db, self.run_id, kinds=[SteeringKind.INJECT.value]
+        )
+        for event in events:
+            payload = event["payload"]
+            directive = ""
+            if isinstance(payload, dict):
+                directive = str(payload.get("directive", "") or "").strip()
+            if not directive:
+                await repo.insert_event(
+                    self.db,
+                    "steering_ignored",
+                    {"kind": SteeringKind.INJECT.value, "reason": "blank directive"},
+                    run_id=self.run_id,
+                    attempt_id=self.attempt.id,
+                )
+                continue
+            messages.append(
+                Message(role="user", content=prompts.build_directive_message(directive))
+            )
+            await repo.insert_event(
+                self.db,
+                "steering_injected",
+                {"directive": directive},
+                run_id=self.run_id,
+                attempt_id=self.attempt.id,
+            )
+        return messages
+
     async def _run_calls(
-        self, tool_calls: list[ModelToolCall]
+        self, tool_calls: list[ModelToolCall], *, deadline_s: float | None = None
     ) -> list[tuple[str, dict[str, object], ToolExecResult]]:
         """Defensively parse ``arguments_json``, then execute each call.
 
         Malformed arguments never raise outward: the model gets a synthetic
-        error result and the turn still counts.
+        error result and the turn still counts. Each execution is bounded by
+        the remaining wall-clock (§8.3.2); exhaustion raises
+        :class:`_MidTurnDeadline` so the caller takes the timeout path.
         """
+        loop = asyncio.get_running_loop()
         executed: list[tuple[str, dict[str, object], ToolExecResult]] = []
         for tc in tool_calls:
             try:
@@ -224,9 +291,59 @@ class AgentRuntime:
                     (tc.name, {}, ToolExecResult(ok=False, output=error_output))
                 )
                 continue
-            result = await self._registry.execute(tc.name, args)
+            remaining = self._remaining_s(deadline_s, loop)
+            if remaining is not None and remaining <= 0:
+                raise _MidTurnDeadline
+            try:
+                result = await asyncio.wait_for(
+                    self._registry.execute(tc.name, args), timeout=remaining
+                )
+            except TimeoutError:
+                raise _MidTurnDeadline from None
             executed.append((tc.name, args, result))
         return executed
+
+    @staticmethod
+    def _remaining_s(deadline_s: float | None, loop: asyncio.AbstractEventLoop) -> float | None:
+        """Seconds of wall-clock left under the attempt ceiling (§8.3.2)."""
+        if deadline_s is None:
+            return None
+        return deadline_s - loop.time()
+
+    async def _persist_prompt(self, turn: int, messages: list[Message]) -> None:
+        """Persist the exact outgoing prompt snapshot (plan.md Phase 5 task 5).
+
+        The serialized message list is redacted through the same §8.6 pipeline
+        tool outputs use (``redact_and_log``, writing ``redaction_log`` rows)
+        before storage, because prompts embed raw tool output. Purely
+        observability: any failure logs and continues, never killing the turn.
+        """
+        payload = json.dumps(
+            [{"role": m.role, "content": m.content} for m in messages], default=str
+        )
+        try:
+            redacted = await redact_and_log(
+                self._redactor,
+                payload,
+                source_field="prompt:turn",
+                db=self.db,
+                attempt_id=self.attempt.id,
+            )
+            await repo.record_attempt_prompt(
+                self.db,
+                self.attempt.id,
+                turn=turn,
+                role="turn",
+                content=redacted,
+                run_id=self.run_id,
+            )
+        except Exception:
+            logger.warning(
+                "prompt persistence failed (attempt %s, turn %s); continuing",
+                self.attempt.id,
+                turn,
+                exc_info=True,
+            )
 
     def _terminal_of(
         self, calls: list[tuple[str, dict[str, object], ToolExecResult]]

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import stat
+from pathlib import Path
+
 import pytest
 
 from girder.config import ProjectConfig
@@ -147,3 +151,69 @@ def test_spec_path_is_protected_read() -> None:
 
 def test_schema_constant() -> None:
     assert SPEC_SCHEMA == "girder.openspec/v1"
+
+
+# --- Optional openspec CLI shell-out (R7/§6.9) -------------------------------
+
+
+def _write_cli(
+    directory: Path, name: str = "openspec-fake", *, exit_code: int = 0, stderr: str = ""
+) -> Path:
+    script = directory / name
+    quoted = stderr.replace("'", "'\\''")
+    script.write_text(f"#!/bin/sh\ncat > /dev/null\necho '{quoted}' >&2\nexit {exit_code}\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+def test_cli_true_exit_zero_is_accepted(tmp_path: Path) -> None:
+    fake = _write_cli(tmp_path, exit_code=0)
+    doc = parse_spec(GOLDEN, cli=True, cli_bin=str(fake))
+    assert doc.title == "Add user authentication"
+
+
+def test_cli_true_nonzero_exit_rejects_with_stderr(tmp_path: Path) -> None:
+    fake = _write_cli(tmp_path, exit_code=1, stderr="schema unknown: nope")
+    with pytest.raises(ValueError) as excinfo:
+        parse_spec(GOLDEN, cli=True, cli_bin=str(fake))
+    errors = excinfo.value.errors  # type: ignore[attr-defined]
+    assert any("schema unknown: nope" in e for e in errors), errors
+
+
+def test_cli_true_binary_absent_warns_and_inprocess_verdict_stands(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    missing = tmp_path / "no-such-openspec"
+    with caplog.at_level(logging.WARNING, logger="girder.specs.validator"):
+        doc = parse_spec(GOLDEN, cli=True, cli_bin=str(missing))
+    assert doc.title == "Add user authentication"  # in-process verdict stands
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("not found" in r.getMessage() for r in warnings)
+
+
+def test_cli_true_bad_spec_rejected_before_cli_runs(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    fake = tmp_path / "openspec-sentinel"
+    fake.write_text(f"#!/bin/sh\ntouch {sentinel}\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(ValueError):
+        parse_spec("no frontmatter here\n", cli=True, cli_bin=str(fake))
+    assert not sentinel.exists()  # in-process rejection short-circuits the CLI
+
+
+def test_cli_false_never_invokes_subprocess(tmp_path: Path) -> None:
+    sentinel = tmp_path / "sentinel"
+    fake = tmp_path / "openspec-sentinel"
+    fake.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 1\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    doc = parse_spec(GOLDEN, cli=False, cli_bin=str(fake))
+    assert doc.title == "Add user authentication"
+    assert not sentinel.exists()
+
+
+def test_cli_true_nonzero_without_stderr_still_rejects(tmp_path: Path) -> None:
+    fake = _write_cli(tmp_path, exit_code=2, stderr="")
+    with pytest.raises(ValueError) as excinfo:
+        parse_spec(GOLDEN, cli=True, cli_bin=str(fake))
+    errors = excinfo.value.errors  # type: ignore[attr-defined]
+    assert any("exited 2" in e for e in errors), errors

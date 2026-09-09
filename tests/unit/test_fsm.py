@@ -13,6 +13,7 @@ from girder.fsm import (
     _RUN_EDGES,
     _TASK_EDGES,
     InvalidTransition,
+    current_status,
     transition,
     transition_attempt,
     transition_run,
@@ -125,8 +126,6 @@ async def test_every_declared_edge_is_legal_and_others_are_not(db) -> None:  # t
     all_runs = [s.value for s in RunStatus]
     for src in all_runs:
         for dst in all_runs:
-            if src == dst:
-                continue
             await _force_status(db, "runs", run.id, src)  # fresh source state each time
             if (src, dst) in legal_run:
                 await transition(db, "run", run.id, dst)
@@ -140,8 +139,6 @@ async def test_every_declared_edge_is_legal_and_others_are_not(db) -> None:  # t
     all_tasks = [s.value for s in TaskStatus]
     for src in all_tasks:
         for dst in all_tasks:
-            if src == dst:
-                continue
             await _force_status(db, "tasks", task.id, src)
             if (src, dst) in legal_task:
                 await transition(db, "task", task.id, dst)
@@ -155,8 +152,6 @@ async def test_every_declared_edge_is_legal_and_others_are_not(db) -> None:  # t
     all_atts = [s.value for s in AttemptStatus]
     for src in all_atts:
         for dst in all_atts:
-            if src == dst:
-                continue
             await _force_status(db, "attempts", attempt.id, src)
             if (src, dst) in legal_att:
                 await transition(db, "attempt", attempt.id, dst)
@@ -242,6 +237,7 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         ("active", "failed"),
         ("active", "aborted"),
         ("active", "budget_exhausted"),
+        ("active", "escalated"),  # Phase 4: unresolvable wave conflict escalates
         ("awaiting_amendment", "active"),
         ("awaiting_amendment", "pr_open"),
         ("awaiting_amendment", "aborted"),
@@ -298,6 +294,7 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         ("verifying", "force_passed"),
         ("verify_passed", "completed"),
         ("verify_passed", "retry_scheduled"),
+        ("verify_passed", "dropped"),  # Phase 4: verified-green wave task can be dropped
         ("retry_scheduled", "running"),
         ("retry_scheduled", "failed"),
         ("retry_scheduled", "dropped"),
@@ -399,3 +396,49 @@ async def test_draft_cannot_go_budget_exhausted(db) -> None:  # type: ignore[no-
     _, run, _, _, _ = await _seed(db)
     with pytest.raises(InvalidTransition, match="draft -> budget_exhausted"):
         await transition_run(db, run.id, RunStatus.BUDGET_EXHAUSTED)
+
+
+# ------------------------------------------------------------------- self-loops
+
+
+async def test_spec_pending_self_loop_is_declared_and_audited(db) -> None:  # type: ignore[no-untyped-def]
+    """§5.1: 'Regenerate' self-loop — a new draft replaces the old, same state."""
+    _, run, _, _, _ = await _seed(db)
+    await transition_run(db, run.id, RunStatus.SPEC_PENDING, reason="spec dispatched")
+
+    result = await transition_run(db, run.id, RunStatus.SPEC_PENDING, reason="regenerate")
+    assert result == RunStatus.SPEC_PENDING.value
+    assert await current_status(db, "run", run.id) == RunStatus.SPEC_PENDING.value
+
+    rows = await db.fetchall(
+        "SELECT payload_json FROM agent_events"
+        " WHERE event_type = 'state_transition' AND run_id = ? ORDER BY id",
+        (run.id,),
+    )
+    assert json.loads(rows[-1]["payload_json"]) == {
+        "entity": "run",
+        "id": run.id,
+        "from": "spec_pending",
+        "to": "spec_pending",
+        "reason": "regenerate",
+    }
+
+
+async def test_undeclared_self_transition_rejected(db) -> None:  # type: ignore[no-untyped-def]
+    _, run, _, task, attempt = await _seed(db)
+    for state in (
+        RunStatus.SPEC_PENDING,
+        RunStatus.SPEC_APPROVED,
+        RunStatus.BASELINE_RUNNING,
+        RunStatus.ACTIVE,
+    ):
+        await transition_run(db, run.id, state)
+    with pytest.raises(InvalidTransition, match="active -> active"):
+        await transition_run(db, run.id, RunStatus.ACTIVE)
+    await transition_task(db, task.id, TaskStatus.SCHEDULED)
+    await transition_task(db, task.id, TaskStatus.RUNNING)
+    with pytest.raises(InvalidTransition, match="running -> running"):
+        await transition_task(db, task.id, TaskStatus.RUNNING)
+    await transition_attempt(db, attempt.id, AttemptStatus.RUNNING)
+    with pytest.raises(InvalidTransition):
+        await transition_attempt(db, attempt.id, AttemptStatus.RUNNING)

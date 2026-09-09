@@ -313,3 +313,30 @@ async def test_missing_api_key_raises(db) -> None:  # type: ignore[no-untyped-de
     finally:
         await gw.aclose()
     assert transport.calls == 0
+
+
+async def test_token_usage_row_written_before_dispatch(db) -> None:  # type: ignore[no-untyped-def]
+    """§6.8 invariant: the estimated_before_call token_usage row exists at the
+    moment the HTTP request is issued — i.e. the write happens BEFORE dispatch."""
+    observed: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # Runs at dispatch time, inside the gateway's HTTP call.
+        rows = await repo.list_token_usage_for_run(db, run_id)
+        assert len(rows) == 1, "usage row must already exist when dispatch happens"
+        assert rows[0]["estimated_before_call"] > 0
+        assert rows[0]["prompt_tokens"] == 0  # not yet reconciled with actuals
+        observed["at_dispatch"] = True
+        return httpx.Response(200, json=_ok_body())
+
+    run_id = await _seed_run(db)
+    gw = _gateway(db, httpx.MockTransport(handler))  # type: ignore[arg-type]
+    try:
+        resp = await gw.complete(
+            "tier1", [Message(role="user", content="order check")], run_id=run_id
+        )
+    finally:
+        await gw.aclose()
+
+    assert observed["at_dispatch"]
+    assert resp.usage_row_id is not None

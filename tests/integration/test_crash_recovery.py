@@ -124,8 +124,12 @@ async def test_crash_recovery_then_clean_resume(seeded) -> None:
         repo_path=repo_path,
     )
     tip_pre = (await _git(repo_path, "rev-parse", run.branch)).strip()
-    descriptor = await engine.pump_once(run.id)
-    assert descriptor == "task_completed"
+    # Sprint 5 wave semantics: this run has two tasks, so the resume goes
+    # through the wave path (single actionable task executes, then serialized
+    # integration fast-forwards the run branch). Drive to local green and
+    # assert the recovery END-STATE: the invariants below are the contract.
+    descriptor = await engine.run_to_completion(run.id)
+    assert descriptor == "local_green"
 
     # completed task A was NOT re-executed: it has zero attempts
     rows_a = await db.fetchall("SELECT * FROM attempts WHERE task_id = ?", (task_a.id,))

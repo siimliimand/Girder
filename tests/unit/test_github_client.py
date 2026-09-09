@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from girder.config import GithubConfig, Secrets, Settings
@@ -92,4 +93,88 @@ async def test_push_token_never_in_argv_or_git_config(tmp_path: Path, db: Databa
     cfg = await run_host_cmd(["git", "-C", str(repo), "config", "--list"],
                              check=False, timeout_s=30)
     assert TOKEN not in cfg.stdout
+    await client.aclose()
+
+
+# ------------------------------------------------- job-logs fallback (§6.11)
+
+SECRET = "ghp_fakeunitlogtoken0000000000"
+
+
+def _failed_check(check_id: int = 4242) -> dict[str, object]:
+    return {
+        "id": check_id,
+        "name": "tests",
+        "status": "completed",
+        "conclusion": "failure",
+        "html_url": "https://github.test/acme/widget/runs/1",
+        "output": {"summary": "", "text": ""},
+    }
+
+
+def _transport(
+    check_runs: list[dict[str, object]],
+    *,
+    job_logs: str | None = None,
+    logs_status: int = 200,
+) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/check-runs"):
+            return httpx.Response(200, json={"check_runs": check_runs})
+        if "/actions/jobs/" in path and path.endswith("/logs"):
+            if job_logs is None:
+                return httpx.Response(404, json={"message": "not found"})
+            return httpx.Response(logs_status, text=job_logs)
+        return httpx.Response(404, json={"message": f"unhandled {path}"})
+
+    return httpx.MockTransport(handler)
+
+
+def _client(db: Database, transport: httpx.MockTransport) -> GitHubClient:
+    return GitHubClient(
+        Settings(github=GithubConfig(api_url="http://github.test")),
+        Secrets(github_token=TOKEN),
+        Redactor(),
+        db,
+        repo_path=Path("/tmp"),
+        token=TOKEN,
+        owner_repo=("acme", "widget"),
+        transport=transport,
+    )
+
+
+async def test_failed_check_empty_output_falls_back_to_job_logs(db: Database) -> None:
+    """Empty Actions check-run output → the job-logs API fills the excerpt,
+    redacted (§6.11: real GHA check runs often carry empty output)."""
+    logs = "noise\n" * 5000 + f"secret={SECRET}\nFAILED tests/test_x.py::test_y\n"
+    client = _client(db, _transport([_failed_check()], job_logs=logs))
+    failures = await client.fetch_failure_logs("abc123")
+    assert len(failures) == 1
+    excerpt = failures[0].output_text or ""
+    assert "tests/test_x.py::test_y" in excerpt
+    assert SECRET not in excerpt  # redaction pipeline ran
+    assert len(excerpt) <= 2000  # capped tail, like the CiPoller excerpt
+    await client.aclose()
+
+
+async def test_failed_check_output_untouched_when_present(db: Database) -> None:
+    """Non-empty check-run output takes no fallback (no job-logs call)."""
+    rich = dict(_failed_check())
+    rich["output"] = {"summary": "boom", "text": "FAILED tests/a.py::test_b"}
+    api = _transport([rich], job_logs="SHOULD NOT BE FETCHED")
+    client = _client(db, api)
+    failures = await client.fetch_failure_logs("abc123")
+    assert failures[0].output_text == "FAILED tests/a.py::test_b"
+    await client.aclose()
+
+
+async def test_failed_check_and_logs_both_empty_is_safe(db: Database) -> None:
+    """Empty output AND unavailable job logs ⇒ no crash, empty excerpt."""
+    client = _client(db, _transport([_failed_check()], job_logs=None))
+    failures = await client.fetch_failure_logs("abc123")
+    assert len(failures) == 1
+    assert failures[0].failed
+    assert not failures[0].output_summary
+    assert not failures[0].output_text
     await client.aclose()

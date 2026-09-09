@@ -1,0 +1,27 @@
+{# Run history across projects (WP 6.5 explorer entry). #}
+{% extends "base.html" %}
+{% block content %}
+<h1>History</h1>
+<table>
+  <thead><tr><th>Project</th><th>Run</th><th>Status</th><th>Paused</th><th>Branch</th>
+      <th>Spend</th><th>Projected</th><th>Cap</th><th>Violations</th><th></th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td><a href="/projects/{{ r.project_id }}">{{ r.project_name }}</a></td>
+      <td><a href="/runs/{{ r.run_id }}"><code>{{ r.run_id[:8] }}</code></a></td>
+      <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{{ "yes" if r.paused else "no" }}</td>
+      <td><code>{{ r.branch }}</code></td>
+      <td>${{ '%.4f'|format(r.spend_usd) }}</td>
+      <td>${{ '%.4f'|format(r.projected_spend_usd) }}</td>
+      <td>${{ '%.2f'|format(r.budget_cap_usd) }}</td>
+      <td>{{ r.integrity_violations }}</td>
+      <td><a href="/runs/{{ r.run_id }}/postmortem">post-mortem</a></td>
+    </tr>
+  {% else %}
+    <tr><td colspan="10">No runs yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -144,7 +144,7 @@ class BaselineRunner:
         self.redactor = redactor
         self.image = image or f"girder-runner:{settings.project.stack}"
         self.suite_cmd = suite_cmd or [
-            "python",
+            settings.sandbox.python_bin,
             "-m",
             "pytest",
             "-q",
@@ -299,7 +299,7 @@ class BaselineRunner:
             await self.sandbox.exec(
                 container,
                 [
-                    "python",
+                    self.settings.sandbox.python_bin,
                     "-m",
                     "pytest",
                     "-q",

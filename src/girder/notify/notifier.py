@@ -69,7 +69,9 @@ class Notifier:
 
         if self.db is not None:
             for r in results:
-                await repo.insert_notification(self.db, r.channel, payload, r.status)
+                await repo.insert_notification(
+                    self.db, r.channel, payload, r.status, run_id=run_id
+                )
         for r in results:
             if r.status == "failed":
                 log.error("notification via %s failed: %s", r.channel, r.error)

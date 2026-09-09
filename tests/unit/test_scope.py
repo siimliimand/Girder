@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from girder.guard.scope import (
@@ -134,3 +136,108 @@ def test_strict_read_scope_literal_behavior() -> None:
 def test_no_path_tools_allowed(scopes: TaskScopes) -> None:
     assert check_tool_call("mark_task_complete", {}, scopes) is Verdict.ALLOW
     assert check_tool_call("request_spec_amendment", {"reason": "x"}, scopes) is Verdict.ALLOW
+
+
+# ------------------------------------------------------- run_command path args
+
+
+def test_run_command_redirect_out_of_scope_is_violation(scopes: TaskScopes) -> None:
+    assert (
+        check_tool_call(
+            "run_command", {"cmd": "echo x > tests/test_new.py"}, scopes
+        )
+        is Verdict.VIOLATION
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo x >> tests/test_new.py",
+        "echo x 2> tests/test_new.py",
+        "echo x &> tests/test_new.py",
+        "echo x >tests/test_new.py",  # attached form
+        "cat src/a.txt | tee tests/test_new.py",
+        "tee tests/test_new.py < src/a.txt",
+    ],
+)
+def test_run_command_write_target_out_of_scope_is_violation(
+    scopes: TaskScopes, cmd: str
+) -> None:
+    assert check_tool_call("run_command", {"cmd": cmd}, scopes) is Verdict.VIOLATION
+
+
+def test_run_command_fd_dup_is_not_a_path_arg(scopes: TaskScopes) -> None:
+    assert check_tool_call("run_command", {"cmd": "python -m pytest 2>&1"}, scopes) is (
+        Verdict.ALLOW
+    )
+
+
+def test_run_command_tee_in_scope_allowed(scopes: TaskScopes) -> None:
+    assert check_tool_call("run_command", {"cmd": "tee src/widgets/new.py"}, scopes) is (
+        Verdict.ALLOW
+    )
+
+
+def test_run_command_no_path_args_allowed(scopes: TaskScopes) -> None:
+    assert check_tool_call("run_command", {"cmd": "python -m pytest -q"}, scopes) is (
+        Verdict.ALLOW
+    )
+
+
+def test_run_command_read_of_existing_path_is_not_write_gated(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Existing in-scope path, read-shaped: reads stay allowed (R2) even
+    though the token falls outside write_globs... and even inside them it is
+    ALLOW_LOGGED, never a write-policy hold."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n")
+    scopes = TaskScopes(
+        write_globs=["src/widgets/**"],
+        protected_globs=[".github/**"],
+        root=str(tmp_path),
+    )
+    assert check_tool_call("run_command", {"cmd": "cat src/app.py"}, scopes) is (
+        Verdict.ALLOW_LOGGED
+    )
+
+
+def test_run_command_unknown_path_token_ignored(scopes: TaskScopes) -> None:
+    """Path-syntax token that does not resolve under the root is ignored —
+    Layer 2/3 audits remain the backstop for indirection."""
+    assert check_tool_call("run_command", {"cmd": "python -m pytest build/app.py"}, scopes) is (
+        Verdict.ALLOW
+    )
+
+
+def test_run_command_protected_write_target_is_violation(scopes: TaskScopes) -> None:
+    assert check_tool_call("run_command", {"cmd": "echo x > .github/x.yml"}, scopes) is (
+        Verdict.VIOLATION
+    )
+
+
+def test_run_command_protected_read_token_is_violation(tmp_path: pathlib.Path) -> None:
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github" / "ci.yml").write_text("on: push\n")
+    scopes = TaskScopes(
+        write_globs=["src/**"], protected_globs=[".github/**"], root=str(tmp_path)
+    )
+    assert check_tool_call("run_command", {"cmd": "cat .github/ci.yml"}, scopes) is (
+        Verdict.VIOLATION
+    )
+
+
+def test_run_command_redirect_escape_is_violation(scopes: TaskScopes) -> None:
+    assert (
+        check_tool_call("run_command", {"cmd": "echo x > ../escape.py"}, scopes)
+        is Verdict.VIOLATION
+    )
+
+
+def test_run_command_unparsable_shell_falls_back_to_allow(scopes: TaskScopes) -> None:
+    """shlex cannot split it — no path args extracted; denylist + Layer 2/3
+    audits own the rest."""
+    assert check_tool_call("run_command", {"cmd": "echo 'unbalanced"}, scopes) is (
+        Verdict.ALLOW
+    )

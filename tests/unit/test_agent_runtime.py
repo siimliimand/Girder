@@ -225,3 +225,119 @@ async def test_guidance_and_schema_reach_the_gateway(
     assert "slice-text" in messages[1].content
     # system message carries the untrusted-content framing rule
     assert "UNTRUSTED CONTENT RULE" in messages[0].content
+
+
+async def test_prompts_persisted_per_turn_and_redacted(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """plan.md Phase 5 task 5 / §8.6: every outgoing prompt is persisted
+    (redacted) before the gateway call, one row per turn, in order."""
+    db, run_id, attempt, _ = seeded
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4"  # credential-shaped
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "read_file", '{"path":"src/a.py"}')]),
+            _resp(
+                content="all done",
+                calls=[_tc("2", "mark_task_complete", '{"summary":"ok"}')],
+            ),
+        ]
+    )
+    sandbox = FakeSandbox(results=[ExecResult(0, f"token {secret} in output\n", "")])
+    outcome = await _runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+    rows = await repo.list_attempt_prompts(db, attempt.id)
+    assert [r.turn for r in rows] == [1, 2]
+    assert all(r.role == "turn" for r in rows)
+    assert all(r.run_id == run_id for r in rows)
+    # turn 1 snapshot is the initial system+user prompt; turn 2 embeds the
+    # tool result — stored redacted, never raw.
+    assert "token" in rows[1].content_redacted
+    assert secret not in rows[1].content_redacted
+    assert "***[REDACTED:" in rows[1].content_redacted
+
+
+async def test_prompt_persistence_failure_is_fail_open(
+    seeded: tuple[Database, str, Attempt, Task],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt-persistence failure must never kill the attempt (§5.5)."""
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway([_resp(calls=[_tc("1", "mark_task_complete", '{"summary":"s"}')])])
+
+    async def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("db offline")
+
+    monkeypatch.setattr(repo, "record_attempt_prompt", boom)
+    outcome = await _runtime(seeded, gateway, FakeSandbox()).execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+    assert len(gateway.calls) == 1
+
+
+class SlowGateway(FakeGateway):
+    """FakeGateway whose complete() sleeps before answering."""
+
+    def __init__(self, responses: list[ModelResponse], delay: float) -> None:
+        super().__init__(responses)
+        self.delay = delay
+
+    async def complete(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        await asyncio.sleep(self.delay)
+        return await super().complete(*args, **kwargs)
+
+
+class SlowSandbox(FakeSandbox):
+    """FakeSandbox whose exec() sleeps before returning."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.exec_calls = 0
+
+    async def exec(
+        self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
+    ) -> ExecResult:
+        self.exec_calls += 1
+        await asyncio.sleep(self.delay)
+        return ExecResult(0, "slow output\n", "")
+
+
+async def test_gateway_overshoot_kills_turn_as_timeout(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """§8.3.2: a single slow model call must not overshoot the ceiling."""
+    _db, _run_id, _attempt, _ = seeded
+    loop = asyncio.get_running_loop()
+    gateway = SlowGateway([_resp()], delay=5.0)
+    runtime = _runtime(seeded, gateway, FakeSandbox())
+    outcome = await runtime.execute_attempt(spec_slice="s", deadline_s=loop.time() + 0.2)
+    assert outcome.status == "timeout"
+    assert "mid-turn" in (outcome.failure_reason or "")
+
+
+async def test_tool_overshoot_ends_attempt_as_timeout(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """§8.3.2: a tool running past the deadline ends the attempt as timeout
+    and later tool calls in the same turn are never executed."""
+    db, _run_id, attempt, _ = seeded
+    loop = asyncio.get_running_loop()
+    gateway = FakeGateway(
+        [
+            _resp(
+                calls=[
+                    _tc("1", "read_file", '{"path":"src/a.py"}'),
+                    _tc("2", "read_file", '{"path":"src/b.py"}'),
+                ]
+            ),
+            _resp(calls=[_tc("3", "mark_task_complete", '{"summary":"s"}')]),
+        ]
+    )
+    sandbox = SlowSandbox(delay=5.0)
+    runtime = _runtime(seeded, gateway, sandbox)
+    outcome = await runtime.execute_attempt(spec_slice="s", deadline_s=loop.time() + 0.2)
+    assert outcome.status == "timeout"
+    assert sandbox.exec_calls == 1  # the second tool never ran
+    # the cancelled call never reached persistence (no post-hoc row)
+    rows = await repo.list_tool_calls_for_attempt(db, attempt.id)
+    assert rows == []

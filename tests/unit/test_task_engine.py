@@ -7,7 +7,9 @@ rerun) with scripted results — no podman.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +32,7 @@ from girder.db.models import (
 from girder.gitops.branch import BranchOps
 from girder.guard.redact import Redactor
 from girder.orchestrator.task_engine import TaskEngine, TaskOutcome
-from girder.sandbox.engine import ExecResult
+from girder.sandbox.engine import ContainerSpec, ExecResult
 from girder.sandbox.local import LocalExecSandbox
 from girder.util import run_host_cmd
 from tests.conftest import seed_run_status
@@ -462,6 +464,56 @@ async def test_amendment_handoff_and_resume(harness: Harness) -> None:
     assert "use y" in resumed_user.content
 
 
+async def test_amendment_reject_guidance_reaches_resumed_attempt(harness: Harness) -> None:
+    h = harness
+    task = await _seed_task(h)
+    amendment_gateway = FakeGateway(
+        responses=[
+            _resp(
+                calls=[
+                    _tc(
+                        "1",
+                        "request_spec_amendment",
+                        '{"reason":"spec conflicts with reality","suggested_change":"use y"}',
+                    )
+                ]
+            )
+        ]
+    )
+    outcome = await h.engine(amendment_gateway).execute_task(h.run, task)
+    assert outcome.kind == "amendment_pending"
+
+    amendment = await repo.get_pending_amendment(h.db, h.run.id)
+    assert amendment is not None
+    from girder.specs.amendment import resolve_amendment
+
+    resolution = await resolve_amendment(
+        h.db, project=h.project, run=h.run, amendment=amendment,
+        decision="rejected", guidance="proceed without the change", notifier=None,
+    )
+    assert resolution.task_status == TaskStatus.RUNNING.value
+
+    # resume: engine must relay the rejection guidance as trusted steering
+    resume_gateway = FakeGateway(responses=write_commit_complete())
+    h.sandbox = ScriptSandbox(suite_results=[ExecResult(0, "", "")], suite_xml=GREEN_XML)
+    outcome = await h.engine(resume_gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+    resumed_user = next(m for m in resume_gateway.calls[0] if getattr(m, "role", "") == "user")
+    assert "proceed without the change" in resumed_user.content
+    assert "[TRUSTED] Steering directive (user-authored):" in resumed_user.content
+
+
+async def test_no_rejected_amendment_means_no_synthetic_guidance(harness: Harness) -> None:
+    h = harness
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete())
+    h.sandbox = ScriptSandbox(suite_results=[ExecResult(0, "", "")], suite_xml=GREEN_XML)
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+    first_user = next(m for m in gateway.calls[0] if getattr(m, "role", "") == "user")
+    assert "Steering directive" not in first_user.content
+
+
 async def test_budget_exhaustion_stops_before_any_dispatch(harness: Harness) -> None:
     import httpx
 
@@ -527,3 +579,194 @@ async def test_budget_exhaustion_stops_before_any_dispatch(harness: Harness) -> 
     assert attempts[0]["status"] == AttemptStatus.BUDGET_FROZEN.value
     run_row = await repo.get_run(h.db, h.run.id)
     assert run_row is not None and run_row.status is RunStatus.BUDGET_EXHAUSTED
+
+
+async def test_uncommitted_attempt_retries_with_commit_guidance(harness: Harness) -> None:
+    """§5.2: forgetting to commit is an ordinary attempt failure, retried with
+    commit guidance — never an integrity violation."""
+    h = harness
+    h.settings.sandbox.python_bin = "py3-custom"
+    task = await _seed_task(h)
+    no_commit_responses = [
+        _resp(
+            calls=[
+                _tc(
+                    "1",
+                    "write_file",
+                    '{"path":"src/app.py","content":"def greet():\\n    return 1\\n"}',
+                )
+            ]
+        ),
+        _resp(calls=[_tc("3", "mark_task_complete", '{"summary":"done"}')]),
+    ]
+    gateway = FakeGateway(responses=[*no_commit_responses, *write_commit_complete()])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 2
+    assert attempts[0]["status"] == AttemptStatus.FAILED.value
+    assert attempts[1]["status"] == AttemptStatus.SUCCEEDED.value
+
+    # attempt 2's prompt carried the commit guidance
+    second_user = next(
+        m for m in gateway.calls[2] if getattr(m, "role", "") == "user"  # attempt 1 = 2 msgs
+    )
+    assert "git add -A && git commit" in second_user.content
+
+    # NOT an integrity violation: no rows, counter untouched
+    viols = await h.db.fetchall("SELECT * FROM integrity_violations")
+    assert viols == []
+    run_row = await repo.get_run(h.db, h.run.id)
+    assert run_row is not None and run_row.integrity_violations == 0
+
+    # the verify suite ran under the configured interpreter
+    assert h.sandbox.suite_cmds and h.sandbox.suite_cmds[0][0] == "py3-custom"
+
+
+async def test_merge_refusal_after_passed_audit_is_ordinary_retry(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = harness
+    task = await _seed_task(h)
+    original = BranchOps.audit_gated_merge
+    calls = [0]
+
+    async def _refuse(self: BranchOps, **kwargs: object) -> object:
+        from girder.gitops.branch import MergeResult
+
+        calls[0] += 1
+        if calls[0] == 1:  # refuse only the first attempt; let the retry merge
+            return MergeResult(False, None, "unexpected refusal")
+        return await original(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(BranchOps, "audit_gated_merge", _refuse)
+    gateway = FakeGateway(responses=[*write_commit_complete(), *write_commit_complete()])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"  # attempt 2 merged for real
+
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 2
+    assert attempts[0]["status"] == AttemptStatus.FAILED.value
+    events = await h.db.fetchall(
+        "SELECT event_type FROM agent_events WHERE run_id = ?", (h.run.id,)
+    )
+    assert any(e["event_type"] == "merge_refused" for e in events)
+    viols = await h.db.fetchall("SELECT * FROM integrity_violations")
+    assert viols == []
+
+
+class NeverCompletingGateway(FakeGateway):
+    """Gateway whose complete() hangs forever (until the task is cancelled)."""
+
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(list(args[-1]) if args else [])
+        await asyncio.sleep(3600)
+
+
+async def test_cancellation_kills_container_and_leaves_status_to_pump(
+    harness: Harness,
+) -> None:
+    """Cancellation protocol: on CancelledError the engine kills the attempt's
+    container and re-raises with NO DB status writes — the run pump owns the
+    terminal transition."""
+    h = harness
+    task = await _seed_task(h)
+    gateway = NeverCompletingGateway(responses=[])
+    engine = h.engine(gateway)
+    pending = asyncio.create_task(engine.execute_task(h.run, task))
+    try:
+        for _ in range(200):
+            if gateway.calls:
+                break
+            await asyncio.sleep(0.05)
+        assert gateway.calls, "agent turn never started"
+        await asyncio.sleep(0.05)  # settle inside the attempt coroutine
+        assert h.sandbox.started
+        container = h.sandbox.started[0].name
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+
+    assert container in h.sandbox.killed
+    row = (await _attempt_rows(h.db, task.id))[0]
+    assert row["status"] == AttemptStatus.RUNNING.value  # unchanged by task_engine
+    assert row["ended_at"] is None
+    fresh = await repo.get_task(h.db, task.id)
+    assert fresh is not None and fresh.status is TaskStatus.RUNNING
+
+
+async def test_multi_test_dir_project_gets_one_ro_snapshot_mount_per_dir(
+    harness: Harness,
+) -> None:
+    """Issue: Layer 1 must not be silently skipped for multi-test-dir projects —
+    one RO shadow mount per configured test directory, each backed by a
+    materialized snapshot."""
+    h = harness
+    (h.repo_path / "spec_tests").mkdir()
+    (h.repo_path / "spec_tests" / "test_s.py").write_text("def test_s():\n    assert True\n")
+    await _git(h.repo_path, "add", "-A")
+    await _git(h.repo_path, "commit", "-m", "second test dir")
+    head = (await _git(h.repo_path, "rev-parse", "HEAD")).strip()
+    await _git(h.repo_path, "update-ref", f"refs/heads/{h.run.branch}", head)
+    h.settings.project.test_directories = ["tests", "spec_tests"]
+
+    class RecordingSandbox(ScriptSandbox):
+        """Records each started spec while the snapshot dirs still exist."""
+
+        def __init__(self) -> None:
+            super().__init__(suite_results=[], suite_xml=GREEN_XML)
+            self.specs: list[ContainerSpec] = []
+
+        async def start(self, spec: ContainerSpec) -> str:
+            self.specs.append(spec)
+            for host in spec.ro_mounts:
+                assert await asyncio.to_thread(Path(host).is_dir), f"missing snapshot {host}"
+            return await super().start(spec)
+
+    h.sandbox = RecordingSandbox()
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete())
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    spec = h.sandbox.specs[0]
+    assert len(spec.ro_mounts) == 2
+    for host, container in spec.ro_mounts.items():
+        snap = Path(host)
+        assert snap.parent.name.startswith("girder-snap-")
+        assert container.startswith("/workspace/")
+        rel = container.removeprefix("/workspace/")
+        assert rel in ("tests", "spec_tests")
+        # archive keeps the path prefix, so the shadow source is <snap>/<dir>
+        assert snap.name == rel
+    # both configured test dirs are shadowed
+    assert set(spec.ro_mounts.values()) == {"/workspace/tests", "/workspace/spec_tests"}
+    # snapshots cleaned up after the attempt
+    leftovers = [
+        host
+        for host in spec.ro_mounts
+        if await asyncio.to_thread(Path(host).parent.exists)
+    ]
+    assert leftovers == []
+
+
+async def test_empty_test_dirs_logs_layer1_warning(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    h = harness
+    h.settings.project.test_directories = []
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete())
+    with caplog.at_level(logging.WARNING, logger="girder.orchestrator.task_engine"):
+        outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+    assert "Layer 1" in caplog.text
+    assert h.sandbox.started[0].ro_mounts == {}

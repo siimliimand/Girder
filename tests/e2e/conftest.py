@@ -10,6 +10,7 @@ over an ``httpx.MockTransport``. No podman, no network.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
@@ -96,12 +97,32 @@ class FakeNotifier:
         self.calls.append((level, title, body))
 
 
+def first_user_content(messages: list[Any]) -> str:
+    """Content of the first user-role message (FakeGateway routing key)."""
+    for m in messages:
+        if getattr(m, "role", "") == "user":
+            return getattr(m, "content", "") or ""
+    return ""
+
+
 @dataclass
 class FakeGateway:
-    """Scripted per-call responses; records each complete() message list."""
+    """Scripted per-call responses; records each complete() message list.
+
+    Sprint 5 additions (backward compatible): ``routes`` dispatches on a
+    substring of the FIRST user message (insertion order wins, non-empty
+    queue required), ``delays`` sleeps before answering a routed call, and
+    ``call_times`` records ``asyncio`` loop time parallel to ``calls`` so
+    tests can prove overlap (SC-14 concurrency).
+    """
 
     responses: list[Any]
     calls: list[list[Any]] = field(default_factory=list)
+    call_times: list[float] = field(default_factory=list)
+    # substring of FIRST user msg -> queue:
+    routes: dict[str, list[Any]] = field(default_factory=dict)
+    # substring -> seconds to sleep before returning:
+    delays: dict[str, float] = field(default_factory=dict)
 
     def role_config(self, role: str) -> Any:
         return type("RoleCfg", (), {"context_window": 200_000, "max_output_tokens": 4096})()
@@ -117,6 +138,19 @@ class FakeGateway:
         temperature: float | None = None,
     ) -> Any:
         self.calls.append(list(messages))
+        self.call_times.append(asyncio.get_running_loop().time())
+        content = first_user_content(messages)
+        for key, queue in self.routes.items():  # insertion order
+            if key in content and queue:
+                if key in self.delays:
+                    await asyncio.sleep(self.delays[key])
+                return queue.pop(0)
+        if not self.responses:
+            head = content[:150].replace("\n", " ")
+            raise AssertionError(
+                f"FakeGateway exhausted: no scripted response for message "
+                f"(role={role!r}, routed keys tried: {list(self.routes)}) starting {head!r}"
+            )
         return self.responses.pop(0)
 
 

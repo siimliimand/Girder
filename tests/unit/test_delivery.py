@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from girder.config import (
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Project, Run, RunStatus, TaskType
+from girder.fsm import transition_run
 from girder.github.client import GitHubClient
 from girder.github.delivery import DeliveryEngine
 from girder.guard.redact import Redactor
@@ -279,6 +281,9 @@ async def test_t0_parks_at_merge_pending_human_then_merges_on_click(dh: DHarness
     assert fresh is not None and fresh.status is RunStatus.MERGE_PENDING_HUMAN
     assert any("ready to merge" in c[1] for c in dh.notifier.calls)
     assert dh.api.merge_calls == 0  # T0 never merges by itself
+    # §9.2: the parked notification carries the same diff summary as the
+    # T1 merged notification
+    assert any("src/lib.py" in c[2] for c in dh.notifier.calls)
 
     # human clicks merge out-of-band → pump observes and runs cleanup
     dh.api.pr_merged = True
@@ -377,12 +382,13 @@ async def test_t2_catastrophic_conformance_escalates_despite_streak(dh: DHarness
 
 @pytest.mark.parametrize("dh", [1], indirect=True)
 async def test_ci_lint_failure_diagnosed_and_fixed_then_merged(dh: DHarness) -> None:
-    """SC-09 core: induced lint failure (no test ids ⇒ novel) → fix agent → green."""
+    """SC-09 core: induced failure with an extractable nodeid whose rerun is
+    red (real_failure ⇒ novel) → fix agent → green."""
     dh.api.checks = [
         check(
             "lint",
             "failure",
-            summary="F401 unused import `os` in src/lib.py — ruff failed",
+            summary="FAILED tests/test_p.py::test_ok — F401 unused import `os`",
             text="src/lib.py:1:1: F401 `os` imported but unused",
         )
     ]
@@ -398,6 +404,10 @@ async def test_ci_lint_failure_diagnosed_and_fixed_then_merged(dh: DHarness) -> 
     gateway = FakeGateway(responses=[*compliant, _resp(content=GOOD_VERDICT)])
     d = dh.delivery(gateway)
     assert await d.enter_delivery(dh.run) == "pr_opened"
+
+    # local suite green at entry; the flaky-breaker rerun of the failing
+    # nodeid must come out red (real_failure) ⇒ route to the fix agent
+    dh.sandbox._suite_xml = RED_XML
 
     # first pump observes the red CI and parks in ci_fixing
     run = await repo.get_run(dh.db, dh.run.id)
@@ -435,7 +445,12 @@ async def test_ci_fix_cap_exhausted_fails_run_without_dispatch(dh: DHarness) -> 
     """ci_fix_attempts already consumed ⇒ the next red-CI episode fails the run
     and the diagnostic agent is never even dispatched (D5 anti-thrash cap)."""
     dh.api.checks = [
-        check("lint", "failure", summary="E501 line too long — ruff failed", text="")
+        check(
+            "lint",
+            "failure",
+            summary="FAILED tests/test_p.py::test_ok — E501 line too long",
+            text="",
+        )
     ]
     # two prior fix tasks ⇒ cap (ci_fix_attempts=2) already reached
     wave = await repo.get_or_create_wave0(dh.db, dh.run.id)
@@ -447,6 +462,7 @@ async def test_ci_fix_cap_exhausted_fails_run_without_dispatch(dh: DHarness) -> 
     gateway = FakeGateway(responses=[])
     d = dh.delivery(gateway)
     assert await d.enter_delivery(dh.run) == "pr_opened"
+    dh.sandbox._suite_xml = RED_XML  # rerun of the failing nodeid is red
 
     run = await repo.get_run(dh.db, dh.run.id)
     assert run is not None
@@ -514,3 +530,186 @@ async def test_red_delivery_suite_fails_run_before_push(dh: DHarness) -> None:
     assert fresh is not None and fresh.status is RunStatus.FAILED
     event = await repo.get_latest_event(dh.db, dh.run.id, "delivery_suite")
     assert event is not None and event["payload"]["green"] is False
+
+
+# ------------------------------------------------------- CI poll timeout §6.11
+
+
+def _pending(name: str = "ci") -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": "in_progress",
+        "conclusion": None,
+        "html_url": f"https://github.com/{OWNER}/{NAME}/runs/1",
+        "output": {"summary": "", "text": ""},
+    }
+
+
+async def _enter_ci_running_and_backdate(
+    dh: DHarness, d: DeliveryEngine, age_s: float
+) -> None:
+    """Drive pr_open → ci_running against a perpetually pending check, then
+    backdate the persisted ci_running state_transition event by *age_s*."""
+    dh.api.checks = [_pending()]
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    assert await d.pump(run) == "ci_pending"
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.CI_RUNNING
+    # backdate the transition event: the pump's deadline derives from it
+    from datetime import datetime, timedelta
+
+    old = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
+    await dh.db.execute(
+        "UPDATE agent_events SET ts = ? WHERE run_id = ? AND event_type ="
+        " 'state_transition' AND json_extract(payload_json, '$.to') = 'ci_running'",
+        (old, dh.run.id),
+    )
+    await dh.db.conn.commit()
+
+
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_ci_pending_beyond_poll_timeout_escalates(dh: DHarness) -> None:
+    """§6.11: CI stuck pending longer than poll_timeout_s ⇒ escalated (with
+    notification), never an infinite poll loop."""
+    dh.settings.github.poll_timeout_s = 3600.0
+    gateway = FakeGateway(responses=[])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    await _enter_ci_running_and_backdate(dh, d, age_s=3601.0)
+
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    assert await d.pump(run) == "escalated"
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.ESCALATED
+    assert any("pending" in c[2].lower() for c in dh.notifier.calls)
+    # zero model dispatch: escalation is bookkeeping, not an agent episode
+    assert gateway.calls == []
+
+
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_ci_pending_within_window_keeps_polling(dh: DHarness) -> None:
+    dh.settings.github.poll_timeout_s = 3600.0
+    gateway = FakeGateway(responses=[])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    await _enter_ci_running_and_backdate(dh, d, age_s=60.0)
+
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    assert await d.pump(run) == "ci_pending"
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.CI_RUNNING
+    assert not any("escalat" in c[1].lower() for c in dh.notifier.calls)
+
+
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_ci_fixing_reentry_does_not_reset_poll_deadline(dh: DHarness) -> None:
+    """Semantic pin: the deadline starts at the FIRST ci_running entry; a
+    ci_fixing → ci_running re-entry does not buy a fresh budget."""
+    dh.settings.github.poll_timeout_s = 3600.0
+    gateway = FakeGateway(responses=[])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    await _enter_ci_running_and_backdate(dh, d, age_s=3601.0)
+
+    # simulate a fix episode: ci_running → ci_fixing → ci_running; the newest
+    # ci_running transition event carries a FRESH timestamp, but the deadline
+    # must still be derived from the first (backdated) entry
+    await transition_run(dh.db, dh.run.id, RunStatus.CI_FIXING, payload={"failed": ["x"]})
+    await transition_run(dh.db, dh.run.id, RunStatus.CI_RUNNING, payload={"fix": "y"})
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.CI_RUNNING
+
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    assert await d.pump(run) == "escalated"
+
+
+# --------------------------------- classification without nodeids (§6.11)
+
+
+async def _red_ci_without_nodeids(dh: DHarness) -> DeliveryEngine:
+    dh.api.checks = [check("tests", "failure", summary="1 test failed — see logs")]
+    gateway = FakeGateway(responses=[])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    return d
+
+
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_unparseable_ci_log_locally_red_in_baseline_escalates(dh: DHarness) -> None:
+    """No nodeids in the CI log + locally red on the baseline ⇒ baseline_broken
+    escalation — classification must not be skipped when ids are unextractable."""
+    baseline = await repo.create_baseline_run(
+        dh.db,
+        dh.project.id,
+        "base0000",
+        json.dumps({"tests/test_p.py::test_bad": {"status": "failed", "flaky": False}}),
+    )
+    await repo.update_run_fields(dh.db, dh.run.id, baseline_run_id=baseline.id)
+    d = await _red_ci_without_nodeids(dh)
+    dh.sandbox._suite_xml = RED_XML  # local suite on the run head is red
+
+    status = await _drive(d, dh.run.id)
+    assert status == "escalated"
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.ESCALATED
+    assert any("baseline" in c[2].lower() for c in dh.notifier.calls)
+    assert d.gateway.calls == []  # escalated, never dispatched to the fix agent
+
+
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_unparseable_ci_log_locally_green_goes_to_fix_agent(dh: DHarness) -> None:
+    """No nodeids + locally green ⇒ the CI failure is not a test failure at
+    all (lint/env-shaped, SC-09's linter-mismatch case): no test could be
+    masked, so the failure is novel and routes to the diagnostic fix agent
+    rather than escalating."""
+    gateway = FakeGateway(responses=[])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    dh.api.checks = [check("tests", "failure", summary="1 test failed — see logs")]
+
+    # pump until the routing decision lands (CI_FIXING ⇒ novel ⇒ fix agent)
+    status = "pr_opened"
+    for _ in range(12):
+        run = await repo.get_run(dh.db, dh.run.id)
+        assert run is not None
+        await d.pump(run)
+        fresh = await repo.get_run(dh.db, dh.run.id)
+        assert fresh is not None
+        status = fresh.status
+        if status is RunStatus.CI_FIXING or status in (
+            RunStatus.ESCALATED,
+            RunStatus.FAILED,
+            RunStatus.MERGED,
+            RunStatus.MERGE_PENDING_HUMAN,
+        ):
+            break
+    assert status is RunStatus.CI_FIXING, f"expected novel-failure routing, got {status}"
+
+
+# --------------------------------------- refused merge resets streak (§9.2)
+
+
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_github_refused_merge_resets_clean_streak(dh: DHarness) -> None:
+    """§9.2: a refused (escalated) merge is not a clean merge — the streak
+    resets, and the run escalates."""
+    await dh.db.execute(
+        "UPDATE projects SET clean_merge_streak = 7 WHERE id = ?", (dh.project.id,)
+    )
+    await dh.db.conn.commit()
+    dh.api.merge_refused = True
+    gateway = FakeGateway(responses=[_resp(content=GOOD_VERDICT)])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    status = await _drive(d, dh.run.id)
+    assert status == "escalated"
+    assert dh.api.merge_calls == 1
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.ESCALATED
+    project = await repo.get_project(dh.db, dh.project.id)
+    assert project is not None and project.clean_merge_streak == 0
+    assert any("merge refused" in c[2].lower() for c in dh.notifier.calls)

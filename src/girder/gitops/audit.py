@@ -85,6 +85,92 @@ class DiffAudit:
         lines = "".join(f"{p}\0{h}\n" for p, h in sorted(files.items()))
         return TestManifest(root_hash=_hash_bytes(lines.encode()), files=files)
 
+    async def manifest_from_commit(self, repo_path: Path, commit: str) -> TestManifest:
+        """Hash every blob in ``<commit>``'s tree matching a test-signal pattern."""
+        out = await _git(repo_path, "ls-tree", "-r", commit)
+        rels: list[str] = []
+        for line in out.splitlines():
+            if not line:
+                continue
+            meta, _, path = line.partition("\t")
+            parts = meta.split()
+            if len(parts) != 3 or parts[1] != "blob":
+                continue
+            rels.append(path)
+        files: dict[str, str] = {}
+        for rel in rels:
+            if not _matches_any(rel, self.test_signal_patterns):
+                continue
+            blob = await _git(repo_path, "show", f"{commit}:{rel}")
+            files[rel] = _hash_bytes(blob.encode())
+        lines = "".join(f"{p}\0{h}\n" for p, h in sorted(files.items()))
+        return TestManifest(root_hash=_hash_bytes(lines.encode()), files=files)
+
+    async def audit_commit(
+        self,
+        repo_path: Path,
+        *,
+        task_type: TaskType,
+        scope_globs: list[str],
+        base_commit: str,
+        commit: str,
+        start_manifest: TestManifest | None = None,
+    ) -> AuditResult:
+        """Layer 2/3 audit of an already-made commit, no worktree required."""
+        diff_out = await _git(repo_path, "diff", "--name-only", "-M", base_commit, commit)
+        changed = {line for line in diff_out.splitlines() if line}
+
+        test_violations = sorted(
+            p
+            for p in changed
+            if task_type is not TaskType.TEST_CHANGE
+            and _matches_any(p, self.test_signal_patterns)
+        )
+        protected = sorted(p for p in changed if _matches_any(p, self.protected_read_paths))
+        out_of_scope = sorted(
+            p
+            for p in changed
+            if not p.startswith(".git/")
+            and not any(path_matches(p, g) for g in scope_globs)
+        )
+
+        mismatches: list[str] = []
+        if start_manifest is not None:
+            end = await self.manifest_from_commit(repo_path, commit)
+            if start_manifest.files:
+                for path in sorted(set(start_manifest.files) | set(end.files)):
+                    if start_manifest.files.get(path) != end.files.get(path):
+                        # Same layer-2 semantics as audit_attempt: flag only
+                        # test-signal drift on non-test tasks (deletions count).
+                        if (
+                            task_type is not TaskType.TEST_CHANGE
+                            and _matches_any(path, self.test_signal_patterns)
+                        ):
+                            mismatches.append(path)
+            elif (
+                start_manifest.root_hash
+                and start_manifest.root_hash != end.root_hash
+                and task_type is not TaskType.TEST_CHANGE
+            ):
+                # The caller only kept the root hash (not per-file entries), so
+                # per-path attribution is impossible; best-effort, report every
+                # changed test-signal path as a mismatch. Same layer-2 gate as
+                # above: a test_change task is ALLOWED to move test files, so
+                # its root hash drifting from the pre-task anchor is normal.
+                mismatches = sorted(
+                    p for p in changed if _matches_any(p, self.test_signal_patterns)
+                )
+
+        leftovers: list[str] = []
+        return AuditResult(
+            passed=not (test_violations or mismatches or out_of_scope or protected or leftovers),
+            test_path_violations=test_violations,
+            content_hash_mismatches=mismatches,
+            out_of_scope_writes=out_of_scope,
+            protected_path_touches=protected,
+            uncommitted_leftovers=leftovers,
+        )
+
     async def audit_attempt(
         self,
         worktree_path: Path,

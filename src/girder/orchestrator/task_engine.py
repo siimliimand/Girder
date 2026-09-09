@@ -40,6 +40,7 @@ from girder.db.models import (
     IntegrityKind,
     Project,
     Run,
+    SteeringKind,
     Task,
     TaskStatus,
     TaskType,
@@ -62,28 +63,39 @@ from girder.util import run_host_cmd, utcnow_iso
 log = logging.getLogger(__name__)
 
 VERIFY_XML = ".girder-verify.xml"
-VERIFY_CMD = [
-    "python",
-    "-m",
-    "pytest",
-    "-q",
-    f"--junitxml=/workspace/{VERIFY_XML}",
-    "-p",
-    "no:cacheprovider",
-]
+
+
+def verify_cmd(python_bin: str) -> list[str]:
+    """Verification suite argv under the configured interpreter (§5.5)."""
+    return [
+        python_bin,
+        "-m",
+        "pytest",
+        "-q",
+        f"--junitxml=/workspace/{VERIFY_XML}",
+        "-p",
+        "no:cacheprovider",
+    ]
+
+
+# Default-interpreter form kept for callers that have no Settings in hand
+# (orchestrator.suites); the engine itself uses ``verify_cmd(python_bin)``.
+VERIFY_CMD = verify_cmd("python3")
 _VERIFY_TIMEOUT_S = 900.0
 _TAIL_CHARS = 2000
 
 
 @dataclass(frozen=True)
 class TaskOutcome:
-    kind: str  # completed | failed | integrity_violation | amendment_pending | budget_exhausted
+    # completed | verified (wave mode, integration deferred) | failed |
+    # integrity_violation | amendment_pending | budget_exhausted
+    kind: str
     detail: str | None = None
 
 
 @dataclass(frozen=True)
 class _VerifyStep:
-    """Internal: completed/failed/integrity_violation, or retry with guidance."""
+    """Internal: completed/verified/failed/integrity_violation, or retry."""
 
     kind: str
     detail: str | None
@@ -126,20 +138,58 @@ class TaskEngine:
             test_signal_patterns=settings.project.test_signal_patterns,
             protected_read_paths=settings.project.protected_read_paths,
         )
-        self._snapshot_dirs: dict[str, Path | None] = {}
+        self._snapshot_dirs: dict[str, list[Path]] = {}
 
     # ------------------------------------------------------------- entrypoint
 
-    async def execute_task(self, run: Run, task: Task) -> TaskOutcome:
-        """Run *task* to a terminal outcome (or an amendment park)."""
+    async def execute_task(self, run: Run, task: Task, *, integrate: bool = True) -> TaskOutcome:
+        """Run *task* to a terminal outcome (or an amendment park).
+
+        With ``integrate=False`` (Sprint 5 wave mode) a green, audit-clean
+        attempt stops at ``verify_passed`` with its commits on the task branch
+        — the wave integrator merges verified task branches one by one, so
+        agents never merge into a shared branch concurrently (plan.md Phase 4
+        task 4).
+        """
         max_attempts = self.settings.limits.task_max_attempts
+        # Rejection guidance (§6.9): a user-rejected spec amendment persists
+        # guidance that must reach the agent as trusted steering. Looked up
+        # once per execute_task call (i.e. once per amendment resume) and kept
+        # as a standing constraint on every attempt, composed before any
+        # failed-attempt feedback. User-authored ⇒ trusted per §7.
+        rejection_guidance = await repo.get_rejected_guidance(self.db, run.id, task.id)
+        # Sprint 6 (WP 6.2): steering injects that arrived between tasks or
+        # during a pause were never consumed by an agent turn — fold them into
+        # this attempt's guidance instead (blank-line separated).
+        injects = await repo.consume_steering_events(
+            self.db, run.id, kinds=[SteeringKind.INJECT.value]
+        )
+        directives = [
+            str(e["payload"].get("directive", "") or "").strip()
+            for e in injects
+            if isinstance(e["payload"], dict)
+            and str(e["payload"].get("directive", "") or "").strip()
+        ]
+        steering_guidance = "\n\n".join(
+            g for g in (rejection_guidance, *directives) if g
+        ) or None
         guidance: str | None = None
         branch_ops = BranchOps(self.repo_path)
+
+        def _effective_guidance() -> str | None:
+            if steering_guidance is None:
+                return guidance
+            if guidance is None:
+                return steering_guidance
+            return f"{steering_guidance}\n{guidance}"
 
         while True:
             fresh = await repo.get_task(self.db, task.id)
             if fresh is None:
                 raise KeyError(f"task {task.id} not found")
+            if fresh.status is TaskStatus.VERIFY_PASSED:
+                # Wave mode: already verified, waiting on the integrator.
+                return TaskOutcome("verified")
             if fresh.status in (
                 TaskStatus.COMPLETED,
                 TaskStatus.FAILED,
@@ -173,6 +223,7 @@ class TaskEngine:
             )
             deadline = asyncio.get_running_loop().time() + self.settings.limits.attempt_wallclock_s
             step: _VerifyStep | None = None
+            cancelled = False
             try:
                 runtime = AgentRuntime(
                     gateway=self.gateway,
@@ -193,14 +244,21 @@ class TaskEngine:
                 try:
                     outcome = await runtime.execute_attempt(
                         spec_slice=fresh.spec_slice_md,
-                        guidance=guidance,
+                        guidance=_effective_guidance(),
                         deadline_s=deadline,
                     )
-                    # Verify + merge while the container is still alive (the
-                    # finally below tears it down).
+                    # Verify (+ merge unless deferred) while the container is
+                    # still alive (the finally below tears it down).
                     step = (
                         await self._verify_and_integrate(
-                            run, fresh, attempt, worktree, manifest, base_commit, container
+                            run,
+                            fresh,
+                            attempt,
+                            worktree,
+                            manifest,
+                            base_commit,
+                            container,
+                            integrate=integrate,
                         )
                         if outcome.status == "succeeded"
                         else None
@@ -209,6 +267,17 @@ class TaskEngine:
                     # The gateway already froze the attempt (budget_frozen) and
                     # routed the run to budget_exhausted; report upward.
                     return TaskOutcome("budget_exhausted")
+                except asyncio.CancelledError:
+                    # Cancellation protocol: the run pump aborting the attempt
+                    # owns every terminal transition (attempt → crashed, task
+                    # state, events). Here we only kill this attempt's sandbox
+                    # container — best-effort and idempotent, the pump may have
+                    # killed it already — then re-raise WITHOUT any DB status
+                    # writes (no attempt/task transitions, no events).
+                    cancelled = True
+                    with suppress(Exception):
+                        await self.sandbox.kill(container)
+                    raise
                 except Exception as exc:
                     # Never silently swallow programming errors — record, raise.
                     with suppress(InvalidTransition):
@@ -221,7 +290,7 @@ class TaskEngine:
                     )
                     raise
             finally:
-                await self._teardown_attempt(attempt, container)
+                await self._teardown_attempt(attempt, container, record_end=not cancelled)
 
             if outcome.status == "amendment_requested":
                 reason, change = outcome.amendment or ("unspecified", "")
@@ -276,32 +345,55 @@ class TaskEngine:
             image=self.image,
             worktree=ref.path,
         )
-        # Layer 1 test shadowing (§8.2): mount a pristine RO snapshot of the
-        # test tree over the worktree's own copy. Only possible when the
-        # project declares exactly ONE test directory (a single mount point);
-        # with 0 or >1 we skip the mount — Layers 2 (re-hash) and 3 (diff
-        # audit) still catch any test tampering after the fact.
+        # Layer 1 test shadowing (§8.2): mount a pristine RO snapshot of each
+        # configured test directory over the worktree's own copy — one
+        # snapshot dir + one RO shadow mount per test directory (the engine
+        # renders ``ro_mounts`` as ``-v host:container:ro`` before the
+        # workspace contents are visible to the agent). With no configured
+        # test directories Layer 1 is inactive — warn, and rely on Layers 2
+        # (re-hash) and 3 (diff audit) to catch tampering after the fact.
         test_dirs = self.settings.project.test_directories
-        snapshot_dir: Path | None = None
-        if task.task_type is not TaskType.TEST_CHANGE and len(test_dirs) == 1:
-            snapshot_dir = Path(tempfile.mkdtemp(prefix="girder-snap-"))
-            await self._audit.materialize_test_snapshot(
-                self.repo_path, base_commit, [test_dirs[0]], snapshot_dir
-            )
-            spec.test_snapshot = (snapshot_dir, test_dirs[0])
-        self._snapshot_dirs[spec.name] = snapshot_dir
+        snapshot_dirs: list[Path] = []
+        if task.task_type is not TaskType.TEST_CHANGE:
+            if not test_dirs:
+                log.warning(
+                    "attempt %s: project.test_directories is empty — "
+                    "Layer 1 RO test snapshot is INACTIVE (§8.2)",
+                    attempt.id,
+                )
+            for test_dir in test_dirs:
+                snapshot_dir = Path(tempfile.mkdtemp(prefix="girder-snap-"))
+                await self._audit.materialize_test_snapshot(
+                    self.repo_path, base_commit, [test_dir], snapshot_dir
+                )
+                # `git archive` keeps the path prefix, so the shadow source is
+                # <snapshot>/<test_dir>, mounted over /workspace/<test_dir>.
+                spec.ro_mounts[str(snapshot_dir / test_dir.strip("/"))] = (
+                    "/workspace/" + test_dir.strip("/")
+                )
+                snapshot_dirs.append(snapshot_dir)
+        self._snapshot_dirs[spec.name] = snapshot_dirs
 
         await self.sandbox.start(spec)
         await repo.update_attempt_fields(self.db, attempt.id, container_id=spec.name)
         await transition_attempt(self.db, attempt.id, AttemptStatus.RUNNING)
         return attempt, ref, manifest, spec.name
 
-    async def _teardown_attempt(self, attempt: Attempt, container: str) -> None:
+    async def _teardown_attempt(
+        self, attempt: Attempt, container: str, *, record_end: bool = True
+    ) -> None:
+        """Tear down one attempt's container, snapshots and worktree.
+
+        With ``record_end=False`` (cancellation protocol: the run pump owns
+        the terminal transition) only the container kill and snapshot cleanup
+        run — no worktree pruning, no DB writes.
+        """
         with suppress(Exception):
             await self.sandbox.kill(container)
-        snapshot_dir = self._snapshot_dirs.pop(container, None)
-        if snapshot_dir is not None:
+        for snapshot_dir in self._snapshot_dirs.pop(container, []):
             shutil.rmtree(snapshot_dir, ignore_errors=True)
+        if not record_end:
+            return
         wt_path = attempt.worktree_path
         if wt_path is not None:
             manager = WorktreeManager(self.repo_path, self.worktree_base or DEFAULT_BASE)
@@ -331,9 +423,15 @@ class TaskEngine:
         manifest: TestManifest,
         base_commit: str,
         container: str,
+        *,
+        integrate: bool = True,
     ) -> _VerifyStep:
         await transition_task(self.db, task.id, TaskStatus.VERIFYING)
-        exec_res = await self.sandbox.exec(container, VERIFY_CMD, timeout_s=_VERIFY_TIMEOUT_S)
+        exec_res = await self.sandbox.exec(
+            container,
+            verify_cmd(self.settings.sandbox.python_bin),
+            timeout_s=_VERIFY_TIMEOUT_S,
+        )
         xml_path = worktree.path / VERIFY_XML
         suite_green = exec_res.exit_code == 0 and xml_path.is_file()
         test_results: dict[str, str] = {}
@@ -351,13 +449,9 @@ class TaskEngine:
 
         if not suite_green:
             tail = self._redact_tail(exec_res.stdout + "\n" + exec_res.stderr)
-            await self._close_attempt(attempt.id, AttemptStatus.FAILED.value, tail)
-            next_guidance = await self._retry_or_fail(
-                run, task, tail, event="verify_failed", note="verification suite failed"
+            return await self._retry_step(
+                run, task, attempt, tail, event="verify_failed", note="verification suite failed"
             )
-            if next_guidance is None:
-                return _VerifyStep("failed", tail)
-            return _VerifyStep("retry", next_guidance)
 
         # Suite green — Layer 2/3 mechanical audit of the observed diff.
         audit = await self._audit.audit_attempt(
@@ -367,8 +461,32 @@ class TaskEngine:
             base_commit=base_commit,
             start_manifest=manifest,
         )
+        if audit.uncommitted_leftovers and not (
+            audit.test_path_violations
+            or audit.content_hash_mismatches
+            or audit.out_of_scope_writes
+            or audit.protected_path_touches
+        ):
+            # §5.2: forgetting to commit is an ordinary attempt failure —
+            # NOT an integrity violation (§8.2 lists only the five mechanical
+            # kinds below). Retry with explicit commit guidance.
+            detail = (
+                "uncommitted changes left on the task branch ("
+                + ", ".join(audit.uncommitted_leftovers[:5])
+                + "). Commit your work (git add -A && git commit); "
+                "the task branch must be clean before completion."
+            )
+            return await self._retry_step(
+                run, task, attempt, detail, event="verify_failed", note="uncommitted leftovers"
+            )
         if not audit.passed:
             return await self._integrity_violation(run, task, attempt, audit)
+
+        # A clean tree with an empty commit range is a legitimate "no change
+        # needed" outcome (e.g. documentation-only intents): the ff proof in
+        # audit_gated_merge passes for equal tips and the merge is a no-op.
+        # "Forgot to commit" is caught above via the uncommitted-leftovers
+        # audit finding, not here.
 
         # Record where this attempt's work ended on the task branch (the
         # worktree may be detached after a retry), then merge ff-only.
@@ -386,6 +504,25 @@ class TaskEngine:
             ],
             timeout_s=30,
         )
+        if not integrate:
+            # Wave mode (Phase 4): stop at verify_passed. The branch tip is
+            # recorded; the wave integrator merges verified branches one by
+            # one, so concurrent agents never share a merge target.
+            await transition_attempt(self.db, attempt.id, AttemptStatus.SUCCEEDED)
+            await repo.insert_event(
+                self.db,
+                "task_verified",
+                {
+                    "task_id": task.id,
+                    "attempt_id": attempt.id,
+                    "commit": head.stdout.strip(),
+                    "tests": len(test_results),
+                },
+                run_id=run.id,
+                attempt_id=attempt.id,
+            )
+            await transition_task(self.db, task.id, TaskStatus.VERIFY_PASSED)
+            return _VerifyStep("verified", head.stdout.strip())
         merge = await BranchOps(self.repo_path).audit_gated_merge(
             source_branch=worktree.branch,
             target_branch=run.branch,
@@ -393,17 +530,14 @@ class TaskEngine:
             worktree_path=worktree.path,
         )
         if not merge.merged:
-            # Unreachable when the audit passed; treat as integrity regardless.
-            await repo.insert_integrity_violation(
-                self.db,
-                run.id,
-                IntegrityKind.SCOPE_VIOLATION,
-                {"detail": f"merge refused: {merge.reason}"},
-                task_id=task.id,
-                attempt_id=attempt.id,
+            # Unexpected refusal after a passed audit (§5.2): an ordinary
+            # attempt failure — retry, never logged as an integrity violation
+            # (§8.2 reserves that for the five mechanical kinds only).
+            reason = merge.reason or "merge refused"
+            detail = f"merge refused after a passed audit: {reason}"
+            return await self._retry_step(
+                run, task, attempt, detail, event="merge_refused", note=detail
             )
-            await self._fail_without_retry(run, task, attempt, f"merge refused: {merge.reason}")
-            return _VerifyStep("integrity_violation", merge.reason)
 
         await transition_attempt(self.db, attempt.id, AttemptStatus.SUCCEEDED)
         await repo.insert_event(
@@ -425,7 +559,9 @@ class TaskEngine:
     async def _integrity_violation(
         self, run: Run, task: Task, attempt: Attempt, audit: AuditResult
     ) -> _VerifyStep:
-        # §8.2: integrity violations fail WITHOUT retry and never merge.
+        # §8.2: integrity violations fail WITHOUT retry and never merge. Only
+        # the five mechanical kinds count — uncommitted leftovers are handled
+        # upstream as an ordinary retryable failure.
         findings: list[tuple[IntegrityKind, dict[str, object]]] = []
         if audit.test_path_violations:
             findings.append(
@@ -443,10 +579,8 @@ class TaskEngine:
             findings.append(
                 (IntegrityKind.PROTECTED_READ, {"paths": audit.protected_path_touches})
             )
-        if audit.uncommitted_leftovers:
-            findings.append(
-                (IntegrityKind.SCOPE_VIOLATION, {"paths": audit.uncommitted_leftovers})
-            )
+        if not findings:  # pragma: no cover - guarded by the callers above
+            raise RuntimeError("integrity violation with no mechanical findings")
         for kind, detail in findings:
             await repo.insert_integrity_violation(
                 self.db, run.id, kind.value, detail, task_id=task.id, attempt_id=attempt.id
@@ -472,6 +606,24 @@ class TaskEngine:
             )
 
     # ---------------------------------------------------------------- helpers
+
+    async def _retry_step(
+        self,
+        run: Run,
+        task: Task,
+        attempt: Attempt,
+        detail: str,
+        *,
+        event: str,
+        note: str,
+    ) -> _VerifyStep:
+        """Close the attempt FAILED and retry with feedback, or fail the task."""
+        tail = self._redact_tail(detail)
+        await self._close_attempt(attempt.id, AttemptStatus.FAILED.value, tail)
+        next_guidance = await self._retry_or_fail(run, task, tail, event=event, note=note)
+        if next_guidance is None:
+            return _VerifyStep("failed", tail)
+        return _VerifyStep("retry", detail)
 
     async def _retry_or_fail(
         self, run: Run, task: Task, tail: str, *, event: str, note: str

@@ -151,6 +151,9 @@ class Run:
     pr_number: int | None = None
     proposal_md: str | None = None
     integrity_violations: int = 0
+    # Sprint 6 steering: pump-level suspend flag (migration 010). The run
+    # stays `active`; a paused run is pumped only to observe resume/abort.
+    paused: bool = False
 
 
 @dataclass
@@ -201,3 +204,18 @@ class Worktree:
     state: WorktreeState = WorktreeState.ACTIVE
     created_at: str | None = None
     removed_at: str | None = None
+
+
+@dataclass
+class AttemptPrompt:
+    """One per-turn prompt snapshot (migration 011, plan.md Phase 5 task 5).
+
+    ``content_redacted`` is stored as given — callers redact before persisting.
+    """
+
+    attempt_id: str
+    turn: int
+    role: str
+    content_redacted: str
+    ts: str
+    run_id: str | None = None

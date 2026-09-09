@@ -71,13 +71,13 @@ tasks:
     type: test_change
     scope_globs: ["tests/**"]
     success_criteria: ["divide is covered by tests"]
-    depends_on: []
+    depends_on: [implement-divide]
   - id: readme-usage
     title: Document divide in the README
     type: documentation
     scope_globs: ["README.md"]
     success_criteria: ["README documents divide"]
-    depends_on: []
+    depends_on: [divide-tests]
 ---
 Narrative.
 """

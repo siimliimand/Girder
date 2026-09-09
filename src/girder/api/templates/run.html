@@ -1,34 +1,125 @@
-{# Run detail page (impl-plan §10). Includes the pollable panel fragment.
-
-Polling is plain-vanilla JS re-fetching /runs/{id}/panel every 2s while the
-fragment carries data-poll="true"; HTMX/SSE replace this in the Sprint 6
-console. No CDN assets are used.
+{# Run detail page (impl-plan §10). Sprint 6 live console (WP 6.1/6.3):
+   SSE event stream, server-rendered DAG, steering controls, spend meter.
+   Polling of the panel stays for status/spend freshness; the event log itself
+   is EventSource-driven. No CDN assets are used.
 #}
 {% extends "base.html" %}
 {% block content %}
 <h1>Run <code>{{ run.id[:8] }}</code></h1>
-<p>Project: <a href="/projects/{{ project.id }}">{{ project.name }}</a></p>
+<p>Project: <a href="/projects/{{ project.id }}">{{ project.name }}</a>
+   | <a href="/runs/{{ run.id }}/postmortem">Post-mortem</a></p>
+{% if run.status.value == "budget_exhausted" %}
+  <p class="banner-budget">Budget exhausted — this run tripped its spend cap
+     (${{ '%.2f'|format(spend.cap) }}) and was halted.</p>
+{% endif %}
 <div id="run-panel">
   {% include "_run_panel.html" %}
 </div>
+
+<h2>Spend (WP 6.3)</h2>
+<div class="spend">
+  Actual ${{ '%.4f'|format(spend.spend_usd) }} · projected
+  ${{ '%.4f'|format(spend.projected_spend_usd) }} · cap
+  ${{ '%.2f'|format(spend.cap) }}
+</div>
+<div class="meter" title="actual spend against cap">
+  {% set pct = (100 * spend.spend_usd / spend.cap)|round(1) if spend.cap else 0 %}
+  <div class="meter-fill {% if pct > 90 %}meter-hot{% endif %}" style="width: {{ pct }}%"></div>
+</div>
+{% if roles %}
+<table>
+  <thead><tr><th>Role</th><th>Model</th><th>Calls</th><th>Prompt</th><th>Completion</th>
+      <th>Cost</th><th>Estimated before call</th></tr></thead>
+  <tbody>
+  {% for r in roles %}
+    <tr>
+      <td>{{ r.model_role }}</td><td>{{ r.model_id }}</td><td>{{ r.calls }}</td>
+      <td>{{ r.prompt_tokens }}</td><td>{{ r.completion_tokens }}</td>
+      <td>${{ '%.4f'|format(r.cost_usd) }}</td><td>${{ '%.4f'|format(r.estimated_usd) }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Task graph</h2>
+<div class="dag">
+  {% for w in graph.waves %}
+    <section class="wave">
+      <h3>Wave {{ w.sequence_order }}
+        <span class="badge">{{ w.status }}</span></h3>
+      {% for t in w.tasks %}
+        <div class="task task-{{ t.cls }}">
+          <strong>#{{ t.seq }} {{ t.title }}</strong>
+          <span class="badge">{{ t.task_type }}</span>
+          <span class="badge">{{ t.status }}</span>
+          <div class="muted">scope: {% for g in t.scope_globs %}<code>{{ g }}</code> {% else %}—{% endfor %}</div>
+          {% if t.depends_on %}<div class="muted">depends on: {{ t.depends_on|join(', ') }}</div>{% endif %}
+        </div>
+      {% else %}
+        <p class="muted">No tasks in this wave.</p>
+      {% endfor %}
+    </section>
+  {% endfor %}
+  {% if graph.unwaved_tasks %}
+    <section class="wave">
+      <h3>Unwaved tasks</h3>
+      {% for t in graph.unwaved_tasks %}
+        <div class="task task-{{ t.cls }}"><strong>#{{ t.seq }} {{ t.title }}</strong>
+          <span class="badge">{{ t.status }}</span></div>
+      {% endfor %}
+    </section>
+  {% endif %}
+</div>
+
+<h2>Steering</h2>
+<div class="actions">
+  <form method="post" action="/api/runs/{{ run.id }}/steer">
+    <button type="submit" name="action" value="pause">Pause</button>
+    <button type="submit" name="action" value="resume">Resume</button>
+    <button type="submit" name="action" value="abort">Abort</button>
+  </form>
+  <form method="post" action="/api/runs/{{ run.id }}/steer">
+    <label>Directive<br>
+      <textarea name="directive" rows="2" cols="60"></textarea></label><br>
+    <button type="submit" name="action" value="inject">Inject</button>
+  </form>
+  <form method="post" action="/api/runs/{{ run.id }}/steer">
+    <label>Task
+      <select name="task_id">
+        {% for w in graph.waves %}{% for t in w.tasks %}
+          <option value="{{ t.id }}">#{{ t.seq }} {{ t.title }}</option>
+        {% endfor %}{% endfor %}
+      </select>
+    </label>
+    <button type="submit" name="action" value="skip">Skip</button>
+    <button type="submit" name="action" value="force_pass">Force-pass</button>
+  </form>
+</div>
+
+<h2>Live events</h2>
+<p id="stream-note" class="muted">connecting…</p>
+<div id="event-log" class="event-log"></div>
 <script>
 (function () {
-  var el = document.getElementById("run-panel");
-  var timer = null;
-  function tick() {
-    fetch("/runs/{{ run.id }}/panel")
-      .then(function (r) { return r.text(); })
-      .then(function (html) {
-        el.innerHTML = html;
-        if (html.indexOf('data-poll="true"') === -1 && timer) {
-          clearInterval(timer);
-          timer = null;
-        }
-      });
-  }
-  if (document.querySelector('[data-poll="true"]') && !timer) {
-    timer = setInterval(tick, 2000);
-  }
+  var log = document.getElementById("event-log");
+  var note = document.getElementById("stream-note");
+  var es = new EventSource("/api/runs/{{ run.id }}/events?after_id=0");
+  ["violation", "budget", "state", "tool", "info"].forEach(function (cls) {
+    es.addEventListener(cls, function (e) {
+      var d = JSON.parse(e.data);
+      var row = document.createElement("div");
+      row.className = "evt evt-" + cls;
+      row.textContent = d.ts + " [" + cls + "] " + d.event_type + " " +
+        JSON.stringify(d.payload);
+      log.appendChild(row);
+    });
+  });
+  es.addEventListener("end", function (e) {
+    es.close();
+    note.textContent = "stream ended (run " + JSON.parse(e.data).status + ")";
+  });
+  es.onerror = function () { note.textContent = "reconnecting…"; };
 })();
 </script>
 {% endblock %}

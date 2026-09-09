@@ -8,6 +8,7 @@ the same flag surface) lives in :mod:`girder.sandbox.podman`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,3 +72,15 @@ class SandboxEngine(ABC):
     @abstractmethod
     async def exists(self, name: str) -> bool:
         """True while the sandbox is running."""
+
+    async def stream_logs(self, sandbox_id: str) -> AsyncIterator[str]:
+        """Yield sandbox log lines as they arrive (impl-plan §6.4).
+
+        Follows the log until the sandbox exits or the consumer breaks out of
+        the iterator — breaking cancels the underlying ``logs --follow`` and
+        terminates the streaming subprocess. Default is an empty stream;
+        engines that have a log source (PodmanEngine) override this. Kept
+        non-abstract so lightweight fakes remain concrete.
+        """
+        raise NotImplementedError
+        yield ""  # pragma: no cover — makes this an async-generator method

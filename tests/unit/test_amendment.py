@@ -173,6 +173,21 @@ async def test_reject_returns_to_active_with_guidance(ctx: Ctx) -> None:
     fresh_run = await repo.get_run(ctx.db, ctx.run.id)
     assert fresh_run is not None
     assert fresh_run.spec_hash == ctx.old_hash  # untouched
+    # the TaskEngine's lookup relays the guidance on resume (impl-plan §6.9)
+    assert amendment.task_id is not None
+    found = await repo.get_rejected_guidance(ctx.db, ctx.run.id, amendment.task_id)
+    assert found == "proceed without the change"
+
+
+async def test_get_rejected_guidance_none_without_rejection(ctx: Ctx) -> None:
+    amendment = await _request(ctx)
+    assert amendment.task_id is not None
+    assert await repo.get_rejected_guidance(ctx.db, ctx.run.id, amendment.task_id) is None
+    # a pending amendment (no guidance) still yields None
+    await resolve_amendment(
+        ctx.db, project=ctx.project, run=ctx.run, amendment=amendment, decision="approved"
+    )
+    assert await repo.get_rejected_guidance(ctx.db, ctx.run.id, amendment.task_id) is None
 
 
 async def test_abort_drops_task_and_aborts_run(ctx: Ctx) -> None:

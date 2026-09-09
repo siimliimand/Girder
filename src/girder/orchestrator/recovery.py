@@ -9,7 +9,11 @@ migrations, this service reconciles the world to match it:
    --force``); unremovable ones are quarantined for human inspection.
 3. Tasks caught mid-flight (``running`` / ``verifying``) are rescheduled — or
    marked failed outright when the attempt budget is exhausted.
-4. If anything was recovered, a notification with a recovery report goes out
+4. Git/DB consistency is verified for every non-terminal run (§8.7 step 4):
+   a missing run branch is recreated from ``main``; worktree rows whose path
+   vanished from disk are pruned so the scheduler rebuilds cleanly from the
+   task's base commit.
+5. If anything was recovered, a notification with a recovery report goes out
    (through the redaction pipeline, like every notification).
 """
 
@@ -29,6 +33,7 @@ from girder.db.models import (
     WorktreeState,
 )
 from girder.fsm import transition_attempt, transition_task
+from girder.gitops.branch import BranchOps
 from girder.gitops.worktree import WorktreeManager
 from girder.notify.notifier import Notifier
 
@@ -42,6 +47,7 @@ class RecoveryReport:
     quarantined_worktrees: list[str] = field(default_factory=list)
     rescheduled_tasks: list[str] = field(default_factory=list)
     failed_tasks: list[str] = field(default_factory=list)
+    recreated_branches: list[str] = field(default_factory=list)
 
     @property
     def anything_recovered(self) -> bool:
@@ -51,12 +57,17 @@ class RecoveryReport:
             or self.quarantined_worktrees
             or self.rescheduled_tasks
             or self.failed_tasks
+            or self.recreated_branches
         )
 
     def summary(self) -> str:
         lines = ["Recovery report:"]
         if self.crashed_attempts:
             lines.append(f"- {len(self.crashed_attempts)} attempt(s) crashed mid-flight")
+        if self.recreated_branches:
+            lines.append(
+                f"- {len(self.recreated_branches)} missing run branch(es) recreated from main"
+            )
         if self.pruned_worktrees:
             lines.append(f"- {len(self.pruned_worktrees)} worktree(s) pruned")
         if self.quarantined_worktrees:
@@ -81,6 +92,7 @@ class RecoveryService:
         await self._crash_running_attempts(report)
         await self._reschedule_interrupted_tasks(report)
         await self._prune_dead_worktrees(report)
+        await self._reconcile_run_branches(report)
         await self._verify_no_live_worktrees_on_terminal_runs()
         if report.anything_recovered and self.notifier is not None:
             await self.notifier.notify("warning", "Girder restarted after crash", report.summary())
@@ -127,6 +139,20 @@ class RecoveryService:
             if ctx["status"] == AttemptStatus.RUNNING.value:
                 continue  # still live — nothing to do (should not happen post-step-1)
             manager = WorktreeManager(Path(ctx["repo_path"]))
+            if not (Path(ctx["path"]) / ".git").exists():
+                # §8.7 step 4: the path is gone (or never was a worktree) —
+                # the DB row is the stale side. Prune the ROW so the
+                # scheduler rebuilds cleanly from the task's base commit;
+                # prune git's stale metadata too.
+                await manager.remove(ctx["path"], force=True)
+                await repo.set_worktree_state(self.db, ctx["worktree_id"], WorktreeState.PRUNED)
+                report.pruned_worktrees.append(ctx["path"])
+                log.warning(
+                    "worktree row %s points at missing path %s — pruned",
+                    ctx["worktree_id"],
+                    ctx["path"],
+                )
+                continue
             try:
                 await manager.remove(ctx["path"], force=True)
                 await repo.set_worktree_state(self.db, ctx["worktree_id"], WorktreeState.PRUNED)
@@ -137,6 +163,40 @@ class RecoveryService:
                 )
                 report.quarantined_worktrees.append(ctx["path"])
                 log.exception("could not prune worktree %s", ctx["path"])
+
+    async def _reconcile_run_branches(self, report: RecoveryReport) -> None:
+        """§8.7 step 4: verify git state matches the DB. A non-terminal run
+        whose branch is missing from git gets it recreated from ``main``
+        (the baseline anchor) so pumping can resume; every action is logged
+        and lands in the recovery report."""
+        terminal = [s.value for s in TERMINAL_RUN_STATUSES]
+        rows = await self.db.fetchall(
+            f"""
+            SELECT r.id AS run_id, r.branch, p.repo_path
+            FROM runs r
+            JOIN projects p ON r.project_id = p.id
+            WHERE r.status NOT IN ({','.join('?' for _ in terminal)})
+            """,
+            tuple(terminal),
+        )
+        for row in rows:
+            branch_ops = BranchOps(Path(row["repo_path"]))
+            if await branch_ops.run_branch_tip(row["branch"]) is not None:
+                continue
+            base = "HEAD"
+            for ref in ("main", "origin/main"):
+                sha = await branch_ops.resolve_ref(ref)
+                if sha is not None:
+                    base = sha
+                    break
+            tip = await branch_ops.ensure_run_branch(row["branch"], base_commit=base)
+            log.warning(
+                "run %s: branch %s missing from git — recreated at %s",
+                row["run_id"],
+                row["branch"],
+                tip,
+            )
+            report.recreated_branches.append(row["branch"])
 
     async def _verify_no_live_worktrees_on_terminal_runs(self) -> None:
         """Sanity probe: no *active* worktree row may belong to a terminal run.

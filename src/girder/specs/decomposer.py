@@ -5,10 +5,14 @@ Runs exactly once per run, right after the spec freezes. Validation happened in
 persistence and then materializes one :class:`~girder.db.models.Task` per
 ``TaskSpec``, in declared order, each carrying the slice of the frozen spec that
 will later be mounted into its agent's prompt.
+
+Wave-0 placement is provisional: tasks all land in wave 0 here, and the
+Sprint 5 wave planner later redistributes them into dependency waves.
 """
 
 from __future__ import annotations
 
+import json
 import re
 
 from girder.db import repo
@@ -94,24 +98,44 @@ async def decompose_spec(db: Database, run: Run, spec: SpecDocument) -> list[Tas
 
     wave0 = await repo.get_or_create_wave0(db, run.id)
     tasks: list[Task] = []
+    spec_id_to_db_id: dict[str, str] = {}
     for seq, task_spec in enumerate(spec.tasks, start=1):
-        tasks.append(
-            await repo.create_task(
-                db,
-                wave0.id,
-                seq,
-                task_spec.title,
-                TaskType(task_spec.type),
-                scope_globs=list(task_spec.scope_globs),
-                spec_slice_md=_extract_slice(spec.raw, task_spec),
-                depends_on=list(task_spec.depends_on),
-            )
+        task = await repo.create_task(
+            db,
+            wave0.id,
+            seq,
+            task_spec.title,
+            TaskType(task_spec.type),
+            scope_globs=list(task_spec.scope_globs),
+            spec_slice_md=_extract_slice(spec.raw, task_spec),
         )
+        tasks.append(task)
+        spec_id_to_db_id[task_spec.id] = task.id
+
+    # Translate spec-level depends_on ids into persisted task ids.
+    edges = 0
+    for task, task_spec in zip(tasks, spec.tasks, strict=True):
+        resolved: list[str] = []
+        for dep_id in task_spec.depends_on:
+            db_id = spec_id_to_db_id.get(dep_id)
+            if db_id is None:
+                raise DecompositionError(
+                    f"task {task_spec.id!r} depends on unknown task id {dep_id!r}"
+                )
+            resolved.append(db_id)
+        edges += len(resolved)
+        if resolved:
+            await repo.update_task_fields(db, task.id, depends_on_json=json.dumps(resolved))
+            task.depends_on = resolved  # keep returned objects in sync with the DB
 
     await repo.insert_event(
         db,
         "spec_decomposed",
-        {"task_count": len(tasks), "task_ids": [t.id for t in spec.tasks]},
+        {
+            "task_count": len(tasks),
+            "task_ids": [t.id for t in spec.tasks],
+            "depends_on_edges": edges,
+        },
         run_id=run.id,
     )
     return tasks

@@ -1,21 +1,39 @@
-"""In-process OpenSpec structural validation (impl-plan §6.9, R7).
+"""OpenSpec validation (impl-plan §6.9, R7).
 
-Malformed proposals are rejected here, before the user ever reviews them
-(plan.md Phase 1 task 2). The optional ``openspec`` CLI shell-out lives in
-Settings.specs and is a future concern; this module is authoritative.
+In-process structural validation is always authoritative for parsing; the
+optional ``openspec`` CLI shell-out (``Settings.specs.cli``) runs *after* it
+and, when enabled and the binary is present, is authoritative for the final
+verdict:
+
+* ``cli=False`` (default) — in-process validation only, exactly as before.
+* ``cli=True``, binary present, exit 0 — accepted.
+* ``cli=True``, binary present, non-zero exit / timeout — rejected; CLI stderr
+  is aggregated into the :class:`SpecValidationError` error list.
+* ``cli=True``, binary absent — warning logged, in-process verdict stands
+  ("optional shell-out *when present*").
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import logging
 import re
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import yaml
 
 from girder.db.models import TaskType
 from girder.guard.scope import glob_to_regex
 
+log = logging.getLogger(__name__)
+
 SPEC_SCHEMA = "girder.openspec/v1"
+
+#: Wall-clock cap for the optional `openspec` CLI shell-out (§6.9).
+CLI_TIMEOUT_S = 10.0
 
 _TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
@@ -140,9 +158,62 @@ def _detect_cycle(dep: dict[str, list[str]], errors: list[str]) -> None:
             return
 
 
-def parse_spec(text: str) -> SpecDocument:
+async def _run_openspec_cli(cli_bin: str, text: str) -> tuple[int | None, list[str]]:
+    """Run ``<cli_bin> validate --json <file>`` on the serialized proposal.
+
+    Returns ``(returncode, stderr_lines)``; ``returncode is None`` means the
+    binary was not found on PATH. A timeout is treated as a non-zero exit.
+    """
+    fd = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+    try:
+        fd.write(text)
+        fd.close()
+        proc = await asyncio.create_subprocess_exec(
+            cli_bin,
+            "validate",
+            "--json",
+            fd.name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), CLI_TIMEOUT_S)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 1, [f"openspec CLI timed out after {CLI_TIMEOUT_S:g}s"]
+        lines = [ln for ln in stderr.decode(errors="replace").splitlines() if ln.strip()]
+        return proc.returncode, lines
+    except FileNotFoundError:
+        return None, []
+    finally:
+        await asyncio.to_thread(Path(fd.name).unlink, missing_ok=True)
+
+
+def _cli_validate(cli_bin: str, text: str) -> tuple[int | None, list[str]]:
+    """Sync bridge for :func:`_run_openspec_cli` (safe inside a running loop)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_run_openspec_cli(cli_bin, text))
+    # Already inside an event loop (e.g. FastAPI route): the CLI call is
+    # blocking-by-contract, so run it in a worker thread with its own loop.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, _run_openspec_cli(cli_bin, text)).result()
+
+
+def parse_spec(
+    text: str,
+    *,
+    cli: bool = False,
+    cli_bin: str = "openspec",
+) -> SpecDocument:
     """Parse + validate. Collects ALL violations into one SpecValidationError
     (fail-with-everything, not fail-first, so the review UI can show them all).
+
+    With ``cli=True`` (``Settings.specs.cli``), the in-process check runs first
+    (cheap, no subprocess); if it passes, the ``openspec`` CLI is invoked and
+    its verdict wins — see the module docstring for the semantics.
     """
     errors: list[str] = []
     data = _split_frontmatter(text, errors)
@@ -244,6 +315,19 @@ def parse_spec(text: str) -> SpecDocument:
 
     if errors:
         raise SpecValidationError(errors)
+
+    if cli:
+        returncode, cli_errors = _cli_validate(cli_bin, text)
+        if returncode is None:
+            log.warning(
+                "openspec CLI %r not found on PATH; falling back to in-process "
+                "validation only (set specs.cli = false to silence)",
+                cli_bin,
+            )
+        elif returncode != 0:
+            raise SpecValidationError(
+                cli_errors or [f"openspec CLI exited {returncode} without diagnostics"]
+            )
 
     close = text.split("\n").index("---", 1)
     body = "\n".join(text.split("\n")[close + 1 :]).lstrip("\n")

@@ -85,6 +85,37 @@ class WorktreeManager:
             created_at=utcnow_iso(),
         )
 
+    async def create_detached(self, run_id: str, label: str, commit: str) -> Path:
+        """Detached worktree at ``<base>/<run_id>/<label>`` checked out at ``commit``.
+
+        Raises FileExistsError if the path already exists; RuntimeError if git
+        fails. Label is caller-chosen (e.g. ``"verify-w0"`` or
+        ``"resolve-<task8>-1"``) and must not contain ``/`` or whitespace.
+        """
+        if "/" in label or any(ch.isspace() for ch in label):
+            raise ValueError(f"invalid worktree label: {label!r}")
+        path = self.base / run_id / label
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raise FileExistsError(f"worktree path already exists: {path}")
+        try:
+            await run_host_cmd(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo_path),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(path),
+                    commit,
+                ],
+                timeout_s=60,
+            )
+        except CommandError as exc:
+            raise RuntimeError(f"worktree add failed: {exc}") from exc
+        return path
+
     async def remove(self, path: Path | str, *, force: bool = True) -> None:
         """``git worktree remove`` (+ prune of stale metadata)."""
         args = ["git", "-C", str(self.repo_path), "worktree", "remove"]

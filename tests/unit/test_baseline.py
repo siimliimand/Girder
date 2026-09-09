@@ -123,6 +123,20 @@ def make_runner(db: Database, sandbox: FakeSandbox) -> BaselineRunner:
     )
 
 
+def test_suite_cmd_defaults_to_configured_python_bin(db: Database) -> None:
+    from girder.config import SandboxNetwork
+
+    settings = Settings(sandbox=SandboxNetwork(python_bin="mypython3"))
+    runner = BaselineRunner(
+        db=db,
+        sandbox=FakeSandbox([]),  # type: ignore[arg-type]
+        settings=settings,
+        redactor=Redactor(),
+    )
+    assert runner.suite_cmd[0] == "mypython3"
+    assert "pytest" in runner.suite_cmd
+
+
 def _init_git_repo(repo_dir: Path) -> str:
     """Sync helper — heavy blocking git setup, run via asyncio.to_thread."""
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True)

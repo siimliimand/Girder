@@ -11,7 +11,9 @@ Two hard constraints shape every implementation:
 
 ``run_command`` gets its own screening layer on top of the scope gate: the
 command string is matched against a network/escalation denylist before it is
-handed to ``sh -c`` inside the (network=none) container.
+handed to ``sh -c`` inside the (network=none) container. The scope gate itself
+now also applies the §6.6 R2 write policy to the command's path arguments
+(redirect operands, ``tee`` targets) — see ``guard.scope.run_command_path_args``.
 """
 
 from __future__ import annotations
@@ -265,14 +267,24 @@ class ToolRegistry:
         # 2. Terminal tools never touch the sandbox.
         if name in _TERMINAL_TOOLS:
             text = await self._finalize(
-                name, input_json, f"{name} recorded", True, started
+                name, input_json, f"{name} recorded", True, started, verdict=verdict
             )
             return ToolExecResult(ok=True, output=text)
 
         try:
             ok, raw = await self._dispatch(name, args)
         except CommandDenied as exc:
-            text = await self._finalize(name, input_json, str(exc), False, started, held=True)
+            # Denylisted commands are held like scope violations — the verdict
+            # column must agree with scope_violation=1/held=1.
+            text = await self._finalize(
+                name,
+                input_json,
+                str(exc),
+                False,
+                started,
+                held=True,
+                verdict=Verdict.VIOLATION,
+            )
             await repo.insert_integrity_violation(
                 self.db,
                 self.run_id,
@@ -284,7 +296,7 @@ class ToolRegistry:
             return ToolExecResult(ok=False, output=text, held=True, scope_violation=True)
         except Exception as exc:
             ok, raw = False, f"error: {type(exc).__name__}: {exc}"
-        text = await self._finalize(name, input_json, raw, ok, started)
+        text = await self._finalize(name, input_json, raw, ok, started, verdict=verdict)
         return ToolExecResult(ok=ok, output=text)
 
     # ------------------------------------------------------------- dispatch
@@ -390,8 +402,14 @@ class ToolRegistry:
         started: float,
         *,
         held: bool = False,
+        verdict: Verdict,
     ) -> str:
-        """Truncate -> redact -> persist; returns the conversation-safe text."""
+        """Truncate -> redact -> persist; returns the conversation-safe text.
+
+        The ScopeGuard ``verdict`` is persisted verbatim (migration 011) so
+        ALLOW_LOGGED stays distinguishable from ALLOW in the audit trail
+        (impl-plan §6.6 R2).
+        """
         duration_ms = int((time.monotonic() - started) * 1000)
         text = await redact_and_log(
             self.redactor,
@@ -409,6 +427,7 @@ class ToolRegistry:
             duration_ms=duration_ms,
             scope_violation=held,
             held=held,
+            verdict=verdict.value,
         )
         return text
 
@@ -437,6 +456,7 @@ class ToolRegistry:
             duration_ms=0,
             scope_violation=True,
             held=True,
+            verdict=Verdict.VIOLATION.value,
         )
         await repo.insert_integrity_violation(
             self.db,

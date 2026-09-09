@@ -49,6 +49,9 @@ _RUN_EDGES: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.FAILED,
             RunStatus.ABORTED,
             RunStatus.BUDGET_EXHAUSTED,
+            # Phase 4: an unresolvable wave-integration conflict drops the
+            # task and escalates to the user regardless of autonomy tier.
+            RunStatus.ESCALATED,
         }
     ),
     RunStatus.AWAITING_AMENDMENT: frozenset(
@@ -131,7 +134,11 @@ _TASK_EDGES: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.FORCE_PASSED,
         }
     ),
-    TaskStatus.VERIFY_PASSED: frozenset({TaskStatus.COMPLETED, TaskStatus.RETRY_SCHEDULED}),
+    # verify_passed gains → dropped (Phase 4): a wave task verified green but
+    # unresolvable at integration (conflict/semantic) is dropped from the wave.
+    TaskStatus.VERIFY_PASSED: frozenset(
+        {TaskStatus.COMPLETED, TaskStatus.RETRY_SCHEDULED, TaskStatus.DROPPED}
+    ),
     TaskStatus.RETRY_SCHEDULED: frozenset(
         {
             TaskStatus.RUNNING,

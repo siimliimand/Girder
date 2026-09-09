@@ -29,6 +29,12 @@ async def _git(cwd: Path, *args: str) -> None:
     await run_host_cmd(["git", "-C", str(cwd), *args], timeout_s=30)
 
 
+async def _git_out(cwd: Path, *args: str) -> str:
+    proc = await run_host_cmd(["git", "-C", str(cwd), *args], timeout_s=30)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
 @pytest.fixture
 async def crashed_state(db: Database, tmp_path: Path):  # type: ignore[no-untyped-def]
     """A full project→run→task→attempt chain frozen mid-attempt, plus the
@@ -41,6 +47,7 @@ async def crashed_state(db: Database, tmp_path: Path):  # type: ignore[no-untype
     (repo_dir / "app.py").write_text("v1\n")
     await _git(repo_dir, "add", "-A")
     await _git(repo_dir, "commit", "-m", "init")
+    await _git(repo_dir, "branch", "run/rec1")  # the run branch, like baseline does
 
     project = await repo.create_project(db, "rec-test", str(repo_dir))
     run = await repo.create_run(db, project.id, "intent", "run/rec1", 5.0)
@@ -138,3 +145,45 @@ async def test_recovery_notifies_with_redacted_summary(
     level, title, _ = sent[0]
     assert level == "warning"
     assert "restarted" in title
+
+
+async def test_recovery_recreates_deleted_run_branch(crashed_state) -> None:
+    """§8.7 step 4: a non-terminal run whose branch is missing from git gets
+    it recreated from main, and the action lands in the report."""
+    db: Database = crashed_state["db"]
+    repo_dir: Path = crashed_state["repo_dir"]
+    await _git(repo_dir, "branch", "-D", "run/rec1")
+    probe = await run_host_cmd(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", "-q", "run/rec1"],
+        check=False,
+        timeout_s=30,
+    )
+    assert probe.returncode != 0
+
+    service = RecoveryService(db, Settings())
+    report = await service.recover()
+
+    assert report.recreated_branches == ["run/rec1"]
+    main_tip = await _git_out(repo_dir, "rev-parse", "main")
+    assert await _git_out(repo_dir, "rev-parse", "run/rec1") == main_tip
+
+
+async def test_recovery_prunes_worktree_row_with_missing_path(crashed_state) -> None:
+    """§8.7 step 4: a worktree row whose path vanished is pruned (the DB row
+    is the stale side) so the scheduler rebuilds cleanly from base_commit."""
+    import shutil
+
+    db: Database = crashed_state["db"]
+    shutil.rmtree(crashed_state["worktree"])
+    assert not crashed_state["worktree"].exists()
+
+    service = RecoveryService(db, Settings())
+    report = await service.recover()
+
+    assert report.pruned_worktrees == [str(crashed_state["worktree"])]
+    wts = await repo.list_worktrees(db)
+    assert len(wts) == 1 and wts[0].state.value == "pruned"
+    # the task was rescheduled and can be rebuilt from its base commit
+    fresh_task = await repo.get_task(db, crashed_state["task"].id)
+    assert fresh_task is not None
+    assert fresh_task.status == TaskStatus.RETRY_SCHEDULED

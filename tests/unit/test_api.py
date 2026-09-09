@@ -246,6 +246,51 @@ async def test_edit_valid_doc_updates_proposal(tmp_path: Path) -> None:
         assert "Renamed title" in page.text
 
 
+async def test_edit_frozen_run_refused(tmp_path: Path) -> None:
+    fake = _FakeGenerator()
+    app = make_app(tmp_path, fake)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        pid = await make_project(client, tmp_path)
+        rid = await make_run(client, pid)
+        await drain(app)
+        # freeze the run via raw SQL (test-only fsm bypass)
+        db: Database = app.state.db
+        await db.execute(
+            "UPDATE runs SET spec_hash = 'deadbeef' WHERE id = ?", (rid,)
+        )
+        await db.conn.commit()
+        before = await repo.get_run(db, rid)
+        assert before is not None
+        original_proposal = before.proposal_md
+
+        resp = await client.post(f"/api/runs/{rid}/edit", data={"proposal": GOLDEN})
+        assert resp.status_code == 409
+        assert "frozen" in resp.text
+        after = await repo.get_run(db, rid)
+        assert after is not None
+        assert after.proposal_md == original_proposal
+
+
+async def test_edit_unfrozen_run_still_works(tmp_path: Path) -> None:
+    fake = _FakeGenerator()
+    app = make_app(tmp_path, fake)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        pid = await make_project(client, tmp_path)
+        rid = await make_run(client, pid)
+        await drain(app)
+        db: Database = app.state.db
+        run = await repo.get_run(db, rid)
+        assert run is not None
+        assert run.spec_hash is None  # unfrozen
+
+        modified = GOLDEN.replace("Add user authentication", "Edited while open")
+        resp = await client.post(f"/api/runs/{rid}/edit", data={"proposal": modified})
+        assert resp.status_code == 303
+        after = await repo.get_run(db, rid)
+        assert after is not None
+        assert after.proposal_md == modified
+
+
 async def test_spend_endpoint(tmp_path: Path) -> None:
     fake = _FakeGenerator()
     app = make_app(tmp_path, fake)

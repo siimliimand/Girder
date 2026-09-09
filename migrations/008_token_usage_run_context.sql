@@ -2,6 +2,13 @@
 -- Spec generation and plan estimation make model calls before any attempt
 -- exists, so attempt_id becomes nullable and every usage row carries a
 -- run_id. SQLite cannot drop a NOT NULL constraint in place, so rebuild.
+--
+-- Re-runnable (§4.1 crash safety): the runner autocommits each statement, so a
+-- crash mid-script can leave a leftover token_usage_new. Dropping it first
+-- makes a retry start from a clean slate; if the crash landed between the DROP
+-- of the old table and the RENAME, the final RENAME below still completes the
+-- swap because token_usage_new already holds the rebuilt data.
+DROP TABLE IF EXISTS token_usage_new;
 CREATE TABLE token_usage_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   attempt_id TEXT REFERENCES attempts(id),

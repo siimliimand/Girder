@@ -11,28 +11,38 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from girder import __version__
 from girder.api.app import create_app
 from girder.budget.guard import BudgetGuard
-from girder.config import Secrets, Settings, load_secrets, load_settings
+from girder.config import (
+    Secrets,
+    SecretsPermissionError,
+    Settings,
+    load_secrets,
+    load_settings,
+)
 from girder.db import repo
 from girder.db.engine import Database, default_migrations_dir
-from girder.db.models import Run
+from girder.db.models import Run, RunStatus
 from girder.github.client import GitHubClient
 from girder.gitops.worktree import DEFAULT_BASE
 from girder.guard.redact import Redactor
 from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
+from girder.notify.telegram_inbound import TelegramReceiver
 from girder.orchestrator.gc import WorktreeGC
 from girder.orchestrator.recovery import RecoveryService
 from girder.orchestrator.run_engine import _PUMPABLE_RUN_STATUSES, RunEngine
 from girder.sandbox.engine import SandboxEngine
 from girder.sandbox.local import LocalExecSandbox
 from girder.sandbox.podman import PodmanEngine
+from girder.specs.amendment import AmendmentError, resolve_amendment
 
 log = logging.getLogger("girder")
 
@@ -108,8 +118,26 @@ async def cmd_web(args: argparse.Namespace) -> int:
     return 0
 
 
+class LocalSandboxRefused(RuntimeError):
+    """``--sandbox local`` was requested without an explicit dev opt-in."""
+
+
+def _local_sandbox_allowed(args: argparse.Namespace) -> bool:
+    """Local sandbox runs attempts directly on the host with zero isolation
+    ("NOT A SECURITY BOUNDARY") — allowed only with an explicit ``--dev`` flag
+    or ``GIRDER_DEV=1`` in the environment."""
+    return bool(getattr(args, "dev", False)) or os.environ.get("GIRDER_DEV") == "1"
+
+
 def _build_sandbox(args: argparse.Namespace, settings: Settings) -> SandboxEngine:
     if args.sandbox == "local":
+        if not _local_sandbox_allowed(args):
+            raise LocalSandboxRefused(
+                "--sandbox local executes attempts directly on the host with no"
+                " isolation (documented NOT A SECURITY BOUNDARY). Refusing to run"
+                " it in a daemon/production context: pass --dev (or set"
+                " GIRDER_DEV=1) to confirm you are in a development environment."
+            )
         return LocalExecSandbox()
     return PodmanEngine(settings.sandbox.runtime)
 
@@ -139,6 +167,49 @@ async def _pumpable_runs(db: Database) -> list[Run]:
             if run.status in _PUMPABLE_RUN_STATUSES:
                 runs.append(run)
     return runs
+
+
+def _due_run_ids(run_ids: list[str], active: dict[str, asyncio.Task[None]]) -> list[str]:
+    """Pure scheduling step (issue 23): runs to spawn this cycle — every
+    pumpable run that does not already have a pump task in flight. A run whose
+    pump is still running is skipped, which preserves the per-run ordering
+    guarantee the sequential loop had."""
+    return [rid for rid in run_ids if rid not in active]
+
+
+async def pump_runs_concurrently(
+    run_ids: list[str],
+    pump: Callable[[str], Awaitable[object]],
+    active: dict[str, asyncio.Task[None]],
+    *,
+    logger: logging.Logger = log,
+) -> None:
+    """Spawn one task per due run, gather with exception isolation.
+
+    One crashing (or long-running) pump never blocks or kills the others; the
+    *active* registry is the caller-owned per-run task table, trimmed of
+    finished tasks each cycle.
+    """
+    for run_id in _due_run_ids(run_ids, active):
+        active[run_id] = asyncio.create_task(_pump_one(run_id, pump, logger=logger))
+    finished = [rid for rid, task in active.items() if task.done()]
+    for rid in finished:
+        active.pop(rid)
+
+
+async def _pump_one(
+    run_id: str,
+    pump: Callable[[str], Awaitable[object]],
+    *,
+    logger: logging.Logger,
+) -> None:
+    try:
+        descriptor = await pump(run_id)
+        logger.info("pump run %s -> %s", run_id, descriptor)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # never let one run kill the loop
+        logger.exception("pump failed for run %s", run_id)
 
 
 async def cmd_daemon(args: argparse.Namespace) -> int:
@@ -174,27 +245,72 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
             redactor=redactor,
             github=_build_github(settings, secrets, db, redactor),
         )
+        telegram_task: asyncio.Task[None] | None = _start_telegram_receiver(
+            args, settings, secrets, db
+        )
         poll_s = 5.0
+        active_pumps: dict[str, asyncio.Task[None]] = {}
         while not stop.is_set():
-            for run in await _pumpable_runs(db):
-                try:
-                    descriptor = await engine.pump_once(run.id)
-                    log.info("pump run %s -> %s", run.id, descriptor)
-                except Exception:  # never let one run kill the loop
-                    log.exception("pump failed for run %s", run.id)
+            run_ids = [run.id for run in await _pumpable_runs(db)]
+            # issue 23: pump runs concurrently — one run's long attempt no
+            # longer blocks steering/pump processing of every other run.
+            await pump_runs_concurrently(
+                run_ids, engine.pump_once, active_pumps, logger=log
+            )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=poll_s)
             except TimeoutError:
                 pass
-        gc_task.cancel()
-        try:
-            await gc_task
-        except asyncio.CancelledError:
-            pass
+        for task in (*active_pumps.values(), telegram_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(gc_task, *active_pumps.values(), return_exceptions=True)
+        if telegram_task is not None:
+            await asyncio.gather(telegram_task, return_exceptions=True)
     finally:
         await db.close()
     log.info("daemon stopped cleanly")
     return 0
+
+
+def _start_telegram_receiver(
+    args: argparse.Namespace, settings: Settings, secrets: Secrets, db: Database
+) -> asyncio.Task[None] | None:
+    """Start the §8.4 Telegram inbound poller when configured; never fatal."""
+    if "telegram" not in settings.notify.channels:
+        return None
+    if not secrets.notify_telegram_bot_token:
+        log.warning("telegram channel configured but no bot token — inbound disabled")
+        return None
+    notifier = _build_notifier(settings, db)
+
+    async def resolver(amendment_id: str, decision: str, guidance: str | None) -> str:
+        amendment = await repo.get_spec_amendment(db, amendment_id)
+        if amendment is None:
+            raise AmendmentError(f"amendment {amendment_id} not found")
+        run = await repo.get_run(db, amendment.run_id)
+        if run is None:
+            raise AmendmentError(f"run {amendment.run_id} not found")
+        project = await repo.get_project(db, run.project_id)
+        if project is None:
+            raise AmendmentError(f"project {run.project_id} not found")
+        outcome = await resolve_amendment(
+            db,
+            project=project,
+            run=run,
+            amendment=amendment,
+            decision=decision,
+            guidance=guidance,
+            notifier=notifier,
+        )
+        return (
+            f"amendment resolved: {outcome.decision}"
+            f" (run {run.id} -> {outcome.run_status}, task -> {outcome.task_status})"
+        )
+
+    receiver = TelegramReceiver(db, settings.notify, secrets, notifier, resolver)
+    log.info("telegram amendment inbound enabled (chat %s)", settings.notify.telegram_chat_id)
+    return asyncio.create_task(receiver.run())
 
 
 async def cmd_pump(args: argparse.Namespace) -> int:
@@ -231,6 +347,33 @@ async def cmd_pump(args: argparse.Namespace) -> int:
         await db.close()
 
 
+async def review_run(db: Database, run_id: str) -> int:
+    """Record ``merge_reviewed`` for a merged run; 0 ok, 1 refused (plan.md §2.3
+    T1 rolling review window: unreviewed merges pause new merges)."""
+    run = await repo.get_run(db, run_id)
+    if run is None:
+        log.error("run %s not found", run_id)
+        return 1
+    if run.status is not RunStatus.MERGED:
+        log.error(
+            "run %s is %s, not merged — only merged runs can be marked reviewed",
+            run_id,
+            run.status,
+        )
+        return 1
+    await repo.insert_event(db, "merge_reviewed", {"reviewed_by": "cli"}, run_id=run.id)
+    print(f"run {run.id} marked merge_reviewed")
+    return 0
+
+
+async def cmd_review(args: argparse.Namespace) -> int:
+    db = await _open_db(args)
+    try:
+        return await review_run(db, args.run_id)
+    finally:
+        await db.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="girder", description=__doc__)
     parser.add_argument("--version", action="version", version=f"girder {__version__}")
@@ -254,7 +397,14 @@ def main(argv: list[str] | None = None) -> int:
         "--sandbox",
         default="podman",
         choices=["podman", "local"],
-        help="sandbox engine (local executes on the host — dev/tests only)",
+        help="sandbox engine (local executes on the host with no isolation;"
+        " requires --dev and is NOT a security boundary)",
+    )
+    daemon_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="confirm a development environment (required for --sandbox local,"
+        " alternatively set GIRDER_DEV=1)",
     )
     pump_parser = sub.add_parser(
         "pump", help="drive one run a single pump step (or to completion with --wait)"
@@ -267,7 +417,14 @@ def main(argv: list[str] | None = None) -> int:
         "--sandbox",
         default="podman",
         choices=["podman", "local"],
-        help="sandbox engine (local executes on the host — dev/tests only)",
+        help="sandbox engine (local executes on the host with no isolation;"
+        " requires --dev and is NOT a security boundary)",
+    )
+    pump_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="confirm a development environment (required for --sandbox local,"
+        " alternatively set GIRDER_DEV=1)",
     )
     web_parser = sub.add_parser("web", help="serve the approval web console (impl-plan §10)")
     web_parser.add_argument(
@@ -276,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
     web_parser.add_argument(
         "--port", type=int, default=None, help="bind port (default: settings.web.port)"
     )
+    review_parser = sub.add_parser(
+        "review", help="mark a merged run as human-reviewed (T1 review window, §2.3)"
+    )
+    review_parser.add_argument("run_id", help="merged run id to mark reviewed")
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -296,9 +457,16 @@ def main(argv: list[str] | None = None) -> int:
         "daemon": cmd_daemon,
         "pump": cmd_pump,
         "web": cmd_web,
+        "review": cmd_review,
     }
     try:
         return asyncio.run(handlers[args.command](args))
+    except LocalSandboxRefused as exc:
+        log.error("%s", exc)
+        return 2
+    except SecretsPermissionError as exc:
+        log.error("%s", exc)
+        return 2
     except KeyboardInterrupt:  # pragma: no cover - interactive convenience
         return 130
 

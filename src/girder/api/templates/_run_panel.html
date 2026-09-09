@@ -34,6 +34,26 @@ attribute disappears.
 
   {% if run.proposal_md %}
     <h2>Proposal</h2>
+    {% if proposal_tasks %}
+      <h3>File impact</h3>
+      <table>
+        <thead><tr><th>Task</th><th>Title</th><th>Type</th><th>Scope (write globs)</th>
+            <th>Success criteria</th></tr></thead>
+        <tbody>
+        {% for t in proposal_tasks %}
+          <tr>
+            <td><code>{{ t.id }}</code></td>
+            <td>{{ t.title }}</td>
+            <td><span class="badge">{{ t.type }}</span></td>
+            <td>{% for g in t.scope_globs %}<code>{{ g }}</code> {% endfor %}</td>
+            <td>{{ t.criteria }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="muted">Estimated cost of next generation call:
+        <strong>{{ estimate_next_generation|default('n/a') }}</strong></p>
+    {% endif %}
     <pre>{{ run.proposal_md }}</pre>
   {% elif poll %}
     <p class="muted">Generating proposal…</p>

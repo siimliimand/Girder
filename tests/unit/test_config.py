@@ -9,6 +9,7 @@ from girder.config import (
     DEFAULT_SECRETS_PATH,
     ModelsConfig,
     Secrets,
+    SecretsPermissionError,
     load_secrets,
     load_settings,
 )
@@ -118,36 +119,63 @@ def test_load_secrets_flat_and_table_forms(tmp_path: Path) -> None:
         "[github]\ntoken = 'ghp_table'\n"
         '[notify]\ntelegram_bot_token = "tg-xyz"\n'
     )
+    f.chmod(0o600)  # impl-plan §3.2: permissive files are refused
     secrets = load_secrets(f)
     assert secrets.github_token == "ghp_flat"  # flat wins over table form
     assert secrets.notify_telegram_bot_token == "tg-xyz"
     assert DEFAULT_SECRETS_PATH.name == "secrets.toml"
 
 
-def test_load_secrets_0600_no_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_load_secrets_0600_loads_cleanly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     f = tmp_path / "secrets.toml"
     f.write_text('github_token = "ghp_x"\n')
     f.chmod(0o600)
     with caplog.at_level(logging.WARNING, logger="girder.config"):
         secrets = load_secrets(f)
     assert secrets.github_token == "ghp_x"
-    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def test_load_secrets_permissive_warns_but_loads(
+def test_empty_model_registry_warns_at_load(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # issue 16: an empty registry must not silently pass — warn that model
+    # calls will fail.
+    with caplog.at_level(logging.WARNING, logger="girder.config"):
+        settings = load_settings(start_dir=tmp_path)
+    assert settings.models.roles == []
+    messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("no model roles configured" in m for m in messages)
+
+
+def test_partial_registry_still_refused() -> None:
+    with pytest.raises(ValueError, match="tier3"):
+        ModelsConfig(
+            roles=[
+                {"role": "tier1", "provider": "x", "model": "a"},
+                {"role": "tier2", "provider": "x", "model": "b"},
+            ]
+        )
+
+
+def test_load_secrets_permissive_refused(tmp_path: Path) -> None:
+    # impl-plan §3.2 (issue 15): a group/world-accessible secrets file must be
+    # refused with a fix-it message, not loaded with a warning.
     f = tmp_path / "secrets.toml"
     f.write_text('github_token = "ghp_x"\n')
     f.chmod(0o644)
-    with caplog.at_level(logging.WARNING, logger="girder.config"):
-        secrets = load_secrets(f)
-    assert secrets.github_token == "ghp_x"  # warn, don't refuse
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert str(f) in warnings[0].getMessage()
-    assert "644" in warnings[0].getMessage()
-    assert "chmod 600" in warnings[0].getMessage()
+    with pytest.raises(SecretsPermissionError, match=r"chmod 600"):
+        load_secrets(f)
+
+
+def test_load_secrets_group_writable_refused(tmp_path: Path) -> None:
+    f = tmp_path / "secrets.toml"
+    f.write_text('github_token = "ghp_x"\n')
+    f.chmod(0o660)
+    with pytest.raises(SecretsPermissionError, match="660"):
+        load_secrets(f)
 
 
 def test_specs_and_web_defaults(tmp_path: Path) -> None:
@@ -170,6 +198,55 @@ def test_models_config_accepts_request_timeout_s() -> None:
 
     cfg = ModelsConfig(request_timeout_s=12.5)
     assert cfg.request_timeout_s == 12.5
+
+
+def test_budget_cap_must_be_positive(tmp_path: Path) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text("[budget]\nrun_cap_usd = 0\n")
+    with pytest.raises(ValueError, match=r"budget\.run_cap_usd"):
+        load_settings(config_path=cfg)
+    cfg.write_text("[budget]\nrun_cap_usd = -1.0\n")
+    with pytest.raises(ValueError, match=r"budget\.run_cap_usd"):
+        load_settings(config_path=cfg)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "attempt_wallclock_s",
+        "attempt_max_turns",
+        "task_max_attempts",
+        "ci_fix_attempts",
+        "conflict_resolution_attempts",
+        "tool_output_max_lines",
+        "tool_output_max_tokens",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_limits_must_be_positive(tmp_path: Path, key: str, value: int) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text(f"[limits]\n{key} = {value}\n")
+    with pytest.raises(ValueError, match=f"limits\\.{key}"):
+        load_settings(config_path=cfg)
+
+
+def test_test_directories_must_be_non_empty(tmp_path: Path) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text('[project]\ntest_directories = []\n')
+    with pytest.raises(ValueError, match=r"project\.test_directories"):
+        load_settings(config_path=cfg)
+
+
+def test_good_fixture_config_still_loads(tmp_path: Path) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text(
+        "[budget]\nrun_cap_usd = 9.5\n"
+        "[limits]\nattempt_max_turns = 5\n"
+        '[project]\ntest_directories = ["tests", "spec"]\n'
+    )
+    settings = load_settings(config_path=cfg)
+    assert settings.limits.attempt_max_turns == 5
+    assert settings.project.test_directories == ["tests", "spec"]
 
 
 def test_toml_roundtrips_specs_web_and_base_url(tmp_path: Path) -> None:

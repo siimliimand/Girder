@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,3 +32,31 @@ jobs:
           enable-cache: true
       - run: uv sync
       - run: uv run pytest -m integration
+
+  # Sandbox-image / CI toolchain parity audit (impl-plan §9.1, Sprint 4 WP 4.1).
+  # Builds the runner image from container/Dockerfile.python-3.12 with podman,
+  # dumps the CI runner's toolchain (container/ci-env-dump.sh), then fails on
+  # any python/pip/pytest divergence between image and CI
+  # (container/parity-check.sh -> girder.github.parity).
+  #
+  # Manual/dispatch-only on purpose: it builds a container image (a few minutes
+  # of pull + build on every push would dominate CI), and the pinned toolchain
+  # (python:3.12-slim, pytest==8.3.2) only changes when the Dockerfile changes.
+  # Run it via "Run workflow" whenever the Dockerfile or CI pins move; flip on
+  # a `schedule:` trigger if you want it nightly.
+  parity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install podman (image build + probe engine)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends podman
+      - name: Build runner image
+        run: podman build -t girder-runner:python-3.12 -f container/Dockerfile.python-3.12 container/
+      - name: CI env dump (host runner toolchain)
+        run: container/ci-env-dump.sh > ci-env-dump.txt
+      - name: Parity check (image vs CI dump; divergence = hard failure)
+        run: uv sync && container/parity-check.sh girder-runner:python-3.12 ci-env-dump.txt
