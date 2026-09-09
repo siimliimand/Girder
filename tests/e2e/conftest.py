@@ -1,0 +1,259 @@
+"""Shared fixtures for the end-to-end scenario suite (impl-plan §12).
+
+Everything here runs the REAL RunEngine/TaskEngine code paths against a real
+temp git repo (the copied ``tests/fixtures/e2e-target`` tree) with
+``LocalExecSandbox`` — baseline AND verify suites are REAL ``python -m pytest``
+runs on the host. The model is a scripted :class:`FakeGateway` (same idiom as
+``tests/unit/test_task_engine.py``); SC-07 swaps in a real ``ModelGateway``
+over an ``httpx.MockTransport``. No podman, no network.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from girder.config import (
+    LimitsConfig,
+    ProjectConfig,
+    SandboxNetwork,
+    Secrets,
+    Settings,
+)
+from girder.db import repo
+from girder.db.engine import Database
+from girder.db.models import Project, Run, RunStatus
+from girder.guard.redact import Redactor
+from girder.orchestrator.run_engine import RunEngine
+from girder.sandbox.engine import ExecResult
+from girder.sandbox.local import LocalExecSandbox
+from girder.specs.freeze import approve_and_freeze
+from girder.util import run_host_cmd
+from tests.conftest import seed_run_status
+
+FIXTURE_SRC = Path(__file__).resolve().parents[1] / "fixtures" / "e2e-target"
+PLANTED_SECRET = "girder-hunter2-do-not-echo"
+PLANTED_ENV_VAR = "GIRDER_PLANTED_SECRET"
+
+
+async def git(cwd: Path, *args: str, check: bool = True) -> str:
+    result = await run_host_cmd(["git", "-C", str(cwd), *args], check=check, timeout_s=30)
+    return result.stdout
+
+
+def _host_pytest_usable() -> bool:
+    """The sandbox execs ``python -m pytest`` from PATH — it must exist."""
+    if shutil.which("python") is None:
+        return False
+    probe = subprocess.run(
+        ["python", "-m", "pytest", "--version"], capture_output=True, text=True, timeout=60
+    )
+    return probe.returncode == 0
+
+
+
+
+class HostSuiteSandbox(LocalExecSandbox):
+    """LocalExecSandbox that also rewrites ``--flag=/workspace/...`` argv.
+
+    The orchestrator's suite commands pass the junit report as a single
+    ``--junitxml=/workspace/.girder-*.xml`` argv element, which the base
+    rewrite (exact ``/workspace`` prefix) leaves untouched — the nested real
+    pytest would then try to write the host root. This subclass maps the path
+    inside such flags to the worktree, so the REAL pytest suite runs and its
+    report lands in the worktree, exactly as in a container.
+    """
+
+    async def exec(
+        self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
+    ) -> ExecResult:
+        rewritten = list(cmd)
+        for i, arg in enumerate(rewritten):
+            if "=/workspace/" in arg:
+                flag, _, path = arg.partition("=")
+                target = self._rewrite("/" + path.removeprefix("/"), self._specs[name])
+                rewritten[i] = f"{flag}={target}"
+        return await super().exec(name, rewritten, timeout_s=timeout_s, user=user)
+
+
+@dataclass
+class FakeNotifier:
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    async def notify(
+        self, level: str, title: str, body: str, *, run_id: str | None = None
+    ) -> None:
+        self.calls.append((level, title, body))
+
+
+@dataclass
+class FakeGateway:
+    """Scripted per-call responses; records each complete() message list."""
+
+    responses: list[Any]
+    calls: list[list[Any]] = field(default_factory=list)
+
+    def role_config(self, role: str) -> Any:
+        return type("RoleCfg", (), {"context_window": 200_000, "max_output_tokens": 4096})()
+
+    async def complete(
+        self,
+        role: str,
+        messages: list[Any],
+        *,
+        run_id: str,
+        attempt_id: str | None = None,
+        tools: Any = None,
+        temperature: float | None = None,
+    ) -> Any:
+        self.calls.append(list(messages))
+        return self.responses.pop(0)
+
+
+def tc(id_: str, name: str, arguments_json: str) -> Any:
+    from girder.models.gateway import ModelToolCall
+
+    return ModelToolCall(id=id_, name=name, arguments_json=arguments_json)
+
+
+def resp(calls: list[Any] | None = None, content: str | None = None) -> Any:
+    from girder.models.gateway import ModelResponse, Usage
+
+    return ModelResponse(
+        content=content,
+        tool_calls=calls or [],
+        finish_reason="tool_calls" if calls else "stop",
+        usage=Usage(),
+        role="tier2",
+        model_id="fake",
+        provider="fake",
+    )
+
+
+def write_resp(tc_id: str, path: str, content: str) -> Any:
+    """One scripted model turn: a JSON-safe ``write_file`` tool call."""
+    return resp(calls=[tc(tc_id, "write_file", json.dumps({"path": path, "content": content}))])
+
+
+COMMIT_TURN = resp(calls=[tc("c", "run_command", '{"cmd":"git add -A && git commit -m work"}')])
+
+
+def write_commit_of(path: str, content: str, *, tc_id: str = "1") -> list[Any]:
+    """A scripted attempt: write ``path``, commit everything, declare done."""
+    return [
+        write_resp(tc_id, path, content),
+        resp(
+            calls=[tc(f"{tc_id}-c", "run_command", '{"cmd":"git add -A && git commit -m work"}')]
+        ),
+        resp(calls=[tc(f"{tc_id}-d", "mark_task_complete", '{"summary":"done"}')]),
+    ]
+
+
+@dataclass
+class E2eCtx:
+    db: Database
+    project: Project
+    run: Run
+    repo_path: Path
+    settings: Settings
+    redactor: Redactor
+    notifier: FakeNotifier
+
+    def engine(self, gateway: Any, sandbox: LocalExecSandbox | None = None) -> RunEngine:
+        return RunEngine(
+            db=self.db,
+            settings=self.settings,
+            secrets=Secrets(models_openrouter_api_key="sk-test-nonsecret"),
+            gateway=gateway,
+            sandbox=sandbox or HostSuiteSandbox(),
+            notifier=self.notifier,
+            redactor=self.redactor,
+            repo_path=self.repo_path,
+        )
+
+
+MakeCtx = Callable[..., Awaitable[E2eCtx]]
+
+
+@pytest.fixture
+def redactor() -> Redactor:
+    return Redactor(secret_env_names=[PLANTED_ENV_VAR])
+
+
+@pytest.fixture
+def settings() -> Settings:
+    return Settings(
+        project=ProjectConfig(test_directories=["tests"]),
+        limits=LimitsConfig(
+            task_max_attempts=2,
+            attempt_max_turns=8,
+            attempt_wallclock_s=120,
+        ),
+        sandbox=SandboxNetwork(),
+    )
+
+
+@pytest.fixture
+async def e2e_repo(tmp_path: Path) -> AsyncIterator[Path]:
+    """The fixture project copied to tmp and committed on a real main branch."""
+    if not _host_pytest_usable():
+        pytest.skip("host `python -m pytest` unavailable")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(FIXTURE_SRC, repo_path)
+    await git(repo_path, "init", "-b", "main")
+    await git(repo_path, "config", "user.email", "e2e@girder.local")
+    await git(repo_path, "config", "user.name", "girder-e2e")
+    await git(repo_path, "add", "-A")
+    await git(repo_path, "commit", "-m", "initial: calculator without divide")
+    yield repo_path
+
+
+@pytest.fixture
+async def make_ctx(
+    db: Database,
+    e2e_repo: Path,
+    settings: Settings,
+    redactor: Redactor,
+    tmp_path: Path,
+) -> AsyncIterator[MakeCtx]:
+    """Factory: freeze a proposal for a fresh run and return its pump context."""
+
+    async def _make(
+        proposal_text: str,
+        *,
+        budget_cap_usd: float = 5.0,
+        branch: str = "run/e2e1",
+    ) -> E2eCtx:
+        project = await repo.create_project(db, "e2e-target", str(e2e_repo))
+        run = await repo.create_run(db, project.id, "e2e intent", branch, budget_cap_usd)
+        await seed_run_status(db, run.id, RunStatus.SPEC_PENDING.value)
+        fresh = await repo.get_run(db, run.id)
+        assert fresh is not None
+        await approve_and_freeze(
+            db,
+            project=project,
+            run=fresh,
+            proposal_text=proposal_text,
+            repo_path=e2e_repo,
+            worktree_base=tmp_path / "freeze-wt",
+        )
+        fresh = await repo.get_run(db, run.id)
+        assert fresh is not None and fresh.status is RunStatus.SPEC_APPROVED
+        return E2eCtx(
+            db=db,
+            project=project,
+            run=fresh,
+            repo_path=e2e_repo,
+            settings=settings,
+            redactor=redactor,
+            notifier=FakeNotifier(),
+        )
+
+    yield _make

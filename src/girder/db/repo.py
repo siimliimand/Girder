@@ -9,6 +9,7 @@ atomic.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from aiosqlite import Row
@@ -444,6 +445,12 @@ async def create_worktree(db: Database, attempt_id: str, path: str, branch: str)
         id=new_id(), attempt_id=attempt_id, path=path, branch=branch, created_at=utcnow_iso()
     )
     async with db.tx() as conn:
+        # A task retry reuses the same per-task path; the previous (pruned or
+        # quarantined) row for it is superseded history — drop it so the
+        # UNIQUE(path) constraint doesn't block the new attempt's row.
+        await conn.execute(
+            "DELETE FROM worktrees WHERE path = ? AND state != 'active'", (path,)
+        )
         await conn.execute(
             "INSERT INTO worktrees (id, attempt_id, path, branch, state, created_at)"
             " VALUES (?, ?, ?, ?, 'active', ?)",
@@ -622,3 +629,277 @@ async def get_latest_event(
     if r is None:
         return None
     return {"payload": json.loads(r["payload_json"]), "ts": r["ts"]}
+
+
+# ------------------------------------------------- sprint 3 aggregate row types
+# NOTE: existing aggregates keep their dataclasses in girder.db.models; these
+# five live here because models.py is owned by another workstream this sprint.
+
+
+@dataclass
+class BaselineRun:
+    id: str
+    project_id: str
+    commit_sha: str
+    created_at: str
+    per_test_json: str = "{}"
+
+
+@dataclass
+class FlakyTest:
+    project_id: str
+    test_id: str
+    first_seen_run: str | None = None
+    last_seen_run: str | None = None
+    status: str = "known_flaky"
+
+
+@dataclass
+class SpecAmendment:
+    id: str
+    run_id: str
+    task_id: str | None
+    reason: str
+    suggested_change: str
+    status: str = "pending"
+    guidance: str | None = None
+    new_spec_hash: str | None = None
+    resolved_at: str | None = None
+
+
+# ---------------------------------------------------------------- baseline runs
+
+
+async def create_baseline_run(
+    db: Database, project_id: str, commit_sha: str, per_test_json: str
+) -> BaselineRun:
+    baseline = BaselineRun(
+        id=new_id(), project_id=project_id, commit_sha=commit_sha,
+        created_at=utcnow_iso(), per_test_json=per_test_json,
+    )
+    async with db.tx() as conn:
+        await conn.execute(
+            "INSERT INTO baseline_runs (id, project_id, commit_sha, created_at, per_test_json)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (baseline.id, project_id, commit_sha, baseline.created_at, per_test_json),
+        )
+    return baseline
+
+
+def _row_to_baseline_run(r: Row) -> BaselineRun:
+    return BaselineRun(
+        id=r["id"],
+        project_id=r["project_id"],
+        commit_sha=r["commit_sha"],
+        created_at=r["created_at"],
+        per_test_json=r["per_test_json"],
+    )
+
+
+async def get_baseline_run(db: Database, baseline_run_id: str) -> BaselineRun | None:
+    r = await db.fetchone("SELECT * FROM baseline_runs WHERE id = ?", (baseline_run_id,))
+    return _row_to_baseline_run(r) if r else None
+
+
+# ------------------------------------------------------------------ flaky tests
+
+
+async def upsert_flaky_test(
+    db: Database, project_id: str, test_id: str, *, run_id: str, status: str = "known_flaky"
+) -> None:
+    """Insert or refresh a flaky-test record; first_seen_run is preserved."""
+    async with db.tx() as conn:
+        await conn.execute(
+            "INSERT INTO flaky_tests (project_id, test_id, first_seen_run, last_seen_run, status)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT (project_id, test_id) DO UPDATE SET"
+            " last_seen_run = excluded.last_seen_run, status = excluded.status",
+            (project_id, test_id, run_id, run_id, status),
+        )
+
+
+async def list_flaky_tests(db: Database, project_id: str) -> list[FlakyTest]:
+    rows = await db.fetchall(
+        "SELECT * FROM flaky_tests WHERE project_id = ? ORDER BY test_id", (project_id,)
+    )
+    return [
+        FlakyTest(
+            project_id=r["project_id"],
+            test_id=r["test_id"],
+            first_seen_run=r["first_seen_run"],
+            last_seen_run=r["last_seen_run"],
+            status=r["status"],
+        )
+        for r in rows
+    ]
+
+
+# -------------------------------------------------------------- spec amendments
+
+
+async def create_spec_amendment(
+    db: Database, run_id: str, reason: str, suggested_change: str, *,
+    task_id: str | None = None,
+) -> SpecAmendment:
+    amendment = SpecAmendment(
+        id=new_id(), run_id=run_id, task_id=task_id, reason=reason,
+        suggested_change=suggested_change,
+    )
+    async with db.tx() as conn:
+        await conn.execute(
+            "INSERT INTO spec_amendments (id, run_id, task_id, reason, suggested_change, status)"
+            " VALUES (?, ?, ?, ?, ?, 'pending')",
+            (amendment.id, run_id, task_id, reason, suggested_change),
+        )
+    return amendment
+
+
+def _row_to_spec_amendment(r: Row) -> SpecAmendment:
+    return SpecAmendment(
+        id=r["id"],
+        run_id=r["run_id"],
+        task_id=r["task_id"],
+        reason=r["reason"],
+        suggested_change=r["suggested_change"],
+        status=r["status"],
+        guidance=r["guidance"],
+        new_spec_hash=r["new_spec_hash"],
+        resolved_at=r["resolved_at"],
+    )
+
+
+async def get_spec_amendment(db: Database, amendment_id: str) -> SpecAmendment | None:
+    r = await db.fetchone("SELECT * FROM spec_amendments WHERE id = ?", (amendment_id,))
+    return _row_to_spec_amendment(r) if r else None
+
+
+async def list_amendments_for_run(db: Database, run_id: str) -> list[SpecAmendment]:
+    rows = await db.fetchall(
+        "SELECT * FROM spec_amendments WHERE run_id = ? ORDER BY rowid", (run_id,)
+    )
+    return [_row_to_spec_amendment(r) for r in rows]
+
+
+async def get_pending_amendment(db: Database, run_id: str) -> SpecAmendment | None:
+    """Newest still-pending amendment for a run, if any."""
+    r = await db.fetchone(
+        "SELECT * FROM spec_amendments WHERE run_id = ? AND status = 'pending'"
+        " ORDER BY rowid DESC LIMIT 1",
+        (run_id,),
+    )
+    return _row_to_spec_amendment(r) if r else None
+
+
+_RESOLVED_AMENDMENT_STATUSES = frozenset({"approved", "rejected", "aborted"})
+
+
+async def resolve_spec_amendment(
+    db: Database,
+    amendment_id: str,
+    *,
+    status: str,
+    guidance: str | None = None,
+    new_spec_hash: str | None = None,
+) -> None:
+    """Resolve a pending amendment. spec_amendments.status is a plain CHECK
+    column (not fsm-guarded), so this is the sole writer of its terminal states."""
+    if status not in _RESOLVED_AMENDMENT_STATUSES:
+        raise ValueError(
+            f"amendment status must be one of {sorted(_RESOLVED_AMENDMENT_STATUSES)},"
+            f" got {status!r}"
+        )
+    async with db.tx() as conn:
+        await conn.execute(
+            "UPDATE spec_amendments SET status = ?, guidance = ?, new_spec_hash = ?,"
+            " resolved_at = ? WHERE id = ?",
+            (status, guidance, new_spec_hash, utcnow_iso(), amendment_id),
+        )
+
+
+# ------------------------------------------------------------------ tool calls
+
+
+async def insert_tool_call(
+    db: Database,
+    *,
+    attempt_id: str,
+    tool_name: str,
+    input_json: str,
+    output_redacted: str | None = None,
+    duration_ms: int | None = None,
+    scope_violation: bool = False,
+    held: bool = False,
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO tool_calls (attempt_id, ts, tool_name, input_json,"
+        " output_blob_redacted, duration_ms, scope_violation, held)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            attempt_id,
+            utcnow_iso(),
+            tool_name,
+            input_json,
+            output_redacted,
+            duration_ms,
+            int(scope_violation),
+            int(held),
+        ),
+    )
+    await db.conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+async def list_tool_calls_for_attempt(db: Database, attempt_id: str) -> list[dict[str, Any]]:
+    rows = await db.fetchall(
+        "SELECT id, attempt_id, ts, tool_name, input_json, output_blob_redacted,"
+        " duration_ms, scope_violation, held"
+        " FROM tool_calls WHERE attempt_id = ? ORDER BY id",
+        (attempt_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+# -------------------------------------------------------------- steering events
+
+
+async def insert_steering_event(
+    db: Database, run_id: str, kind: str, payload: dict[str, Any]
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO steering_events (run_id, kind, payload_json, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (run_id, kind, json.dumps(payload), utcnow_iso()),
+    )
+    await db.conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+async def consume_steering_events(
+    db: Database, run_id: str, *, kinds: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Return unconsumed events (oldest first, optional kind filter) and mark
+    them consumed in one transaction — each event is delivered exactly once."""
+    async with db.tx() as conn:
+        sql = "SELECT * FROM steering_events WHERE run_id = ? AND consumed_at IS NULL"
+        params: list[Any] = [run_id]
+        if kinds is not None:
+            sql += f" AND kind IN ({','.join('?' for _ in kinds)})"
+            params.extend(kinds)
+        sql += " ORDER BY id"
+        async with conn.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            await conn.execute(
+                "UPDATE steering_events SET consumed_at = ? WHERE id = ?",
+                (utcnow_iso(), r["id"]),
+            )
+    return [
+        {
+            "id": r["id"],
+            "run_id": r["run_id"],
+            "kind": r["kind"],
+            "payload": json.loads(r["payload_json"]),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]

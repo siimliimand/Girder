@@ -1,0 +1,130 @@
+"""Unit tests for context compaction (§8.5) and §7 prompt framing."""
+
+from __future__ import annotations
+
+import copy
+
+from girder.agent.context import (
+    CompactionStats,
+    compact,
+    estimate_tokens,
+    should_compact,
+)
+from girder.agent.prompts import build_system_prompt, build_task_message, wrap_tool_result
+from girder.db.models import Task, TaskStatus, TaskType
+from girder.models.gateway import Message
+
+
+def _task() -> Task:
+    return Task(
+        id="t1",
+        wave_id="w0",
+        seq=1,
+        title="add parser",
+        task_type=TaskType.CODE_CHANGE,
+        status=TaskStatus.PENDING,
+        scope_globs=["src/**"],
+    )
+
+
+# ----------------------------------------------------------------- estimation
+
+
+def test_estimate_tokens_is_chars_over_four() -> None:
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("abcd") == 1
+    assert estimate_tokens("a" * 401) == 100
+
+
+def test_should_compact_at_70pct() -> None:
+    window = 1000
+    under = [Message(role="system", content="a" * (4 * 700))]  # exactly 700 tokens
+    assert not should_compact(under, window)
+    over = [Message(role="system", content="a" * (4 * 701))]  # 701 tokens
+    assert should_compact(over, window)
+
+
+# ------------------------------------------------------------------ compaction
+
+
+def _conversation() -> list[Message]:
+    return [
+        Message(role="system", content="SYSTEM INVARIANTS"),
+        Message(role="user", content="TASK BRIEF"),
+        Message(
+            role="assistant",
+            content='[tool calls this turn: write_file({"path": "src/a.py"})]',
+        ),
+        Message(
+            role="user",
+            content=(
+                '<untrusted-data source="write_file:src/a.py">\nwrote ok\n'
+                "</untrusted-data>\n\n"
+                '<untrusted-data source="read_file:src/big.py">\n'
+                + ("X" * 500)
+                + "</untrusted-data>"
+            ),
+        ),
+        Message(role="assistant", content="[tool calls this turn: run_command({...})]"),
+        Message(
+            role="user",
+            content=(
+                '<untrusted-data source="run_command:python -m pytest -q">\n'
+                "error: 3 failed\n</untrusted-data>"
+            ),
+        ),
+    ]
+
+
+def test_compact_keeps_system_and_brief_elides_bodies() -> None:
+    msgs = _conversation()
+    original = copy.deepcopy(msgs)
+    out, _scratchpad = compact(msgs, context_window=1000)
+    # purity: the input list is unmutated
+    assert [m.content for m in msgs] == [m.content for m in original]
+    assert out[0].content == "SYSTEM INVARIANTS"
+    assert out[1].content == "TASK BRIEF"
+    joined = "\n".join(m.content for m in out[2:])
+    assert "X" * 500 not in joined
+    assert "[untrusted-data elided: 501 chars]" in joined  # body + newline
+    assert '<untrusted-data source="read_file:src/big.py">' in joined  # framing kept
+
+
+def test_compact_scratchpad_mentions_writes_commands_errors() -> None:
+    _, scratchpad = compact(_conversation(), context_window=1000)
+    assert "src/a.py" in scratchpad  # files written/patched
+    assert "python" in scratchpad  # commands run (tool + first arg)
+    assert "error: 3 failed" in scratchpad  # errors seen
+
+
+def test_compact_stats_populated() -> None:
+    msgs = _conversation()
+    stats = CompactionStats()
+    compact(msgs, context_window=1000, stats=stats)
+    assert stats.turns_dropped == 4
+    assert stats.tokens_before > stats.tokens_after
+    assert "elided" in stats.scratchpad or stats.scratchpad
+
+
+# -------------------------------------------------------------- §7 prompts
+
+
+def test_system_prompt_carries_invariants() -> None:
+    prompt = build_system_prompt(task=_task(), spec_slice="slice")
+    assert "UNTRUSTED CONTENT RULE" in prompt
+    assert "Test files are read-only" in prompt
+    assert "request_spec_amendment" in prompt
+
+
+def test_task_message_trust_labels_and_guidance() -> None:
+    msg = build_task_message(task=_task(), spec_slice="# frozen spec", guidance="focus on foo")
+    assert "[TRUSTED] Frozen specification slice:" in msg
+    assert "# frozen spec" in msg
+    assert "src/**" in msg
+    assert "[TRUSTED] Steering directive (user-authored):" in msg
+    assert "focus on foo" in msg
+
+
+def test_wrap_tool_result_shape() -> None:
+    wrapped = wrap_tool_result("read_file:src/a.py", "hello")
+    assert wrapped == '<untrusted-data source="read_file:src/a.py">\nhello\n</untrusted-data>'

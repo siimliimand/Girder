@@ -61,6 +61,29 @@ attribute disappears.
     </div>
   {% endif %}
 
+  {% if pending_amendment and run.status.value == "awaiting_amendment" %}
+    <h2>Pending spec amendment</h2>
+    <p><strong>Reason:</strong> {{ pending_amendment.reason }}</p>
+    <p><strong>Change:</strong> {{ pending_amendment.suggested_change }}</p>
+    <div class="actions">
+      <form method="post"
+            action="/api/runs/{{ run.id }}/amendments/{{ pending_amendment.id }}/approve">
+        <button type="submit">Approve</button>
+      </form>
+      <form method="post"
+            action="/api/runs/{{ run.id }}/amendments/{{ pending_amendment.id }}/reject">
+        <label>Guidance (optional)
+          <input type="text" name="guidance">
+        </label>
+        <button type="submit">Reject</button>
+      </form>
+      <form method="post"
+            action="/api/runs/{{ run.id }}/amendments/{{ pending_amendment.id }}/abort">
+        <button type="submit">Abort</button>
+      </form>
+    </div>
+  {% endif %}
+
   {% if usage %}
     <h2>Token usage</h2>
     <table>

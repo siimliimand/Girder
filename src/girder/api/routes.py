@@ -17,6 +17,7 @@ from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Project, Run, RunStatus
 from girder.fsm import transition_run
+from girder.specs.amendment import AmendmentError, resolve_amendment
 from girder.specs.freeze import FreezeError, approve_and_freeze
 from girder.specs.validator import SpecValidationError, parse_spec
 
@@ -48,12 +49,14 @@ async def _run_context(db: Database, run_id: str) -> dict[str, object]:
         "spend_usd": run.spend_usd,
         "projected_spend_usd": run.projected_spend_usd,
     }
+    pending_amendment = await repo.get_pending_amendment(db, run_id)
     return {
         "run": run,
         "project": project,
         "spend": spend,
         "usage": usage,
         "generation_error": failure,
+        "pending_amendment": pending_amendment,
     }
 
 
@@ -254,6 +257,65 @@ async def regenerate(
     return RedirectResponse(f"/runs/{rid}", status_code=303)
 
 
+# ------------------------------------------------------- spec amendment actions
+
+
+@router.post("/api/runs/{rid}/amendments/{aid}/approve", response_model=None)
+async def approve_amendment(
+    request: Request, rid: str, aid: str
+) -> HTMLResponse | RedirectResponse:
+    return await _resolve_amendment_route(request, rid, aid, "approved")
+
+
+@router.post("/api/runs/{rid}/amendments/{aid}/reject", response_model=None)
+async def reject_amendment(
+    request: Request, rid: str, aid: str, guidance: str = Form("")
+) -> HTMLResponse | RedirectResponse:
+    return await _resolve_amendment_route(
+        request, rid, aid, "rejected", guidance=guidance.strip() or None
+    )
+
+
+@router.post("/api/runs/{rid}/amendments/{aid}/abort", response_model=None)
+async def abort_amendment(request: Request, rid: str, aid: str) -> HTMLResponse | RedirectResponse:
+    return await _resolve_amendment_route(request, rid, aid, "aborted")
+
+
+async def _resolve_amendment_route(
+    request: Request,
+    rid: str,
+    aid: str,
+    decision: str,
+    *,
+    guidance: str | None = None,
+) -> HTMLResponse | RedirectResponse:
+    db: Database = request.app.state.db
+    base = await _run_context(db, rid)
+    run: Run = base["run"]  # type: ignore[assignment]
+    project: Project = base["project"]  # type: ignore[assignment]
+    amendment = await repo.get_spec_amendment(db, aid)
+    if amendment is None or amendment.run_id != rid:
+        raise HTTPException(status_code=404, detail="amendment not found")
+    try:
+        await resolve_amendment(
+            db,
+            project=project,
+            run=run,
+            amendment=amendment,
+            decision=decision,
+            guidance=guidance,
+            notifier=request.app.state.notifier,
+        )
+    except AmendmentError as exc:
+        return render(
+            request,
+            "_run_panel.html",
+            _panel_context(run, {**base, "errors": [str(exc)]}),
+            status_code=409,
+        )
+    return RedirectResponse(f"/runs/{rid}", status_code=303)
+
+
 # ------------------------------------------------------------------------ JSON
 
 
@@ -271,6 +333,31 @@ async def run_json(request: Request, rid: str) -> JSONResponse:
             "projected_spend_usd": run.projected_spend_usd,
             "budget_cap_usd": run.budget_cap_usd,
             "has_proposal": run.proposal_md is not None,
+        }
+    )
+
+
+@router.get("/api/runs/{rid}/amendments")
+async def run_amendments(request: Request, rid: str) -> JSONResponse:
+    db: Database = request.app.state.db
+    await _require_run(db, rid)
+    amendments = await repo.list_amendments_for_run(db, rid)
+    return JSONResponse(
+        {
+            "amendments": [
+                {
+                    "id": a.id,
+                    "run_id": a.run_id,
+                    "task_id": a.task_id,
+                    "reason": a.reason,
+                    "suggested_change": a.suggested_change,
+                    "status": a.status,
+                    "guidance": a.guidance,
+                    "new_spec_hash": a.new_spec_hash,
+                    "resolved_at": a.resolved_at,
+                }
+                for a in amendments
+            ]
         }
     )
 

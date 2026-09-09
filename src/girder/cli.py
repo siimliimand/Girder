@@ -17,13 +17,21 @@ from pathlib import Path
 
 from girder import __version__
 from girder.api.app import create_app
-from girder.config import Settings, load_secrets, load_settings
+from girder.budget.guard import BudgetGuard
+from girder.config import Secrets, Settings, load_secrets, load_settings
+from girder.db import repo
 from girder.db.engine import Database, default_migrations_dir
+from girder.db.models import Run
 from girder.gitops.worktree import DEFAULT_BASE
 from girder.guard.redact import Redactor
+from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
 from girder.orchestrator.gc import WorktreeGC
 from girder.orchestrator.recovery import RecoveryService
+from girder.orchestrator.run_engine import _PUMPABLE_RUN_STATUSES, RunEngine
+from girder.sandbox.engine import SandboxEngine
+from girder.sandbox.local import LocalExecSandbox
+from girder.sandbox.podman import PodmanEngine
 
 log = logging.getLogger("girder")
 
@@ -99,8 +107,33 @@ async def cmd_web(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_sandbox(args: argparse.Namespace, settings: Settings) -> SandboxEngine:
+    if args.sandbox == "local":
+        return LocalExecSandbox()
+    return PodmanEngine(settings.sandbox.runtime)
+
+
+def _build_gateway(
+    settings: Settings, secrets: Secrets, db: Database, redactor: Redactor, notifier: Notifier
+) -> ModelGateway:
+    return ModelGateway(settings, secrets, db, redactor, BudgetGuard(db), notifier)
+
+
+async def _pumpable_runs(db: Database) -> list[Run]:
+    """Runs the pump may act on, across every project (SQL lives in db.repo)."""
+    runs: list[Run] = []
+    for project in await repo.list_projects(db):
+        for run in await repo.list_runs_for_project(db, project.id):
+            if run.status in _PUMPABLE_RUN_STATUSES:
+                runs.append(run)
+    return runs
+
+
 async def cmd_daemon(args: argparse.Namespace) -> int:
     settings = load_settings()
+    secrets = load_secrets()
+    redactor = Redactor(secrets.redaction_secret_env_names)
+    notifier = _build_notifier(settings, None)
     db = await _open_db(args)
     stop = asyncio.Event()
 
@@ -112,14 +145,34 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
     for s in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(s, _signal, s)
 
-    log.info("girder daemon starting (db=%s)", args.db)
+    log.info("girder daemon starting (db=%s, sandbox=%s)", args.db, args.sandbox)
     try:
-        await RecoveryService(db, settings, notifier=_build_notifier(settings, db)).recover()
+        report = await RecoveryService(db, settings, notifier=notifier).recover()
+        log.info("%s", report.summary())
         gc_task = asyncio.create_task(
-            WorktreeGC(db, DEFAULT_BASE, notifier=_build_notifier(settings, db)).run_forever()
+            WorktreeGC(db, DEFAULT_BASE, notifier=notifier).run_forever()
         )
-        # Sprint 3 mounts the run-engine pump here; for now: idle until signal.
-        await stop.wait()
+        engine = RunEngine(
+            db=db,
+            settings=settings,
+            secrets=secrets,
+            gateway=_build_gateway(settings, secrets, db, redactor, notifier),
+            sandbox=_build_sandbox(args, settings),
+            notifier=notifier,
+            redactor=redactor,
+        )
+        poll_s = 5.0
+        while not stop.is_set():
+            for run in await _pumpable_runs(db):
+                try:
+                    descriptor = await engine.pump_once(run.id)
+                    log.info("pump run %s -> %s", run.id, descriptor)
+                except Exception:  # never let one run kill the loop
+                    log.exception("pump failed for run %s", run.id)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=poll_s)
+            except TimeoutError:
+                pass
         gc_task.cancel()
         try:
             await gc_task
@@ -129,6 +182,39 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
         await db.close()
     log.info("daemon stopped cleanly")
     return 0
+
+
+async def cmd_pump(args: argparse.Namespace) -> int:
+    """One-shot pump: drive a single run one step (or to completion)."""
+    settings = load_settings()
+    secrets = load_secrets()
+    redactor = Redactor(secrets.redaction_secret_env_names)
+    notifier = _build_notifier(settings, None)
+    db = await _open_db(args)
+    try:
+        report = await RecoveryService(db, settings, notifier=notifier).recover()
+        log.info("%s", report.summary())
+        engine = RunEngine(
+            db=db,
+            settings=settings,
+            secrets=secrets,
+            gateway=_build_gateway(settings, secrets, db, redactor, notifier),
+            sandbox=_build_sandbox(args, settings),
+            notifier=notifier,
+            redactor=redactor,
+        )
+        try:
+            if args.wait:
+                descriptor = await engine.run_to_completion(args.run_id)
+            else:
+                descriptor = await engine.pump_once(args.run_id)
+        except KeyError:
+            log.error("run %s not found", args.run_id)
+            return 1
+        print(descriptor)
+        return 0
+    finally:
+        await db.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -147,7 +233,28 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("recover", help="run boot reconciliation and print the report")
     gc_parser = sub.add_parser("gc", help="run the worktree garbage collector")
     gc_parser.add_argument("--once", action="store_true", help="single pass instead of a loop")
-    sub.add_parser("daemon", help="run the orchestrator daemon (recovery + GC loop)")
+    daemon_parser = sub.add_parser(
+        "daemon", help="run the orchestrator daemon (recovery + GC + run-engine pump)"
+    )
+    daemon_parser.add_argument(
+        "--sandbox",
+        default="podman",
+        choices=["podman", "local"],
+        help="sandbox engine (local executes on the host — dev/tests only)",
+    )
+    pump_parser = sub.add_parser(
+        "pump", help="drive one run a single pump step (or to completion with --wait)"
+    )
+    pump_parser.add_argument("run_id", help="run id to pump")
+    pump_parser.add_argument(
+        "--wait", action="store_true", help="pump to completion instead of one step"
+    )
+    pump_parser.add_argument(
+        "--sandbox",
+        default="podman",
+        choices=["podman", "local"],
+        help="sandbox engine (local executes on the host — dev/tests only)",
+    )
     web_parser = sub.add_parser("web", help="serve the approval web console (impl-plan §10)")
     web_parser.add_argument(
         "--host", default=None, help="bind address (default: settings.web.host)"
@@ -173,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         "recover": cmd_recover,
         "gc": cmd_gc,
         "daemon": cmd_daemon,
+        "pump": cmd_pump,
         "web": cmd_web,
     }
     try:
