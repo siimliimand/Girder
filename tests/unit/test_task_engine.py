@@ -770,3 +770,52 @@ async def test_empty_test_dirs_logs_layer1_warning(
     assert outcome.kind == "completed"
     assert "Layer 1" in caplog.text
     assert h.sandbox.started[0].ro_mounts == {}
+
+
+async def test_container_killed_after_suite_before_audit(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D10 / Phase 0 task 5: on the success path the container must be dead
+    before the Layer-2/3 audit runs — a delayed in-container process must not
+    be able to mutate the worktree between audit and merge. Ordering:
+    suite (in-container) → kill → audit → merge."""
+    from girder.gitops.audit import DiffAudit
+
+    h = harness
+    task = await _seed_task(h)
+
+    class RecordingSandbox(ScriptSandbox):
+        def __init__(self) -> None:
+            super().__init__(suite_results=[ExecResult(0, "", "")], suite_xml=GREEN_XML)
+            self.events: list[str] = []
+
+        async def exec(
+            self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
+        ) -> ExecResult:
+            if any(".girder-" in a and ".xml" in a for a in cmd):
+                self.events.append("suite")
+            return await super().exec(name, cmd, timeout_s=timeout_s, user=user)
+
+        async def kill(self, name: str) -> None:
+            self.events.append("kill")
+            await super().kill(name)
+
+    h.sandbox = RecordingSandbox()
+    sandbox = h.sandbox
+
+    original_audit = DiffAudit.audit_attempt
+
+    async def audit_recorder(self: DiffAudit, path: Path, **kwargs: object) -> object:
+        sandbox.events.append("audit")
+        return await original_audit(self, path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DiffAudit, "audit_attempt", audit_recorder)
+
+    gateway = FakeGateway(responses=write_commit_complete())
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    # suite → kill → audit; the second kill is the engine-level `finally`
+    # backstop (idempotent by design)
+    assert sandbox.events == ["suite", "kill", "audit", "kill"]
+    assert sandbox.events.index("kill") < sandbox.events.index("audit")

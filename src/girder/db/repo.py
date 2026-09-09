@@ -20,6 +20,7 @@ from girder.db.models import (
     TERMINAL_ATTEMPT_STATUSES,
     TERMINAL_TASK_STATUSES,
     Attempt,
+    AttemptDiff,
     AttemptPrompt,
     AttemptStatus,
     Project,
@@ -876,6 +877,15 @@ async def get_pending_amendment(db: Database, run_id: str) -> SpecAmendment | No
     return _row_to_spec_amendment(r) if r else None
 
 
+async def list_pending_amendments(db: Database) -> list[SpecAmendment]:
+    """All still-pending amendments across every run, oldest first (§10
+    Amendments inbox page)."""
+    rows = await db.fetchall(
+        "SELECT * FROM spec_amendments WHERE status = 'pending' ORDER BY rowid"
+    )
+    return [_row_to_spec_amendment(r) for r in rows]
+
+
 async def get_rejected_guidance(db: Database, run_id: str, task_id: str) -> str | None:
     """Guidance from the most recent rejected amendment for this run+task
     (falling back to a run-level amendment with ``task_id IS NULL``).
@@ -1009,6 +1019,66 @@ async def list_attempt_prompts(db: Database, attempt_id: str) -> list[AttemptPro
         )
         for r in rows
     ]
+
+
+# --------------------------------------------------------------- attempt diffs
+
+
+async def insert_attempt_diff(
+    db: Database,
+    *,
+    attempt_id: str,
+    run_id: str,
+    base_commit: str,
+    head_commit: str,
+    diff_redacted: str,
+    task_id: str | None = None,
+) -> int:
+    """Persist one attempt diff (migration 012, §10 diff viewer / plan.md §2.1).
+
+    ``diff_redacted`` is stored exactly as given — the CALLER is responsible
+    for redacting secrets before calling this (same contract as
+    ``record_attempt_prompt``; enforcement lives upstream via the run's
+    Redactor, typically ``redact_and_log(..., source_field="attempt_diff")``).
+    """
+    cur = await db.execute(
+        "INSERT INTO attempt_diffs (attempt_id, task_id, run_id, base_commit,"
+        " head_commit, diff_redacted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (attempt_id, task_id, run_id, base_commit, head_commit, diff_redacted, utcnow_iso()),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _row_to_attempt_diff(r: Row) -> AttemptDiff:
+    return AttemptDiff(
+        attempt_id=r["attempt_id"],
+        task_id=r["task_id"],
+        run_id=r["run_id"],
+        base_commit=r["base_commit"],
+        head_commit=r["head_commit"],
+        diff_redacted=r["diff_redacted"],
+        created_at=r["created_at"],
+    )
+
+
+async def list_attempt_diffs_for_run(db: Database, run_id: str) -> list[AttemptDiff]:
+    """All persisted diffs of a run, oldest first."""
+    rows = await db.fetchall(
+        "SELECT attempt_id, task_id, run_id, base_commit, head_commit, diff_redacted,"
+        " created_at FROM attempt_diffs WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    return [_row_to_attempt_diff(r) for r in rows]
+
+
+async def latest_attempt_diff_for_task(db: Database, task_id: str) -> AttemptDiff | None:
+    """Newest diff across a task's attempts (the current state of its branch)."""
+    r = await db.fetchone(
+        "SELECT attempt_id, task_id, run_id, base_commit, head_commit, diff_redacted,"
+        " created_at FROM attempt_diffs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    return _row_to_attempt_diff(r) if r else None
 
 
 # -------------------------------------------------------------- steering events

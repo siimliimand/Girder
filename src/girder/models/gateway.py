@@ -1,4 +1,4 @@
-"""Thin OpenAI-compatible chat-completions client — impl-plan §6.8 / D1.
+"""Thin model client — impl-plan §6.8 / D1.
 
 No SDK, no LangChain: one ``httpx`` call per model invocation. The order of
 operations inside :meth:`ModelGateway.complete` follows impl-plan §6.8 exactly:
@@ -6,11 +6,19 @@ operations inside :meth:`ModelGateway.complete` follows impl-plan §6.8 exactly:
 estimate -> persist pre-dispatch row -> dispatch -> redact response ->
 reconcile spend -> tripwire -> audit event. Responses pass the redactor
 before they reach the caller, logs, or SQLite (§8.6).
+
+Two transports share that pipeline: OpenAI-compatible chat-completions
+(openai / openrouter) and the Anthropic Messages API. Only the request
+shaping and response parsing differ per provider — retry, redaction and
+budget wiring are identical. Base URLs follow one convention: the versioned
+API root (``…/v1``), with the resource appended per provider
+(``/chat/completions`` vs ``/messages``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -216,25 +224,28 @@ class ModelGateway:
         )
 
         # 5. Dispatch with jittered-backoff retries on 429/5xx/transport errors.
-        payload: dict[str, Any] = {
-            "model": cfg.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "max_tokens": cfg.max_output_tokens,
-        }
-        if tools is not None:
-            payload["tools"] = tools
-        if temperature is not None:
-            payload["temperature"] = temperature
         base_url = cfg.base_url or DEFAULT_BASE_URLS[cfg.provider]
         headers = self._headers(cfg.provider, key)
+        if cfg.provider == "anthropic":
+            payload = self._anthropic_payload(cfg, messages, tools, temperature)
+            endpoint = f"{base_url}/messages"
+        else:
+            payload = {
+                "model": cfg.model,
+                "messages": [{"role": m.role, "content": m.content} for m in messages],
+                "max_tokens": cfg.max_output_tokens,
+            }
+            if tools is not None:
+                payload["tools"] = tools
+            if temperature is not None:
+                payload["temperature"] = temperature
+            endpoint = f"{base_url}/chat/completions"
 
         data: dict[str, Any] | None = None
         failure: str | None = None
         for attempt in range(1, _MAX_HTTP_ATTEMPTS + 1):
             try:
-                resp = await self._client.post(
-                    f"{base_url}/chat/completions", json=payload, headers=headers
-                )
+                resp = await self._client.post(endpoint, json=payload, headers=headers)
                 if resp.status_code == 429 or resp.status_code >= 500:
                     failure = f"HTTP {resp.status_code}"
                     if attempt < _MAX_HTTP_ATTEMPTS:
@@ -257,19 +268,27 @@ class ModelGateway:
             await self._fail(usage_row_id, run_id, attempt_id, failure or "unknown error")
             raise ModelError(f"model call failed after retries: {failure}")
 
-        # 6. Parse the OpenAI shape.
+        # 6. Parse the provider response shape (normalized to the OpenAI
+        # fields the rest of the pipeline — redaction, reconcile — consumes).
         try:
-            choices = data.get("choices") or []
-            if not choices:
-                raise ValueError("empty choices")
-            message = choices[0].get("message") or {}
-            content: str | None = message.get("content")
-            tool_calls_raw = message.get("tool_calls") or []
-            usage_raw = data.get("usage") or {}
-            usage = Usage(
-                prompt_tokens=int(usage_raw.get("prompt_tokens") or 0),
-                completion_tokens=int(usage_raw.get("completion_tokens") or 0),
-            )
+            if cfg.provider == "anthropic":
+                content, tool_calls_raw, usage, finish_reason, resp_role = (
+                    self._parse_anthropic(data)
+                )
+            else:
+                choices = data.get("choices") or []
+                if not choices:
+                    raise ValueError("empty choices")
+                message = choices[0].get("message") or {}
+                content = message.get("content")
+                tool_calls_raw = message.get("tool_calls") or []
+                usage_raw = data.get("usage") or {}
+                usage = Usage(
+                    prompt_tokens=int(usage_raw.get("prompt_tokens") or 0),
+                    completion_tokens=int(usage_raw.get("completion_tokens") or 0),
+                )
+                finish_reason = choices[0].get("finish_reason")
+                resp_role = str(message.get("role") or "assistant")
         except (AttributeError, TypeError, ValueError) as exc:
             await self._fail(usage_row_id, run_id, attempt_id, f"malformed response: {exc}")
             raise ModelError(f"malformed model response: {exc}") from exc
@@ -359,12 +378,114 @@ class ModelGateway:
         return ModelResponse(
             content=redacted_content,
             tool_calls=tool_calls,
-            finish_reason=choices[0].get("finish_reason"),
+            finish_reason=finish_reason,
             usage=usage,
-            role=str(message.get("role") or "assistant"),
+            role=resp_role,
             model_id=cfg.model,
             provider=cfg.provider,
             usage_row_id=usage_row_id,
+        )
+
+    # -------------------------------------------------- anthropic transport
+
+    def _anthropic_payload(
+        self,
+        cfg: ModelRole,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None,
+    ) -> dict[str, Any]:
+        """Shape the Anthropic Messages API request (non-streaming).
+
+        Base URL convention (shared with the OpenAI branches): the versioned
+        API root, ``https://api.anthropic.com/v1`` by default; the endpoint is
+        ``{base}/messages``. ``max_tokens`` is REQUIRED by this API — the
+        role's configured ``max_output_tokens`` is used.
+        """
+        system_parts = [m.content for m in messages if m.role == "system"]
+        convo: list[dict[str, Any]] = []
+        for m in messages:
+            if m.role == "system":
+                continue
+            if m.role == "tool":
+                # The internal Message carries no tool_use id (results are
+                # plain text in this pipeline), so the block's id is empty —
+                # the API pairing key only matters for native tool round-trips.
+                convo.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "",
+                                     "content": m.content}],
+                    }
+                )
+            else:
+                convo.append(
+                    {"role": m.role, "content": [{"type": "text", "text": m.content}]}
+                )
+        payload: dict[str, Any] = {
+            "model": cfg.model,
+            "max_tokens": cfg.max_output_tokens,
+            "messages": convo,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+        if tools is not None:
+            payload["tools"] = [
+                {
+                    "name": t.get("function", {}).get("name", ""),
+                    "description": t.get("function", {}).get("description", ""),
+                    "input_schema": t.get("function", {}).get("parameters", {}),
+                }
+                for t in tools
+            ]
+        if temperature is not None:
+            payload["temperature"] = temperature
+        return payload
+
+    def _parse_anthropic(
+        self, data: dict[str, Any]
+    ) -> tuple[str | None, list[dict[str, Any]], Usage, str | None, str]:
+        """Parse a Messages API response into the OpenAI-shaped fields the
+        shared pipeline consumes: (content, tool_calls, usage, finish_reason,
+        role). ``tool_use`` blocks are converted to OpenAI tool-call dicts so
+        the redaction loop below stays provider-agnostic; ``stop_reason`` is
+        mapped onto OpenAI finish reasons for loop control."""
+        blocks = data.get("content") or []
+        if not isinstance(blocks, list):
+            raise ValueError("content is not a list")
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in blocks:
+            if block.get("type") == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif block.get("type") == "tool_use":
+                tool_calls.append(
+                    {
+                        "id": str(block.get("id") or ""),
+                        "function": {
+                            "name": str(block.get("name") or ""),
+                            "arguments": json.dumps(block.get("input") or {}),
+                        },
+                    }
+                )
+        usage_raw = data.get("usage") or {}
+        usage = Usage(
+            prompt_tokens=int(usage_raw.get("input_tokens") or 0),
+            completion_tokens=int(usage_raw.get("output_tokens") or 0),
+        )
+        stop = data.get("stop_reason")
+        finish = {
+            "tool_use": "tool_calls",
+            "end_turn": "stop",
+            "stop_sequence": "stop",
+            "max_tokens": "length",
+        }.get(str(stop), str(stop) if stop else None)
+        return (
+            "\n".join(text_parts) if text_parts else None,
+            tool_calls,
+            usage,
+            finish,
+            "assistant",
         )
 
     async def _backoff(self, attempt: int) -> None:

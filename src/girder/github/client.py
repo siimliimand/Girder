@@ -87,6 +87,23 @@ def parse_owner_repo(remote_url: str) -> tuple[str, str]:
     raise GitHubError(f"not a GitHub remote URL: {remote_url!r}")
 
 
+def _askpass_script() -> str:
+    """The ``GIT_ASKPASS`` helper pushed with each HTTPS push.
+
+    GitHub over HTTPS prompts ``Username for 'https://github.com': `` FIRST
+    (with GIT_TERMINAL_PROMPT=0 an unanswered username aborts the push), so
+    the helper answers ``Username*`` with ``x-access-token`` (GitHub's
+    conventional PAT username) and ``Password*`` with the token itself.
+    """
+    return (
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  Username*) printf 'x-access-token' ;;\n"
+        '  *Password*) printf \'%s\' "$GIRDER_ASKPASS_TOKEN" ;;\n'
+        "esac\n"
+    )
+
+
 class GitHubClient:
     """Push / PR / checks / comments / merge — all calls redacted-logged."""
 
@@ -200,12 +217,7 @@ class GitHubClient:
             return
         with tempfile.TemporaryDirectory(prefix="girder-askpass-") as tmp:
             helper = Path(tmp) / "askpass.sh"
-            helper.write_text(
-                "#!/bin/sh\n"
-                'case "$1" in\n'
-                '  *Password*) printf \'%s\' "$GIRDER_ASKPASS_TOKEN" ;;\n'
-                "esac\n"
-            )
+            helper.write_text(_askpass_script())
             helper.chmod(stat.S_IRWXU)  # 0700: owner-only
             try:
                 await run_host_cmd(

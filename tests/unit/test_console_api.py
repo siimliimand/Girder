@@ -677,6 +677,17 @@ async def test_panel_renders_impact_table_and_estimate(tmp_path: Path) -> None:
         db: Database = app.state.db
         p = await make_project(db)
         r = await make_run(db, p.id)
+        # issue: the estimate must work with proposal_md None — first review
+        # and Regenerate are exactly when the next generation call is imminent.
+        # (_run_panel.html only prints the line alongside a proposal, so assert
+        # on the estimator itself for the no-proposal case.)
+        from girder.api.routes import _next_generation_estimate
+
+        est_na = _next_generation_estimate(
+            app.state.settings, app.state.budget, await repo.get_run(db, r.id), tmp_path
+        )
+        assert est_na.startswith("$")
+        assert est_na != "n/a"
         await repo.update_run_fields(db, r.id, proposal_md=_SPEC)
         resp = await client.get(f"/runs/{r.id}/panel")
         assert resp.status_code == 200
@@ -722,3 +733,99 @@ async def test_sse_budget_class_distinct_from_violation(tmp_path: Path) -> None:
         assert by_type["budget_preflight_denied"] == "budget"
         assert by_type["scope_violation"] == "violation"
         assert by_type["attempt_failed"] == "violation"
+
+
+# ------------------------------------- migration 012: persisted diff streams
+
+
+async def test_run_page_renders_stored_diff_redacted(tmp_path: Path) -> None:
+    """§10 diff viewer: run page + post-mortem + JSON endpoint render a stored
+    attempt diff, and a planted secret survives only as a redaction marker
+    (historical views share one redactor with the live path)."""
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+        wave = await repo.create_wave(db, r.id, 0)
+        task = await repo.create_task(db, wave.id, 1, "T1", TaskType.CODE_CHANGE)
+        attempt = await repo.create_attempt(db, task.id, base_commit="deadbeef")
+        # caller redacts before insert (repo contract) — plant the raw secret
+        # as if redaction had been skipped, to prove the render path re-redacts.
+        await repo.insert_attempt_diff(
+            db,
+            attempt_id=attempt.id,
+            task_id=task.id,
+            run_id=r.id,
+            base_commit="deadbeef",
+            head_commit="c0ffee0",
+            diff_redacted=f"diff --git a/x b/x\n+token = {SECRET}\n",
+        )
+
+        resp = await client.get(f"/runs/{r.id}")
+        assert resp.status_code == 200
+        assert "diff (latest attempt)" in resp.text
+        assert "diff --git a/x b/x" in resp.text
+        assert SECRET not in resp.text
+        assert "***[REDACTED:" in resp.text
+
+        pm = await client.get(f"/runs/{r.id}/postmortem")
+        assert pm.status_code == 200
+        assert "diff (base..head)" in pm.text
+        assert SECRET not in pm.text
+
+        api = await client.get(f"/api/runs/{r.id}/diffs")
+        assert api.status_code == 200
+        body = api.json()
+        assert body["diffs"][0]["base_commit"] == "deadbeef"
+        assert SECRET not in api.text
+
+
+# ------------------------------------------------ §10: Amendments inbox page
+
+
+async def test_amendments_inbox_empty_state(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        resp = await client.get("/amendments")
+        assert resp.status_code == 200
+        assert "No pending amendments." in resp.text
+
+
+async def test_amendments_inbox_lists_pending_and_resolves(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+        from tests.conftest import seed_run_status
+
+        await seed_run_status(db, r.id, "awaiting_amendment")
+        a = await repo.create_spec_amendment(
+            db, r.id, "scope misses the helper module", "extend scope_globs to src/x/**"
+        )
+
+        resp = await client.get("/amendments")
+        assert resp.status_code == 200
+        assert "scope misses the helper module" in resp.text
+        assert "extend scope_globs to src/x/**" in resp.text
+        assert (
+            f"/api/runs/{r.id}/amendments/{a.id}/approve" in resp.text
+            and f"/api/runs/{r.id}/amendments/{a.id}/reject" in resp.text
+            and f"/api/runs/{r.id}/amendments/{a.id}/abort" in resp.text
+        )
+
+        # Abort from the inbox bounces back to the inbox via Referer (approve
+        # would need the frozen proposal file, which no seeded run has).
+        act = await client.post(
+            f"/api/runs/{r.id}/amendments/{a.id}/abort",
+            headers={"Referer": "http://test/amendments"},
+        )
+        assert act.status_code == 303
+        assert act.headers["location"] == "http://test/amendments"
+        assert await repo.get_spec_amendment(db, a.id) is not None
+        row = await db.fetchone("SELECT status FROM spec_amendments WHERE id = ?", (a.id,))
+        assert row is not None and row["status"] == "aborted"
+        # resolved amendments leave the inbox
+        after = await client.get("/amendments")
+        assert "No pending amendments." in after.text

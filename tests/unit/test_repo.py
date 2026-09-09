@@ -459,3 +459,47 @@ async def test_attempt_prompts_roundtrip(db) -> None:  # type: ignore[no-untyped
     assert prompts[1].run_id is None
     assert all(p.ts for p in prompts)
     assert await repo.list_attempt_prompts(db, "nope") == []
+
+
+async def test_attempt_diffs_roundtrip(db) -> None:  # type: ignore[no-untyped-def]
+    """Migration 012 / §10 diff viewer: per-attempt diff rows, redaction owned
+    by the caller, latest-per-task lookup."""
+    project = await repo.create_project(db, "p", "/repo")
+    run = await repo.create_run(db, project.id, "intent", "run/abc1", 5.0)
+    wave = await repo.get_or_create_wave0(db, run.id)
+    task = await repo.create_task(db, wave.id, 1, "t", TaskType.CODE_CHANGE)
+    attempt = await repo.create_attempt(db, task.id, "abc123")
+
+    assert await repo.list_attempt_diffs_for_run(db, run.id) == []
+    assert await repo.latest_attempt_diff_for_task(db, task.id) is None
+
+    await repo.insert_attempt_diff(
+        db,
+        attempt_id=attempt.id,
+        task_id=task.id,
+        run_id=run.id,
+        base_commit="abc123",
+        head_commit="def456",
+        diff_redacted="diff --git a/x b/x",
+    )
+    await repo.insert_attempt_diff(
+        db,
+        attempt_id=attempt.id,
+        task_id=task.id,
+        run_id=run.id,
+        base_commit="def456",
+        head_commit="789abc",
+        diff_redacted="diff --git a/y b/y",
+    )
+
+    diffs = await repo.list_attempt_diffs_for_run(db, run.id)
+    assert [d.diff_redacted for d in diffs] == [
+        "diff --git a/x b/x",
+        "diff --git a/y b/y",
+    ]
+    assert all(d.run_id == run.id and d.task_id == task.id for d in diffs)
+    assert all(d.created_at for d in diffs)
+    latest = await repo.latest_attempt_diff_for_task(db, task.id)
+    assert latest is not None and latest.diff_redacted == "diff --git a/y b/y"
+    assert await repo.list_attempt_diffs_for_run(db, "nope") == []
+    assert await repo.latest_attempt_diff_for_task(db, "nope") is None

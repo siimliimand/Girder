@@ -109,6 +109,40 @@ async def _request(ctx: Ctx) -> repo.SpecAmendment:
     )
 
 
+@dataclass
+class _FakeNotifier:
+    """Captures notification bodies (§8.4: payload must carry the diff)."""
+
+    bodies: list[str]
+
+    async def notify(
+        self, level: str, title: str, body: str, *, run_id: str | None = None
+    ) -> list[object]:
+        self.bodies.append(body)
+        return []
+
+
+async def test_request_notification_includes_suggested_change(ctx: Ctx) -> None:
+    notifier = _FakeNotifier(bodies=[])
+    long_change = "add explicit acceptance note to do-thing " + "x" * 600
+    await request_spec_amendment(
+        ctx.db,
+        run=ctx.run,
+        task=ctx.task,
+        attempt=ctx.attempt,
+        reason="spec slice is ambiguous",
+        suggested_change=long_change,
+        notifier=notifier,  # type: ignore[arg-type]
+    )
+    assert len(notifier.bodies) == 1
+    body = notifier.bodies[0]
+    assert ctx.run.id in body and ctx.task.id in body
+    assert "spec slice is ambiguous" in body
+    assert "add explicit acceptance note to do-thing" in body
+    assert "x" * 600 not in body  # truncated for chat-sized channels
+    assert "[...truncated]" in body
+
+
 async def test_request_parks_everything(ctx: Ctx) -> None:
     amendment = await _request(ctx)
     assert amendment.status == "pending"

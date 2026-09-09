@@ -55,6 +55,13 @@
           <span class="badge">{{ t.status }}</span>
           <div class="muted">scope: {% for g in t.scope_globs %}<code>{{ g }}</code> {% else %}—{% endfor %}</div>
           {% if t.depends_on %}<div class="muted">depends on: {{ t.depends_on|join(', ') }}</div>{% endif %}
+          {% set diff = diffs_by_task.get(t.id) %}
+          {% if diff %}
+          <details class="diff">
+            <summary>diff (latest attempt)</summary>
+            <pre>{{ diff }}</pre>
+          </details>
+          {% endif %}
         </div>
       {% else %}
         <p class="muted">No tasks in this wave.</p>

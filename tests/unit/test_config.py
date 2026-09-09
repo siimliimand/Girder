@@ -266,3 +266,17 @@ def test_toml_roundtrips_specs_web_and_base_url(tmp_path: Path) -> None:
     assert settings.web.host == "127.0.0.1"  # untouched key keeps default
     assert len(settings.models.roles) == 3
     assert settings.models.roles[0].base_url == "http://localhost:9999/v1"
+
+
+def test_web_unix_socket_default_and_toml(tmp_path: Path) -> None:
+    """impl-plan §10: the console may bind a UDS instead of host/port."""
+    settings = load_settings(start_dir=tmp_path)
+    assert settings.web.unix_socket is None  # default: TCP loopback bind
+
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text('[web]\nunix_socket = "/run/girder/girder.sock"\n')
+    settings = load_settings(config_path=cfg)
+    assert settings.web.unix_socket == "/run/girder/girder.sock"
+    # host/port keep their defaults; they are simply unused in UDS mode.
+    assert settings.web.host == "127.0.0.1"
+    assert settings.web.port == 8787

@@ -33,7 +33,15 @@ from pathlib import Path
 from girder.config import Settings
 from girder.db import repo
 from girder.db.engine import Database
-from girder.db.models import IntegrityKind, Project, Run, Task, TaskStatus, Wave
+from girder.db.models import (
+    IntegrityKind,
+    Project,
+    Run,
+    Task,
+    TaskStatus,
+    TaskType,
+    Wave,
+)
 from girder.fsm import InvalidTransition, transition_task
 from girder.github.conformance import HunkConformanceReviewer
 from girder.gitops.audit import AuditResult, DiffAudit, TestManifest
@@ -143,9 +151,28 @@ class WaveIntegrator:
                 return IntegrationOutcome(outcome.kind, outcome.detail)
             wave_tip = outcome.detail or wave_tip
 
-        # Wave done: the run branch is an ancestor of the wave tip (the wave
-        # branch was created from it), so the Sprint 4 delivery pipeline picks
-        # up from there via the standard ff-only gate.
+        # Wave done: audit the TIP itself before the ff. Each per-task merge
+        # was audited individually, but the merged combination — the wave
+        # tip — never was (plan.md Phase 4 task 5 / D4: nothing crosses a
+        # branch boundary unaudited). Base is the run branch's pre-wave tip,
+        # i.e. the commit the wave branch was created from. If any wave task
+        # is a test change, its test-file writes were already legitimate
+        # under that task's own audit, so the tip audit adopts TEST_CHANGE
+        # semantics; with only code tasks, test files stay immutable.
+        wave_has_test_change = any(t.task_type is TaskType.TEST_CHANGE for t in tasks)
+        tip_audit = await self._audit.audit_commit(
+            self.repo_path,
+            task_type=TaskType.TEST_CHANGE if wave_has_test_change else TaskType.CODE_CHANGE,
+            scope_globs=wave_scope,
+            base_commit=run_tip,
+            commit=wave_tip,
+        )
+        if not tip_audit.passed:
+            return await self._tip_audit_escalation(run, tip_audit)
+
+        # The run branch is an ancestor of the wave tip (the wave branch was
+        # created from it), so the Sprint 4 delivery pipeline picks up from
+        # there via the standard ff-only gate.
         ff = await branch_ops.audit_gated_merge(
             source_branch=wave_branch, target_branch=run.branch, audit_passed=True
         )
@@ -365,9 +392,8 @@ class WaveIntegrator:
             )
         return IntegrationOutcome("escalated", reason)
 
-    async def _audit_escalation(
-        self, run: Run, task: Task, audit: AuditResult
-    ) -> IntegrationOutcome:
+    @staticmethod
+    def _audit_findings(audit: AuditResult) -> list[tuple[IntegrityKind, dict[str, object]]]:
         findings: list[tuple[IntegrityKind, dict[str, object]]] = []
         if audit.test_path_violations:
             findings.append(
@@ -385,12 +411,43 @@ class WaveIntegrator:
             findings.append(
                 (IntegrityKind.PROTECTED_READ, {"paths": audit.protected_path_touches})
             )
+        return findings
+
+    async def _audit_escalation(
+        self, run: Run, task: Task, audit: AuditResult
+    ) -> IntegrationOutcome:
+        findings = self._audit_findings(audit)
         for kind, detail in findings:
             await repo.insert_integrity_violation(
                 self.db, run.id, kind.value, detail, task_id=task.id
             )
         summary = "; ".join(kind.value for kind, _ in findings) or "integration audit failed"
         return await self._drop_and_escalate(run, task, summary)
+
+    async def _tip_audit_escalation(
+        self, run: Run, audit: AuditResult
+    ) -> IntegrationOutcome:
+        """The wave tip (merged combination) failed the Layer 2/3 audit — the
+        run branch was never moved, so there is nothing to roll back: record
+        the violations and escalate like a per-merge audit failure."""
+        findings = self._audit_findings(audit)
+        for kind, detail in findings:
+            await repo.insert_integrity_violation(self.db, run.id, kind.value, detail)
+        summary = "; ".join(kind.value for kind, _ in findings) or "wave tip audit failed"
+        await repo.insert_event(
+            self.db,
+            "wave_tip_audit_failed",
+            {"reason": summary},
+            run_id=run.id,
+        )
+        if self.notifier is not None:
+            await self.notifier.notify(
+                "error",
+                "Girder: wave integration escalated",
+                f"run {run.id}: wave tip audit failed — {summary}",
+                run_id=run.id,
+            )
+        return IntegrationOutcome("escalated", summary)
 
     # git plumbing the BranchOps surface does not expose; both are plain
     # orchestrator-side ref operations (the agent has no path to them).

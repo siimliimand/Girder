@@ -48,6 +48,47 @@ def _matches_any(rel: str, patterns: list[str]) -> bool:
     return any(path_matches(rel, p) for p in patterns)
 
 
+def _unquote(p: str) -> str:
+    """Undo ``core.quotePath`` quoting (``"tab\there"`` → ``tab<tab>here``)."""
+    p = p.strip()
+    if len(p) >= 2 and p.startswith('"') and p.endswith('"'):
+        p = p[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return p
+
+
+def _porcelain_paths(out: str) -> list[str]:
+    """Paths from ``git status --porcelain`` (v1) output.
+
+    Each line is ``XY <space> <path>``. Rename/copy entries carry
+    ``old -> new``: BOTH endpoints belong in the leftover set, otherwise a
+    pure rename of an out-of-scope or test-signal file would evade
+    classification (the old string ``"old -> new"`` matches neither scope
+    nor test patterns). Quoted paths are unquoted; anything unparsable is
+    skipped rather than crashing the audit.
+    """
+    paths: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 4 or line[2] != " ":
+            continue
+        entry = line[3:]
+        if not entry:
+            continue
+        if " -> " in entry:
+            # partition BEFORE unquoting: either side may be individually
+            # quoted (`R  "old\tname" -> "new"`)
+            old, _, new = entry.partition(" -> ")
+            old, new = _unquote(old), _unquote(new)
+            if old:
+                paths.append(old)
+            if new:
+                paths.append(new)
+        else:
+            unquoted = _unquote(entry)
+            if unquoted:
+                paths.append(unquoted)
+    return paths
+
+
 async def _git(cwd: Path, *args: str, check: bool = True) -> str:
     result = await run_host_cmd(["git", "-C", str(cwd), *args], check=check, timeout_s=60)
     if check and result.returncode != 0:
@@ -185,11 +226,7 @@ class DiffAudit:
         changed = {line for line in diff_out.splitlines() if line}
 
         status_out = await _git(worktree_path, "status", "--porcelain")
-        leftovers = [
-            line[3:].removeprefix('"').removesuffix('"')
-            for line in status_out.splitlines()
-            if line
-        ]
+        leftovers = _porcelain_paths(status_out)
         changed |= set(leftovers)
 
         test_violations = sorted(

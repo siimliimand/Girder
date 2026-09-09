@@ -80,6 +80,12 @@
       {% if av.attempt.failure_reason %}
         <p class="error">Failure: {{ av.attempt.failure_reason }}</p>
       {% endif %}
+      {% if av.diff %}
+      <details class="diff">
+        <summary>diff (base..head)</summary>
+        <pre>{{ av.diff }}</pre>
+      </details>
+      {% endif %}
       <h5>Tool calls</h5>
       <table>
         <thead><tr><th>When</th><th>Tool</th><th>ms</th><th>Scope violation</th>

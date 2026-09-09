@@ -37,6 +37,20 @@ def _settings() -> Settings:
     return Settings(models={"roles": [_role("tier1"), _role("tier2"), _role("tier3")]})
 
 
+def _anthropic_settings() -> Settings:
+    def role(role_name: str) -> ModelRole:
+        return ModelRole(
+            role=role_name,
+            provider="anthropic",
+            model="claude-test",
+            max_output_tokens=1000,
+            price_in_per_mtok=PRICE_IN_MTOK,
+            price_out_per_mtok=PRICE_OUT_MTOK,
+        )
+
+    return Settings(models={"roles": [role("tier1"), role("tier2"), role("tier3")]})
+
+
 def _ok_body(content: str | None = "ok") -> dict[str, Any]:
     return {
         "choices": [
@@ -77,6 +91,34 @@ def _gateway(
         transport=transport,
         retry_backoff_s=0,
     )
+
+
+def _anthropic_gateway(db: Any, transport: Any) -> ModelGateway:
+    return ModelGateway(
+        _anthropic_settings(),
+        Secrets(models_anthropic_api_key="sk-ant-test-nonsecret"),
+        db,
+        Redactor(),
+        BudgetGuard(db),
+        transport=transport,
+        retry_backoff_s=0,
+    )
+
+
+def _anthropic_ok_body() -> dict[str, Any]:
+    return {
+        "content": [
+            {"type": "text", "text": f"ok AWS key: {AWS_KEY}"},
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "read_file",
+                "input": {"path": "a.py"},
+            },
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 11, "output_tokens": 7},
+    }
 
 
 async def _seed_run(db: Any, *, cap: float = 5.0) -> str:
@@ -340,3 +382,159 @@ async def test_token_usage_row_written_before_dispatch(db) -> None:  # type: ign
 
     assert observed["at_dispatch"]
     assert resp.usage_row_id is not None
+
+
+# ----------------------------------------------------- anthropic Messages API
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    }
+]
+
+
+async def test_anthropic_request_shape_and_response_parsing(db) -> None:  # type: ignore[no-untyped-def]
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["headers"] = dict(request.headers)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_anthropic_ok_body())
+
+    run_id = await _seed_run(db)
+    gw = _anthropic_gateway(db, httpx.MockTransport(handler))
+    try:
+        resp = await gw.complete(
+            "tier1",
+            [
+                Message(role="system", content="be terse"),
+                Message(role="user", content="hello"),
+            ],
+            tools=TOOLS,
+            temperature=0.2,
+            run_id=run_id,
+        )
+    finally:
+        await gw.aclose()
+
+    # Endpoint + auth headers (base URL convention: versioned API root, /messages).
+    assert seen["path"] == "/v1/messages"
+    assert seen["headers"]["x-api-key"] == "sk-ant-test-nonsecret"
+    assert seen["headers"]["anthropic-version"] == "2023-06-01"
+
+    # Anthropic-shaped body: max_tokens REQUIRED, system top-level, content blocks.
+    body = seen["body"]
+    assert body["model"] == "claude-test"
+    assert body["max_tokens"] == 1000
+    assert body["system"] == "be terse"
+    assert body["temperature"] == 0.2
+    assert body["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+    ]
+    assert body["tools"] == [
+        {
+            "name": "read_file",
+            "description": "read a file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }
+    ]
+
+    # Response parsing: text joined, tool_use → tool call, usage mapped.
+    assert AWS_KEY not in (resp.content or "")
+    assert "AKI***[REDACTED:" in (resp.content or "")
+    assert len(resp.tool_calls) == 1
+    tc = resp.tool_calls[0]
+    assert tc.id == "toolu_1"
+    assert tc.name == "read_file"
+    assert json.loads(tc.arguments_json) == {"path": "a.py"}
+    assert resp.usage.prompt_tokens == 11
+    assert resp.usage.completion_tokens == 7
+    assert resp.finish_reason == "tool_calls"  # stop_reason mapped for loop control
+    assert resp.provider == "anthropic"
+
+    # Budget reconcile consumed the anthropic usage fields.
+    rows = await repo.list_token_usage_for_run(db, run_id)
+    assert rows[0]["prompt_tokens"] == 11
+    assert rows[0]["completion_tokens"] == 7
+    assert rows[0]["cost_usd"] == pytest.approx(11 * 3e-6 + 7 * 15e-6)
+
+
+async def test_anthropic_tool_result_message_maps_to_tool_result_block(db) -> None:  # type: ignore[no-untyped-def]
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_anthropic_ok_body())
+
+    run_id = await _seed_run(db)
+    gw = _anthropic_gateway(db, httpx.MockTransport(handler))
+    try:
+        await gw.complete(
+            "tier1",
+            [Message(role="tool", content="file contents")],
+            run_id=run_id,
+        )
+    finally:
+        await gw.aclose()
+    assert seen["body"]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "", "content": "file contents"}
+            ],
+        }
+    ]
+
+
+async def test_anthropic_retry_on_429(db) -> None:  # type: ignore[no-untyped-def]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429)
+        return httpx.Response(200, json=_anthropic_ok_body())
+
+    run_id = await _seed_run(db)
+    gw = _anthropic_gateway(db, httpx.MockTransport(handler))
+    try:
+        resp = await gw.complete(
+            "tier1", [Message(role="user", content="x")], run_id=run_id
+        )
+    finally:
+        await gw.aclose()
+    assert calls == 2
+    assert resp.content is not None
+
+
+async def test_anthropic_preflight_deny_never_dispatches(db) -> None:  # type: ignore[no-untyped-def]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=_anthropic_ok_body())
+
+    project = await repo.create_project(db, "p", "/tmp/p")
+    run = await repo.create_run(db, project.id, "intent", "branch", budget_cap_usd=0.0000001)
+    await db.execute("UPDATE runs SET status = ? WHERE id = ?",
+                     (RunStatus.ACTIVE.value, run.id))
+    await db.conn.commit()
+
+    gw = _anthropic_gateway(db, httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BudgetExceeded):
+            await gw.complete(
+                "tier1", [Message(role="user", content="expensive")], run_id=run.id
+            )
+    finally:
+        await gw.aclose()
+    assert calls == 0
+    assert await current_status(db, "run", run.id) == RunStatus.BUDGET_EXHAUSTED.value

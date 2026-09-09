@@ -49,6 +49,8 @@ CONSTRAINTS:
 - Include at least one task.
 - Every task's scope_globs must list realistic repo-relative globs limited to \
 files that plausibly exist, judging by the provided file listing.
+- Declare depends_on edges between tasks whenever one task's work depends on \
+another task's output; keep depends_on empty for genuinely independent tasks.
 - Every success criterion must be objectively testable."""
 
 

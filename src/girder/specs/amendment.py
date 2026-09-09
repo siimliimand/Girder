@@ -92,10 +92,18 @@ async def request_spec_amendment(
         attempt_id=attempt.id,
     )
     if notifier is not None:
+        # Chat-sized snippet only (§8.4: notification carries the proposed
+        # diff); the redactor inside notifier.notify handles secrets, and the
+        # full untruncated text lives in the audit event above.
+        snippet = (
+            f"{suggested_change[:500]} [...truncated]"
+            if len(suggested_change) > 500
+            else suggested_change
+        )
         await notifier.notify(
             "error",
             "Spec amendment requested",
-            f"run {run.id} task {task.id}: {reason}",
+            f"run {run.id} task {task.id}: {reason}\n\nProposed change: {snippet}",
             run_id=run.id,
         )
     return amendment

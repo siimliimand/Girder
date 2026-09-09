@@ -94,6 +94,9 @@ class DeliveryEngine:
         self._repo_path = Path(repo_path) if repo_path else None
         self._poller = CiPoller(db=db, client=github, settings=settings, redactor=redactor)
         self._last_poll: dict[str, float] = {}
+        # Separate from _last_poll: a parked T0 run must not inherit its CI
+        # polling timestamp, or its first merge-pending poll would be skipped.
+        self._last_merge_poll: dict[str, float] = {}
 
     # ------------------------------------------------------------------- pump
 
@@ -439,8 +442,19 @@ class DeliveryEngine:
         return "merged"
 
     async def _pump_merge_pending(self, run: Run) -> str:
-        """T0: wait for the human merge click; detect out-of-band merges."""
+        """T0: wait for the human merge click; detect out-of-band merges.
+
+        get_pr is throttled to ``settings.github.poll_interval_s`` per run
+        (same cadence as the CI poll) — parked runs get pumped on every cycle,
+        and an unthrottled poll would hammer the GitHub API. The last-poll
+        map is in-memory and resets on daemon restart: worst case that costs
+        one extra poll."""
         assert run.pr_number is not None
+        interval = self.settings.github.poll_interval_s
+        last = self._last_merge_poll.get(run.id)
+        if last is not None and interval > 0 and (time.monotonic() - last) < interval:
+            return "merge_pending_human"
+        self._last_merge_poll[run.id] = time.monotonic()
         pr = await self.github.get_pr(run.pr_number)
         if pr.get("merged"):
             project = await self._project_of(run)

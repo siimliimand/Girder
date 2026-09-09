@@ -10,9 +10,13 @@ git-level worktree and vice versa.
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
 from pathlib import Path
 
+from girder.db import repo
+from girder.db.engine import Database
+from girder.db.models import Worktree
 from girder.util import CommandError, run_host_cmd, utcnow_iso
 
 DEFAULT_BASE = Path("/tmp/orchestrator-worktrees")
@@ -137,6 +141,13 @@ class WorktreeManager:
             for line in result.stdout.splitlines()
             if line.startswith("worktree ")
         ]
+
+    async def list_stale(self, db: Database) -> builtins.list[Worktree]:
+        """Worktrees eligible for GC — the impl-plan §6.5 contract
+        (``WorktreeManager.list_stale()``), backed by the canonical
+        ``girder.db.repo.find_stale_worktrees`` query: active worktree rows
+        whose attempt or task has reached a terminal state."""
+        return await repo.find_stale_worktrees(db)
 
     async def _branch_exists(self, branch: str) -> bool:
         result = await run_host_cmd(

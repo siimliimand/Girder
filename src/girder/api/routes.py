@@ -39,7 +39,7 @@ from girder.fsm import transition_run
 from girder.guard.redact import Redactor
 from girder.specs.amendment import AmendmentError, resolve_amendment
 from girder.specs.freeze import FreezeError, approve_and_freeze
-from girder.specs.validator import SpecValidationError, parse_spec
+from girder.specs.validator import OPENSPEC_TEMPLATE, SpecValidationError, parse_spec
 
 router = APIRouter()
 
@@ -66,7 +66,9 @@ async def _require_project(db: Database, project_id: str) -> Project:
     return project
 
 
-async def _run_context(db: Database, run_id: str) -> dict[str, object]:
+async def _run_context(
+    db: Database, run_id: str, *, redactor: Redactor | None = None
+) -> dict[str, object]:
     """Everything run.html and _run_panel.html need."""
     run = await _require_run(db, run_id)
     project = await _require_project(db, run.project_id)
@@ -80,6 +82,15 @@ async def _run_context(db: Database, run_id: str) -> dict[str, object]:
     pending_amendment = await repo.get_pending_amendment(db, run_id)
     roles = await repo.sum_token_usage_for_run(db, run_id)
     violations = await repo.list_integrity_violations_for_run(db, run_id)
+    # Diff viewer (§10): stored diffs were redacted at insert time, but
+    # historical views re-run through the SAME redactor as the live path.
+    diffs_by_task: dict[str, str] = {}
+    for d in await repo.list_attempt_diffs_for_run(db, run_id):
+        if d.task_id is None:
+            continue
+        text = d.diff_redacted if redactor is None else _redact(redactor, d.diff_redacted)
+        if text is not None:
+            diffs_by_task.setdefault(d.task_id, text)
     return {
         "run": run,
         "project": project,
@@ -90,14 +101,19 @@ async def _run_context(db: Database, run_id: str) -> dict[str, object]:
         "generation_error": failure,
         "pending_amendment": pending_amendment,
         "proposal_tasks": _proposal_task_rows(run.proposal_md),
+        "diffs_by_task": diffs_by_task,
     }
 
 
-def _estimate_ctx(app: Any, run: Run) -> dict[str, object]:
+def _estimate_ctx(app: Any, run: Run, project: Project) -> dict[str, object]:
     """Pre-approval cost estimate for the review panel (plan.md Phase 1)."""
     settings: Settings = app.state.settings
     budget: BudgetGuard = app.state.budget
-    return {"estimate_next_generation": _next_generation_estimate(settings, budget, run)}
+    return {
+        "estimate_next_generation": _next_generation_estimate(
+            settings, budget, run, Path(project.repo_path)
+        )
+    }
 
 
 def _proposal_task_rows(proposal: str | None) -> list[dict[str, Any]]:
@@ -123,16 +139,47 @@ def _proposal_task_rows(proposal: str | None) -> list[dict[str, Any]]:
     ]
 
 
-def _next_generation_estimate(settings: Settings, budget: BudgetGuard, run: Run) -> str:
+def _next_generation_prompt_chars(run: Run, repo_path: Path) -> int:
+    """Character count of the REAL next tier1 generation prompt.
+
+    Mirrors the SpecGenerator assembly (specs/generator.py): system framing
+    (untrusted-content rule + OpenSpec template) plus the user turn
+    (<user-intent> + untrusted README / file-listing blocks). Generator
+    internals are reused read-only — that file is owned by another workstream,
+    so we do not edit it; no model call is dispatched. Regenerate feedback is
+    not yet known at estimate time and is omitted (slight underestimate only).
+    """
+    from girder.specs import generator as spec_generator
+
+    system = spec_generator._SYSTEM_TEMPLATE.format(
+        untrusted_rule=spec_generator._UNTRUSTED_RULE,
+        template=OPENSPEC_TEMPLATE,
+    )
+    parts = [f"<user-intent>\n{run.intent}\n</user-intent>"]
+    readme = spec_generator._read_readme(repo_path)
+    if readme is not None:
+        parts.append(f'<untrusted-data source="README.md">\n{readme}\n</untrusted-data>')
+    listing = spec_generator._file_listing(repo_path)
+    if listing is not None:
+        parts.append(f'<untrusted-data source="file-listing">\n{listing}\n</untrusted-data>')
+    return len(system) + len("\n\n".join(parts))
+
+
+def _next_generation_estimate(
+    settings: Settings, budget: BudgetGuard, run: Run, repo_path: Path
+) -> str:
     """Best-effort USD estimate for the next tier1 generation call on *run*.
 
-    Uses the same BudgetGuard.preflight the gateway runs before dispatching;
-    renders ``n/a`` when no tier1 role is configured instead of failing.
+    Sized from the real next-call prompt assembly (system template + README +
+    intent — NOT the stored proposal, which does not exist on first review or
+    after Regenerate, exactly when the call is imminent). Feeds the same
+    BudgetGuard.preflight the gateway runs before dispatching; renders ``n/a``
+    when no tier1 role is configured instead of failing.
     """
     role = _tier1_role(settings)
-    if role is None or run.proposal_md is None:
+    if role is None:
         return "n/a"
-    decision = budget.preflight(role, len(run.proposal_md), run)
+    decision = budget.preflight(role, _next_generation_prompt_chars(run, repo_path), run)
     return f"${decision.est_cost_usd:.4f}"
 
 
@@ -261,10 +308,10 @@ async def create_run(
 @router.get("/runs/{rid}", response_class=HTMLResponse)
 async def run_page(request: Request, rid: str) -> HTMLResponse:
     db: Database = request.app.state.db
-    ctx = await _run_context(db, rid)
+    ctx = await _run_context(db, rid, redactor=request.app.state.redactor)
     run: Run = ctx["run"]  # type: ignore[assignment]
     ctx["graph"] = await _graph(db, run)
-    ctx.update(_estimate_ctx(request.app, run))
+    ctx.update(_estimate_ctx(request.app, run, ctx["project"]))  # type: ignore[arg-type]
     ctx = _panel_context(run, ctx)
     return render(request, "run.html", ctx)
 
@@ -272,8 +319,8 @@ async def run_page(request: Request, rid: str) -> HTMLResponse:
 @router.get("/runs/{rid}/panel", response_class=HTMLResponse)
 async def run_panel(request: Request, rid: str) -> HTMLResponse:
     db: Database = request.app.state.db
-    base = await _run_context(db, rid)
-    base.update(_estimate_ctx(request.app, base["run"]))  # type: ignore[arg-type]
+    base = await _run_context(db, rid, redactor=request.app.state.redactor)
+    base.update(_estimate_ctx(request.app, base["run"], base["project"]))  # type: ignore[arg-type]
     return render(request, "_run_panel.html", _panel_context(base["run"], base))  # type: ignore[arg-type]
 
 
@@ -442,7 +489,9 @@ async def _resolve_amendment_route(
             _panel_context(run, {**base, "errors": [str(exc)]}),
             status_code=409,
         )
-    return RedirectResponse(f"/runs/{rid}", status_code=303)
+    # Actions taken from the §10 Amendments inbox bounce back to their Referer
+    # (the inbox); run-page actions have no Referer and stay on the run page.
+    return RedirectResponse(request.headers.get("Referer") or f"/runs/{rid}", status_code=303)
 
 
 # ------------------------------------------------------------------------ JSON
@@ -486,6 +535,32 @@ async def run_amendments(request: Request, rid: str) -> JSONResponse:
                     "resolved_at": a.resolved_at,
                 }
                 for a in amendments
+            ]
+        }
+    )
+
+
+@router.get("/api/runs/{rid}/diffs")
+async def run_diffs(request: Request, rid: str) -> JSONResponse:
+    """Persisted attempt diffs of a run (§10 diff viewer), re-redacted through
+    the same redactor as the live event stream (plan §10)."""
+    app = request.app
+    db: Database = app.state.db
+    redactor: Redactor = app.state.redactor
+    await _require_run(db, rid)
+    diffs = await repo.list_attempt_diffs_for_run(db, rid)
+    return JSONResponse(
+        {
+            "diffs": [
+                {
+                    "attempt_id": d.attempt_id,
+                    "task_id": d.task_id,
+                    "base_commit": d.base_commit,
+                    "head_commit": d.head_commit,
+                    "diff": _redact(redactor, d.diff_redacted),
+                    "created_at": d.created_at,
+                }
+                for d in diffs
             ]
         }
     )
@@ -822,6 +897,34 @@ async def merge_queue_page(request: Request) -> HTMLResponse:
     )
 
 
+async def _amendments_inbox(db: Database) -> list[dict[str, Any]]:
+    """Pending amendments across all runs with run/project context (§10)."""
+    projects = {p.id: p for p in await repo.list_projects(db)}
+    rows: list[dict[str, Any]] = []
+    for a in await repo.list_pending_amendments(db):
+        r = await repo.get_run(db, a.run_id)
+        project = projects[r.project_id] if r is not None and r.project_id in projects else None
+        rows.append(
+            {
+                "amendment_id": a.id,
+                "run_id": a.run_id,
+                "project_id": project.id if project else None,
+                "project_name": project.name if project else a.run_id,
+                "intent": _excerpt(r.intent, 80) if r else None,
+                "task_id": a.task_id,
+                "reason": a.reason,
+                "suggested_change": a.suggested_change,
+            }
+        )
+    return rows
+
+
+@router.get("/amendments", response_class=HTMLResponse)
+async def amendments_page(request: Request) -> HTMLResponse:
+    db: Database = request.app.state.db
+    return render(request, "amendments.html", {"pending": await _amendments_inbox(db)})
+
+
 @router.post("/api/runs/{rid}/reviewed", response_model=None)
 async def mark_merge_reviewed(request: Request, rid: str) -> HTMLResponse | RedirectResponse:
     """Produce the ``merge_reviewed`` event the T1 review window counts
@@ -1028,6 +1131,12 @@ async def postmortem(request: Request, rid: str) -> HTMLResponse:
     run = await _require_run(db, rid)
     project = await _require_project(db, run.project_id)
     events = await repo.list_events_for_run(db, rid, after_id=0, limit=100000)
+    # Diff viewer (§10): stored diffs re-redacted through the same redactor as
+    # the live path (plan §10).
+    diff_by_attempt = {
+        d.attempt_id: _redact(redactor, d.diff_redacted) or ""
+        for d in await repo.list_attempt_diffs_for_run(db, rid)
+    }
 
     task_views: list[dict[str, Any]] = []
     for t in await repo.list_tasks_for_run(db, rid):
@@ -1060,6 +1169,7 @@ async def postmortem(request: Request, rid: str) -> HTMLResponse:
             attempt_views.append(
                 {
                     "attempt": a,
+                    "diff": diff_by_attempt.get(a.id),
                     "tool_calls": tool_calls,
                     "prompts": prompts,
                     "usage": await repo.list_token_usage_for_attempt(db, a.id),

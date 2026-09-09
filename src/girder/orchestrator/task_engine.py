@@ -8,10 +8,12 @@ attempts. Per attempt (§5.5 — park state first, act after):
 3. the Layer-2 anchor (``tasks.test_content_hash``) captured from a
    :class:`~girder.gitops.audit.TestManifest` taken BEFORE the agent acts,
 4. the agent turn loop runs inside the sandbox,
-5. on success the suite runs in the same container, then Layer 2/3
-   :class:`~girder.gitops.audit.DiffAudit` checks the observed diff against
-   declared intent, and only a fully green audit reaches the ff-only
-   audit-gated merge onto the run branch.
+5. on success the suite runs in the same container, the container is then
+   killed (D10: the orchestrator-side audit must observe a quiesced
+   worktree — a hostile agent must not be able to mutate it between audit
+   and merge), Layer 2/3 :class:`~girder.gitops.audit.DiffAudit` checks the
+   observed diff against declared intent, and only a fully green audit
+   reaches the ff-only audit-gated merge onto the run branch.
 
 Integrity violations (plan §8.2) fail WITHOUT retry and never merge.
 Gateway budget exceptions (:class:`~girder.budget.guard.BudgetExceeded`)
@@ -51,7 +53,7 @@ from girder.fsm import InvalidTransition, transition_attempt, transition_task
 from girder.gitops.audit import AuditResult, DiffAudit, TestManifest
 from girder.gitops.branch import BranchOps
 from girder.gitops.worktree import DEFAULT_BASE, WorktreeManager, WorktreeRef
-from girder.guard.redact import Redactor
+from girder.guard.redact import Redactor, redact_and_log
 from girder.guard.scope import TaskScopes
 from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
@@ -305,6 +307,15 @@ class TaskEngine:
                 )
                 return TaskOutcome("amendment_pending")
 
+            if outcome.status == "integrity_violation":
+                # §8.2: the terminal turn was tainted by a held scope
+                # violation — the "completion" rests on work the registry
+                # never executed. The ledger row was already written by the
+                # tool registry (exactly once); fail without retry here.
+                reason = outcome.failure_reason or "held call in the terminal turn"
+                await self._fail_without_retry(run, fresh, attempt, reason)
+                return TaskOutcome("integrity_violation", reason)
+
             if outcome.status == "succeeded":
                 if step is None:  # pragma: no cover - defensive
                     raise RuntimeError("succeeded outcome without a verify step")
@@ -406,6 +417,17 @@ class TaskEngine:
                 log.exception("failed to prune worktree %s", wt_path)
         await repo.update_attempt_fields(self.db, attempt.id, ended_at=utcnow_iso())
 
+    async def _kill_attempt_container(self, container: str) -> None:
+        """Kill one attempt's container and its RO test snapshots, best-effort.
+
+        Idempotent: the engine-level ``finally`` teardown repeats both steps
+        (a second kill is a no-op, the snapshot map entry is already gone).
+        """
+        with suppress(Exception):
+            await self.sandbox.kill(container)
+        for snapshot_dir in self._snapshot_dirs.pop(container, []):
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+
     async def _worktree_row(self, attempt_id: str) -> Worktree | None:
         for row in await repo.list_worktrees(self.db):
             if row.attempt_id == attempt_id:
@@ -453,7 +475,15 @@ class TaskEngine:
                 run, task, attempt, tail, event="verify_failed", note="verification suite failed"
             )
 
-        # Suite green — Layer 2/3 mechanical audit of the observed diff.
+        # Suite green — kill the container BEFORE any orchestrator-side audit
+        # (plan.md D10 / Phase 0 task 5): a hostile agent could plant a
+        # delayed background process that mutates the worktree between the
+        # audit and the merge; the audit must observe a quiesced tree. The
+        # suite itself ran in-container above. The engine-level `finally` in
+        # execute_task stays as the backstop kill on every other path.
+        await self._kill_attempt_container(container)
+
+        # Layer 2/3 mechanical audit of the observed diff.
         audit = await self._audit.audit_attempt(
             worktree.path,
             task_type=task.task_type,
@@ -503,6 +533,28 @@ class TaskEngine:
                 head.stdout.strip(),
             ],
             timeout_s=30,
+        )
+        # Persist the attempt diff for the console diff viewer (migration 012,
+        # impl-plan §10): caller redacts before insert (repo contract).
+        diff_res = await run_host_cmd(
+            ["git", "-C", str(worktree.path), "diff", f"{base_commit}..{head.stdout.strip()}"],
+            timeout_s=30,
+        )
+        diff_redacted = await redact_and_log(
+            self.redactor,
+            diff_res.stdout,
+            source_field="attempt_diff",
+            db=self.db,
+            attempt_id=attempt.id,
+        )
+        await repo.insert_attempt_diff(
+            self.db,
+            attempt_id=attempt.id,
+            task_id=task.id,
+            run_id=run.id,
+            base_commit=base_commit,
+            head_commit=head.stdout.strip(),
+            diff_redacted=diff_redacted,
         )
         if not integrate:
             # Wave mode (Phase 4): stop at verify_passed. The branch tip is

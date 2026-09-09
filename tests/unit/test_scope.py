@@ -241,3 +241,96 @@ def test_run_command_unparsable_shell_falls_back_to_allow(scopes: TaskScopes) ->
     assert check_tool_call("run_command", {"cmd": "echo 'unbalanced"}, scopes) is (
         Verdict.ALLOW
     )
+
+
+# ------------------------------------------------------- apply_patch diff body
+
+
+def _patch(*lines: str) -> dict[str, object]:
+    return {"path": "src/widget.py", "unified_diff": "\n".join(lines)}
+
+
+def test_apply_patch_in_scope_diff_allowed(scopes: TaskScopes) -> None:
+    diff = _patch(
+        "--- a/src/widgets/new.py",
+        "+++ b/src/widgets/new.py",
+        "@@ -1 +1 @@",
+        "-old",
+        "+new",
+    )
+    assert check_tool_call("apply_patch", diff, scopes) is Verdict.ALLOW
+
+
+def test_apply_patch_diff_targeting_out_of_scope_path_is_violation(
+    scopes: TaskScopes,
+) -> None:
+    # declared path is in scope, but the diff body sneaks in a test-signal
+    # file (SC-02 shape): the whole call must be held
+    diff = _patch(
+        "--- a/src/widget.py",
+        "+++ b/src/widget.py",
+        "--- /dev/null",
+        "+++ b/tests/test_evade.py",
+        "+def test_x(): pass",
+    )
+    assert check_tool_call("apply_patch", diff, scopes) is Verdict.VIOLATION
+
+
+def test_apply_patch_diff_targeting_protected_path_is_violation(
+    scopes: TaskScopes,
+) -> None:
+    diff = _patch(
+        "--- a/.github/workflows/ci.yml",
+        "+++ b/.github/workflows/ci.yml",
+        "-on: push",
+    )
+    assert check_tool_call("apply_patch", diff, scopes) is Verdict.VIOLATION
+
+
+def test_apply_patch_devnull_lines_are_skipped(scopes: TaskScopes) -> None:
+    diff = _patch(
+        "--- /dev/null",
+        "+++ b/src/widgets/created.py\t2026-01-01 00:00:00",
+        "+x = 1",
+    )
+    assert check_tool_call("apply_patch", diff, scopes) is Verdict.ALLOW
+    # a delete (--- real path, +++ /dev/null) is still a write target
+    delete = _patch(
+        "--- a/src/other.py",
+        "+++ /dev/null",
+    )
+    assert check_tool_call("apply_patch", delete, scopes) is Verdict.VIOLATION
+
+
+def test_apply_patch_diff_path_escape_is_violation(scopes: TaskScopes) -> None:
+    diff = _patch(
+        "--- a/../evil.py",
+        "+++ b/../evil.py",
+        "-x",
+        "+y",
+    )
+    assert check_tool_call("apply_patch", diff, scopes) is Verdict.VIOLATION
+
+
+def test_apply_patch_unparsable_diff_falls_back_to_declared_path(
+    scopes: TaskScopes,
+) -> None:
+    """No parseable +++/--- targets: the declared-path policy applies alone."""
+    no_targets = _patch("this is not a diff")
+    assert check_tool_call("apply_patch", no_targets, scopes) is Verdict.ALLOW
+    assert (
+        check_tool_call(
+            "apply_patch", {"path": "README.md", "unified_diff": "not a diff"}, scopes
+        )
+        is Verdict.VIOLATION
+    )
+
+
+def test_apply_patch_quoted_paths_unquoted(scopes: TaskScopes) -> None:
+    diff = _patch(
+        '--- "a/src/widgets/q.py"',
+        '+++ "b/src/widgets/q.py"',
+        "-x",
+        "+y",
+    )
+    assert check_tool_call("apply_patch", diff, scopes) is Verdict.ALLOW

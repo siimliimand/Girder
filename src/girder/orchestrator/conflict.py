@@ -14,8 +14,8 @@ autonomy tier:
 
 Attempts are capped at ``limits.conflict_resolution_attempts`` (default 2).
 If the cap is exhausted, an integrity violation shows up in the resolution,
-or the targeted review flags major/catastrophic, the caller drops the task
-from the wave and escalates to the user regardless of tier.
+or the targeted review flags any concern (or major/catastrophic), the caller
+drops the task from the wave and escalates to the user regardless of tier.
 
 The agent works in a detached worktree the orchestrator created: for a
 ``git_conflict`` the orchestrator pre-stages ``git merge --no-commit`` so the
@@ -61,7 +61,9 @@ from girder.util import run_host_cmd, utcnow_iso
 log = logging.getLogger(__name__)
 
 # Severity bar for the targeted hunk review: none/minor pass, anything above
-# fails the attempt (plan.md: a flagged resolution drops the task).
+# fails the attempt — and ANY non-empty concerns list fails too, independent
+# of severity (plan.md Phase 4 task 5: a resolution the review "flags a
+# concern" on drops/escalates at every tier).
 _PASSING_SEVERITIES = frozenset({"none", "minor"})
 
 
@@ -311,7 +313,11 @@ class ConflictResolver:
                 await self._close_failed(attempt, f"hunk review unparseable: {exc}")
                 return ("failed", None, f"hunk review failed to produce a verdict: {exc}")
 
-            if (not verdict.resolution_sound) or verdict.severity not in _PASSING_SEVERITIES:
+            # Spec-strict gate (plan.md Phase 4 task 5): a verdict that flags
+            # ANY concern makes the resolution unsound regardless of severity;
+            # the severity bar remains an independent floor.
+            unsound = (not verdict.resolution_sound) or bool(verdict.concerns)
+            if unsound or verdict.severity not in _PASSING_SEVERITIES:
                 detail = self._redact(
                     f"severity={verdict.severity}: {verdict.summary} "
                     f"concerns={'; '.join(verdict.concerns)}"

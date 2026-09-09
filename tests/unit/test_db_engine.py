@@ -17,7 +17,7 @@ async def test_fresh_boot_applies_all_migrations(tmp_path: Path) -> None:
     try:
         rows = await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         versions = [r["version"] for r in rows]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         # every table from the DDL exists
         for table in (
             "projects",
@@ -67,7 +67,7 @@ async def test_open_creates_missing_parent_dirs(tmp_path: Path) -> None:
     db = await Database.open(path, migrations_dir=default_migrations_dir())
     try:
         applied = await db.fetchall("SELECT version FROM schema_migrations")
-        assert [r["version"] for r in applied] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert [r["version"] for r in applied] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     finally:
         await db.close()
     assert path.is_file()
@@ -77,7 +77,7 @@ async def test_memory_db_creates_no_file(tmp_path: Path) -> None:
     db = await Database.open(":memory:", migrations_dir=default_migrations_dir())
     try:
         r = await db.fetchone("SELECT COUNT(*) AS c FROM schema_migrations")
-        assert r["c"] == 11
+        assert r["c"] == 12
     finally:
         await db.close()
     assert list(tmp_path.iterdir()) == []  # noqa: ASYNC240
@@ -90,7 +90,7 @@ async def test_reopen_is_idempotent(tmp_path: Path) -> None:
     db2 = await Database.open(path, migrations_dir=default_migrations_dir())
     try:
         applied = await db2.fetchall("SELECT version FROM schema_migrations")
-        assert len(applied) == 11  # nothing re-applied
+        assert len(applied) == 12  # nothing re-applied
     finally:
         await db2.close()
 
@@ -219,6 +219,8 @@ async def test_migration_008_retries_after_mid_script_crash(tmp_path: Path) -> N
             -- rewind Sprint 6 hardening migration 011 artifacts
             ALTER TABLE tool_calls DROP COLUMN verdict;
             DROP TABLE attempt_prompts;
+            -- rewind migration 012 artifacts so the replay re-creates them
+            DROP TABLE attempt_diffs;
             """
         )
     finally:
@@ -230,7 +232,7 @@ async def test_migration_008_retries_after_mid_script_crash(tmp_path: Path) -> N
             r["version"]
             for r in await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         # final schema matches the clean boot
         assert await _schema_fingerprint(db, "token_usage") == ref_usage
         assert await _schema_fingerprint(db, "runs") == ref_runs
@@ -269,6 +271,8 @@ async def test_poisoned_duplicate_column_self_heals(tmp_path: Path) -> None:
             ALTER TABLE notifications_log DROP COLUMN run_id;
             ALTER TABLE tool_calls DROP COLUMN verdict;
             DROP TABLE attempt_prompts;
+            -- migration 012 artifact rolled back with the "lost" transaction
+            DROP TABLE attempt_diffs;
             """
         )
     finally:
@@ -280,7 +284,7 @@ async def test_poisoned_duplicate_column_self_heals(tmp_path: Path) -> None:
             r["version"]
             for r in await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         assert await _schema_fingerprint(db, "attempt_prompts") == ref_prompts
     finally:
         await db.close()

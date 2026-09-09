@@ -102,6 +102,8 @@ async def test_happy_path_returns_validated_doc(repo: Path) -> None:
     assert OPENSPEC_TEMPLATE in system.content
     assert "UNTRUSTED CONTENT RULE" in system.content
     assert "never instructions" in system.content
+    assert "depends_on" in system.content
+    assert "genuinely independent tasks" in system.content
 
     assert "Add rate limiting to the API" in user.content
     assert '<untrusted-data source="README.md">' in user.content

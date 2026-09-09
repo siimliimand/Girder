@@ -187,3 +187,109 @@ async def test_recovery_prunes_worktree_row_with_missing_path(crashed_state) -> 
     fresh_task = await repo.get_task(db, crashed_state["task"].id)
     assert fresh_task is not None
     assert fresh_task.status == TaskStatus.RETRY_SCHEDULED
+
+
+# ------------------------------------------------ delivery-state branch repair
+
+
+async def _delivery_run(
+    db: Database, tmp_path: Path, status: str = RunStatus.PR_OPEN.value
+) -> dict[str, object]:
+    """A repo whose run branch exists only on a bare origin, with the run
+    parked in a delivery state (branch deleted locally to simulate the loss)."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    await _git(repo_dir, "init", "-b", "main")
+    await _git(repo_dir, "config", "user.email", "t@t")
+    await _git(repo_dir, "config", "user.name", "t")
+    (repo_dir / "app.py").write_text("v1\n")
+    await _git(repo_dir, "add", "-A")
+    await _git(repo_dir, "commit", "-m", "init")
+    await _git(repo_dir, "branch", "run/del1")
+
+    bare = tmp_path / "origin.git"
+    await _git(tmp_path, "init", "--bare", "-b", "main", str(bare))
+    await _git(repo_dir, "remote", "add", "origin", str(bare))
+    await _git(repo_dir, "push", "-q", "origin", "main", "run/del1")
+    # The PR head commit is NOT local main: it is ahead of it.
+    await _git(repo_dir, "checkout", "-q", "run/del1")
+    (repo_dir / "feature.py").write_text("f = 1\n")
+    await _git(repo_dir, "add", "-A")
+    await _git(repo_dir, "commit", "-m", "pr work")
+    remote_tip = await _git_out(repo_dir, "rev-parse", "run/del1")
+    await _git(repo_dir, "push", "-q", "origin", "run/del1")
+    await _git(repo_dir, "checkout", "-q", "main")
+    await _git(repo_dir, "branch", "-D", "run/del1")
+
+    project = await repo.create_project(db, "del-test", str(repo_dir))
+    run = await repo.create_run(db, project.id, "intent", "run/del1", 5.0)
+    await seed_run_status(db, run.id, status)
+    return {"db": db, "repo_dir": repo_dir, "run_id": run.id, "remote_tip": remote_tip}
+
+
+async def test_delivery_branch_restored_from_remote(db: Database, tmp_path: Path) -> None:
+    """A delivery-state run with a missing local branch is restored from the
+    remote head (NOT recreated at main), and the action is audited."""
+    ctx = await _delivery_run(db, tmp_path)
+    repo_dir: Path = ctx["repo_dir"]  # type: ignore[assignment]
+
+    service = RecoveryService(db, Settings())
+    report = await service.recover()
+
+    assert report.restored_branches == ["run/del1"]
+    assert report.recreated_branches == []
+    tip = await _git_out(repo_dir, "rev-parse", "run/del1")
+    assert tip == ctx["remote_tip"], "branch must be at the remote (PR) head"
+    event = await repo.get_latest_event(db, str(ctx["run_id"]), "run_branch_restored_from_remote")
+    assert event is not None
+
+
+async def test_delivery_branch_without_remote_left_for_operator(
+    db: Database, tmp_path: Path
+) -> None:
+    """No reachable remote: the branch is NOT rebuilt at main; an audit event
+    is written, the recovery report + notification flag it for a human."""
+    ctx = await _delivery_run(db, tmp_path)
+    repo_dir: Path = ctx["repo_dir"]  # type: ignore[assignment]
+    await _git(repo_dir, "remote", "remove", "origin")
+
+    sent: list[tuple[str, str, str]] = []
+
+    class FakeNotifier:
+        async def notify(self, level: str, title: str, body: str, **_: object) -> None:
+            sent.append((level, title, body))
+
+    service = RecoveryService(db, Settings(), notifier=FakeNotifier())  # type: ignore[arg-type]
+    report = await service.recover()
+
+    assert report.attention_branches == ["run/del1"]
+    assert report.restored_branches == []
+    assert report.recreated_branches == []
+    probe = await run_host_cmd(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", "-q", "run/del1"],
+        check=False,
+        timeout_s=30,
+    )
+    assert probe.returncode != 0  # never silently rebuilt at main
+    event = await repo.get_latest_event(db, str(ctx["run_id"]), "run_branch_unrestorable")
+    assert event is not None
+    assert report.anything_recovered
+    assert sent, "recovery report notification must go out"
+    assert "operator attention" in sent[0][2]
+
+
+async def test_worktree_manager_list_stale_is_the_65_contract(crashed_state) -> None:
+    """impl-plan §6.5 ``WorktreeManager.list_stale()`` delegates to the repo's
+    find_stale_worktrees query: active rows whose attempt/task went terminal."""
+    db: Database = crashed_state["db"]
+    manager = WorktreeManager(crashed_state["repo_dir"], base=crashed_state["base"])
+
+    # Attempt still RUNNING: nothing stale yet.
+    assert await manager.list_stale(db) == []
+
+    await transition_attempt(
+        db, crashed_state["attempt"].id, AttemptStatus.CRASHED, payload={"reason": "test"}
+    )
+    stale = await manager.list_stale(db)
+    assert [w.path for w in stale] == [str(crashed_state["worktree"])]
+    assert stale[0].attempt_id == crashed_state["attempt"].id

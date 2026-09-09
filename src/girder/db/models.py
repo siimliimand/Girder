@@ -207,6 +207,22 @@ class Worktree:
 
 
 @dataclass
+class AttemptDiff:
+    """One persisted attempt diff (migration 012, §10 diff viewer).
+
+    ``diff_redacted`` is stored as given — callers redact before persisting.
+    """
+
+    attempt_id: str
+    run_id: str
+    base_commit: str
+    head_commit: str
+    diff_redacted: str
+    created_at: str
+    task_id: str | None = None
+
+
+@dataclass
 class AttemptPrompt:
     """One per-turn prompt snapshot (migration 011, plan.md Phase 5 task 5).
 

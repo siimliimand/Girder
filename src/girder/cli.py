@@ -112,8 +112,20 @@ async def cmd_web(args: argparse.Namespace) -> int:
     )
     host = args.host if args.host is not None else settings.web.host
     port = args.port if args.port is not None else settings.web.port
-    log.info("girder web listening on http://%s:%s (db=%s)", host, port, args.db)
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    uds = getattr(args, "unix_socket", None) or settings.web.unix_socket
+    if uds is not None:
+        # UDS bind (§10: "or UDS /run/girder.sock"): clear a stale socket from
+        # a previous crash and make sure the parent directory exists.
+        socket_path = Path(uds)
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        # Startup-only path: unlinking a stale socket here is fine.
+        if os.path.lexists(uds):  # noqa: ASYNC240
+            os.unlink(uds)
+        log.info("girder web listening on uds://%s (db=%s)", uds, args.db)
+        config = uvicorn.Config(app, uds=uds, log_level="info")
+    else:
+        log.info("girder web listening on http://%s:%s (db=%s)", host, port, args.db)
+        config = uvicorn.Config(app, host=host, port=port, log_level="info")
     await uvicorn.Server(config).serve()
     return 0
 
@@ -432,6 +444,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     web_parser.add_argument(
         "--port", type=int, default=None, help="bind port (default: settings.web.port)"
+    )
+    web_parser.add_argument(
+        "--unix-socket",
+        dest="unix_socket",
+        default=None,
+        help="bind a Unix domain socket instead of host/port (default: settings.web.unix_socket)",
     )
     review_parser = sub.add_parser(
         "review", help="mark a merged run as human-reviewed (T1 review window, §2.3)"

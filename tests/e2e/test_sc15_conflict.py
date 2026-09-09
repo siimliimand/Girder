@@ -273,3 +273,71 @@ async def test_sc15_resolution_exhausted_drops_task_and_escalates(make_ctx: Make
 
     # No resolution ever succeeded.
     assert await repo.get_latest_event(ctx.db, ctx.run.id, "conflict_resolved") is None
+
+
+MINOR_CONCERN_VERDICT = json.dumps(
+    {
+        "resolution_sound": True,
+        "concerns": ["the resolution may drop task B's clamping on empty input"],
+        "severity": "minor",
+        "summary": "looks fine, one nagging concern",
+    }
+)
+
+
+async def test_sc15_minor_severity_with_concerns_drops_and_escalates(
+    make_ctx: MakeCtx,
+) -> None:
+    """plan.md Phase 4 task 5, strict reading: a hunk review that flags ANY
+    concern drops/escalates regardless of severity — even a sound resolution
+    with severity=minor and a non-empty concerns list."""
+    ctx, (_task_a, task_b) = await _seed_conflicting_run(make_ctx)
+
+    def resolve_turns(tag: str) -> list[object]:
+        return [
+            resp(calls=[tc(f"{tag}1", "read_file", '{"path":"calculator.py"}')]),
+            resp(calls=[tc(f"{tag}2", "write_file",
+                           json.dumps({"path": "calculator.py",
+                                       "content": CALC_RESOLVED}))]),
+            resp(calls=[tc(f"{tag}3", "run_command",
+                           '{"cmd":"git add -A && git commit -m \'resolve conflict\'"}')]),
+            resp(calls=[tc(f"{tag}4", "mark_task_complete", '{"summary":"merged hunks"}')]),
+        ]
+
+    # Key order matters: resolution-turn messages carry BOTH the task slice
+    # ("Clamp calculator bounds") and the resolution guidance, so the
+    # resolution route must be checked BEFORE the task-title routes.
+    gateway = FakeGateway(
+        responses=[],
+        routes={
+            "conflict resolution attempt": [
+                *resolve_turns("p1"),
+                *resolve_turns("p2"),
+            ],
+            # Both resolution attempts get a flagged (minor + concerns) verdict.
+            "resolution hunk": [
+                resp(content=MINOR_CONCERN_VERDICT),
+                resp(content=MINOR_CONCERN_VERDICT),
+            ],
+            TASK_A_TITLE: write_commit_of("calculator.py", CALC_A, tc_id="a"),
+            TASK_B_TITLE: write_commit_of("calculator.py", CALC_B, tc_id="b"),
+        },
+    )
+    descriptor = await _pump_to_stop(ctx, gateway)
+    assert descriptor == "escalated"
+
+    fresh_run = await repo.get_run(ctx.db, ctx.run.id)
+    assert fresh_run is not None and fresh_run.status is RunStatus.ESCALATED
+    fresh_b = await repo.get_task(ctx.db, task_b.id)
+    assert fresh_b is not None and fresh_b.status is TaskStatus.DROPPED
+
+    # Both attempts were reviewed; neither verdict was accepted.
+    review_calls = [m for m in gateway.calls if "resolution hunk" in first_user_content(m)]
+    assert len(review_calls) == 2
+    assert await repo.get_latest_event(ctx.db, ctx.run.id, "conflict_resolved") is None
+
+    # Wave branch rolled back: first task's content, no merge commits.
+    wave_branch = f"wave/{ctx.run.id[:8]}/w0"
+    tip = (await git(ctx.repo_path, "rev-parse", wave_branch)).strip()
+    assert (await git(ctx.repo_path, "show", f"{tip}:calculator.py")) == CALC_A
+    assert not (await git(ctx.repo_path, "rev-list", "--merges", wave_branch)).split()

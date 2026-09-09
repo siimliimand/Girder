@@ -174,6 +174,50 @@ async def test_scope_violation_holds_but_attempt_continues(
     assert any("held for review" in m.content for m in final_messages)
 
 
+async def test_terminal_turn_with_held_call_is_integrity_violation(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """§8.5: mark_task_complete in the SAME turn as a held scope violation is
+    not a clean completion — the attempt must fail without retry, and the
+    integrity ledger row (written by the registry) must appear exactly once."""
+    db, run_id, _attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(
+                calls=[
+                    _tc("1", "write_file", '{"path":"src/a.py","content":"ok"}'),
+                    _tc("2", "write_file", '{"path":"tests/test_x.py","content":"boom"}'),
+                    _tc("3", "mark_task_complete", '{"summary":"done"}'),
+                ]
+            ),
+        ]
+    )
+    sandbox = FakeSandbox()
+    outcome = await _runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
+    assert outcome.status == "integrity_violation"
+    # the in-scope write executed (mkdir + write), nothing else ran
+    assert len(sandbox.execs) == 2
+    violations = await db.fetchall("SELECT kind FROM integrity_violations")
+    assert [v["kind"] for v in violations] == ["out_of_scope_write"]  # exactly once
+    assert await repo.get_latest_event(db, run_id, "attempt_finished") is not None
+
+
+async def test_held_call_in_earlier_turn_then_clean_terminal_stays_succeeded(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """A held call in an EARLIER turn followed later by a clean terminal turn
+    is NOT tainted: it stays succeeded (surfaced via the ledger + gate)."""
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "write_file", '{"path":"tests/test_x.py","content":"x"}')]),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"ok"}')]),
+        ]
+    )
+    outcome = await _runtime(seeded, gateway, FakeSandbox()).execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+
+
 async def test_malformed_arguments_yield_synthetic_error(
     seeded: tuple[Database, str, Attempt, Task],
 ) -> None:

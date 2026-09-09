@@ -128,10 +128,12 @@ class SpecsConfig(BaseModel):
 
 
 class WebConfig(BaseModel):
-    """Approval web UI bind address (impl-plan §10): loopback-only by default."""
+    """Approval web UI bind address (impl-plan §10): loopback-only by default,
+    or a Unix domain socket (``unix_socket``) instead of host/port."""
 
     host: str = "127.0.0.1"
     port: int = 8787
+    unix_socket: str | None = None
 
 
 class ModelsConfig(BaseModel):

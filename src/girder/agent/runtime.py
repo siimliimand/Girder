@@ -53,7 +53,8 @@ class _MidTurnDeadline(RuntimeError):
 
 @dataclass(frozen=True)
 class AttemptOutcome:
-    status: str  # "succeeded" | "failed" | "timeout" | "amendment_requested"
+    status: str  # "succeeded" | "failed" | "timeout" | "amendment_requested" |
+    # "integrity_violation" (terminal turn tainted by a held call)
     summary: str | None
     failure_reason: str | None
     turns_used: int
@@ -219,6 +220,20 @@ class AgentRuntime:
             terminal = self._terminal_of(calls)
             if terminal is not None:
                 name, args = terminal
+                # §8.5/D11: a terminal tool declared in the SAME turn as a
+                # held (violated) call is not a clean completion — the held
+                # call never executed, so "done" rests on work the
+                # orchestrator refused to run. Fail without retry; the
+                # integrity ledger row was already written by the registry.
+                # A held call in an EARLIER turn followed by a clean terminal
+                # turn stays as-is (surfaced via the ledger + delivery gate).
+                if any(result.held for _, _, result in calls):
+                    return await self._finish(
+                        "integrity_violation",
+                        None,
+                        "terminal tool called in the same turn as a held call",
+                        turns_used,
+                    )
                 if name == "mark_task_complete":
                     return await self._finish(
                         "succeeded", str(args.get("summary", "")), None, turns_used

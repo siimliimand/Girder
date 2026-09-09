@@ -4,7 +4,11 @@ Verdict policy (resolved ambiguity R2 of the implementation plan):
 
 * **Writes** (``write_file``, ``apply_patch``) must fall inside the task's
   declared ``scope_globs`` — otherwise ``VIOLATION`` (intercepted, never
-  executed, logged as an integrity-relevant event).
+  executed, logged as an integrity-relevant event). For ``apply_patch`` the
+  declared ``path`` argument alone is not enough: every ``+++``/``---``
+  target in the unified diff body is a write path and is checked with the
+  same policy BEFORE execution (§8.5: every write path is checked before
+  execution). Any violating target holds the whole call.
 * **Reads** (``read_file``, ``ripgrep``, ``find_files``,
   ``view_symbol_outline``) are ``ALLOW_LOGGED`` anywhere inside the worktree —
   dynamic discovery (D6) requires it — *except* protected paths
@@ -251,6 +255,28 @@ def _exists_under_root(rel: str, root: str) -> bool:
     return os.path.exists(p) or os.path.isdir(os.path.dirname(p) or "/")
 
 
+def diff_target_paths(diff: str) -> list[str]:
+    """Extract write targets from a unified diff body (§8.5/D11).
+
+    Parses ``+++``/``---`` lines: ``/dev/null`` (pure create/delete) is
+    skipped, ``a/``/``b/`` prefixes are stripped, a trailing tab-separated
+    timestamp is dropped, and quotes (``core.quotePath``-style) are removed.
+    A diff with no parseable targets yields an empty list — the caller then
+    falls back to the declared-path policy alone.
+    """
+    targets: list[str] = []
+    for line in diff.splitlines():
+        if not line.startswith(("+++ ", "--- ")):
+            continue
+        path = line[4:].split("\t", 1)[0].strip().strip('"')
+        if not path or path == "/dev/null":
+            continue
+        if path.startswith(("a/", "b/")):
+            path = path[2:]
+        targets.append(path)
+    return targets
+
+
 def check_tool_call(tool: str, args: dict[str, object], scopes: TaskScopes) -> Verdict:
     """The single scope decision point run before any tool executes."""
     arg_name = _WRITE_TOOLS.get(tool) or _READ_TOOLS.get(tool)
@@ -280,7 +306,21 @@ def check_tool_call(tool: str, args: dict[str, object], scopes: TaskScopes) -> V
         return Verdict.VIOLATION
 
     if tool in _WRITE_TOOLS:
-        return Verdict.ALLOW if _matches_any(rel, scopes.write_globs) else Verdict.VIOLATION
+        if not _matches_any(rel, scopes.write_globs):
+            return Verdict.VIOLATION
+        if tool == "apply_patch":
+            # The declared path is not the only write target: every file the
+            # diff body touches is written when the patch applies. One
+            # violating target holds the whole call (§8.5).
+            for raw_target in diff_target_paths(str(args.get("unified_diff", ""))):
+                trel = resolve_path(raw_target, scopes.root)
+                if trel is None:
+                    return Verdict.VIOLATION  # escape attempt inside the diff
+                if _matches_any(trel, scopes.protected_globs):
+                    return Verdict.VIOLATION
+                if not _matches_any(trel, scopes.write_globs):
+                    return Verdict.VIOLATION
+        return Verdict.ALLOW
 
     # read tools
     if scopes.strict_read_scope:

@@ -736,6 +736,10 @@ Sprint numbering matches plan.md §11. Each WP lists deliverables (files), DoD, 
 | R7 | "OpenSpec CLI validation" | In-process structural validator; optional `openspec` CLI shell-out | Removes a hard external dep while keeping the CLI path |
 | R8 | Token counting for pre-flight | `chars/4` heuristic, tokenizer pluggable | Exact tokenizers are model-specific; estimate only needs conservatism |
 | R9 | SQLite access model | aiosqlite, single-writer `BEGIN IMMEDIATE` behind one lock | Matches §5.5 ordering; avoids WAL-era writer storms (single-user anyway) |
+| R10 | §Phase 3 task 2: `PyGithub` wrapped in `GitHubClient` | Thin `httpx` wrapper (`github/client.py`) speaking the REST endpoints the delivery pipeline needs, with redacted call logging | PyGithub pulls a large sync-only dependency surface for a handful of calls; the wrapper keeps the same credential and logging guarantees (see the `client.py` docstring) |
+| R11 | spec §3.1: sandbox `network="private"` means slirp4netns, loopback only | `network="private"` maps to the Podman **default bridge** network (see `sandbox/podman.py`) | slirp4netns is the rootless *port-publishing* path, not a network mode; the default bridge gives the needed private network without the loopback-only restriction the spec misdescribed |
+| R12 | §2: CLI verbs `init/run/status/tier` | Replaced by the web API (§10); the actual CLI is `migrate / recover / gc / daemon / pump / web / review` | Run lifecycle belongs in the single-writer daemon behind the console; the CLI stays an operations surface |
+| R13 | §1: FastAPI + Jinja2 + HTMX (R5) | Console is Jinja2 + minimal vanilla JS + SSE | R5's intent — no React, no build chain — is met without an HTMX dependency; server-rendered fragments do the same job |
 
 **Decisions defaulted here but worth explicit user confirmation:** Telegram-first vs Discord-first notifications; fine-grained PAT vs GitHub App for delivery; runner hardware (bare metal vs cloud VM) — defaults: Telegram, PAT, existing Linux box with rootless podman.
 

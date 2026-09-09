@@ -10,7 +10,7 @@ import pytest
 
 from girder.config import GithubConfig, Secrets, Settings
 from girder.db.engine import Database
-from girder.github.client import GitHubClient, GitHubError, parse_owner_repo
+from girder.github.client import GitHubClient, GitHubError, _askpass_script, parse_owner_repo
 from girder.guard.redact import Redactor
 from girder.util import run_host_cmd
 
@@ -93,6 +93,82 @@ async def test_push_token_never_in_argv_or_git_config(tmp_path: Path, db: Databa
     cfg = await run_host_cmd(["git", "-C", str(repo), "config", "--list"],
                              check=False, timeout_s=30)
     assert TOKEN not in cfg.stdout
+    await client.aclose()
+
+
+# ------------------------------------------------- askpass helper (HTTPS push)
+
+def test_askpass_answers_username_and_password_prompts(tmp_path: Path) -> None:
+    """GitHub over HTTPS prompts Username FIRST; the helper must answer both
+    prompts (x-access-token / token) or the push dies with an empty username."""
+    import os
+    import subprocess
+
+    helper = tmp_path / "askpass.sh"
+    helper.write_text(_askpass_script())
+    helper.chmod(0o700)
+    env = dict(os.environ, GIRDER_ASKPASS_TOKEN=TOKEN)
+
+    def ask(prompt: str) -> str:
+        # git invokes the helper with the prompt as argv[1]
+        proc = subprocess.run(
+            [str(helper), prompt], capture_output=True, text=True, env=env
+        )
+        assert proc.returncode == 0
+        return proc.stdout
+
+    assert ask("Username for 'https://github.com': ") == "x-access-token"
+    assert ask("Password for 'https://x-access-token@github.com': ") == TOKEN
+    assert TOKEN not in _askpass_script()  # the token never lands in the script
+
+
+async def test_askpass_script_removed_after_push(tmp_path: Path, db: Database) -> None:
+    """The 0700 askpass temp file is gone once _git_push returns (even on the
+    success path)."""
+    import os
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    await run_host_cmd(["git", "init", "-b", "main", str(repo)], timeout_s=30)
+    await run_host_cmd(["git", "-C", str(repo), "config", "user.email", "t@l"], timeout_s=30)
+    await run_host_cmd(["git", "-C", str(repo), "config", "user.name", "t"], timeout_s=30)
+    (repo / "f.txt").write_text("hi\n")
+    await run_host_cmd(["git", "-C", str(repo), "add", "-A"], timeout_s=30)
+    await run_host_cmd(["git", "-C", str(repo), "commit", "-m", "init"], timeout_s=30)
+    origin = tmp_path / "origin.git"
+    await run_host_cmd(["git", "init", "--bare", "-b", "main", str(origin)], timeout_s=30)
+    await run_host_cmd(["git", "-C", str(repo), "remote", "add", "origin", str(origin)],
+                       timeout_s=30)
+
+    settings = Settings(github=GithubConfig(api_url="http://github.test"))
+    client = GitHubClient(
+        settings,
+        Secrets(github_token=TOKEN),
+        Redactor(),
+        db,
+        repo_path=repo,
+        token=TOKEN,
+        owner_repo=("acme", "widget"),
+    )
+    seen: dict[str, object] = {}
+    real_run_host_cmd = run_host_cmd
+
+    async def spy(cmd: list[str], **kwargs: object) -> object:
+        askpass = (kwargs.get("env") or {}).get("GIT_ASKPASS")  # type: ignore[union-attr]
+        if askpass:
+            seen["helper"] = askpass
+            seen["existed_during"] = os.path.exists(str(askpass))  # noqa: ASYNC240
+        return await real_run_host_cmd(cmd, **kwargs)  # type: ignore[arg-type]
+
+    from girder.github import client as client_mod
+
+    client_mod.run_host_cmd = spy  # type: ignore[method-assign]
+    try:
+        await client._git_push(str(origin), "main")
+    finally:
+        client_mod.run_host_cmd = real_run_host_cmd  # type: ignore[method-assign]
+    assert seen["existed_during"] is True
+    assert not os.path.exists(str(seen["helper"]))  # deleted after use  # noqa: ASYNC240
     await client.aclose()
 
 

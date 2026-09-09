@@ -141,6 +141,48 @@ async def test_uncommitted_leftovers_fail_audit(repo: Path) -> None:
     assert sorted(result.uncommitted_leftovers) == ["app.py", "stray.txt"]
 
 
+async def test_uncommitted_rename_lists_both_endpoints(repo: Path) -> None:
+    """A staged-but-uncommitted rename must contribute BOTH the old and the
+    new path to the leftover set — the `R  old -> new` porcelain line must
+    not evade scope/test classification as the literal string."""
+    base = (await _git(repo, "rev-parse", "HEAD")).strip()
+    await _git(repo, "mv", "app.py", "renamed.py")
+    result = await _audit().audit_attempt(
+        repo,
+        task_type=TaskType.CODE_CHANGE,
+        scope_globs=["tests/**"],
+        base_commit=base,
+    )
+    assert not result.passed
+    assert set(result.uncommitted_leftovers) == {"app.py", "renamed.py"}
+    assert result.out_of_scope_writes == ["app.py", "renamed.py"]
+
+
+def test_porcelain_paths_parses_renames_quotes_and_garbage() -> None:
+    from girder.gitops.audit import _porcelain_paths
+
+    out = "\n".join(
+        [
+            " M src/app.py",
+            "?? stray.txt",
+            'R  old.py -> "new\tname.py"',  # quoted destination
+            'R  "old\tname.py" -> new2.py',  # quoted source
+            "A  added.py",
+            "bad",  # too short / no XY — skipped, no crash
+            "",
+        ]
+    )
+    assert _porcelain_paths(out) == [
+        "src/app.py",
+        "stray.txt",
+        "old.py",
+        "new\tname.py",
+        "old\tname.py",
+        "new2.py",
+        "added.py",
+    ]
+
+
 async def test_snapshot_immune_to_later_edits(repo: Path, tmp_path: Path) -> None:
     dest = tmp_path / "snapshot"
     out = await _audit().materialize_test_snapshot(repo, "HEAD", ["tests/test_app.py"], dest)

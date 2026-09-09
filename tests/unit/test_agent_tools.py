@@ -251,8 +251,9 @@ async def test_write_file_uses_b64_argv_plumbing(seeded: tuple[Database, str, st
 async def test_apply_patch_stages_diff_in_tmp(seeded: tuple[Database, str, str]) -> None:
     db, run_id, attempt_id = seeded
     sandbox = FakeSandbox(results=[ExecResult(0, "", ""), ExecResult(0, "", "")])
+    diff = "--- a/src/a.py\n+++ b/src/a.py\n"
     result = await _registry(sandbox, db, run_id, attempt_id).execute(
-        "apply_patch", {"path": "src/a.py", "unified_diff": "--- a\n+++ b\n"}
+        "apply_patch", {"path": "src/a.py", "unified_diff": diff}
     )
     assert result.ok
     stage_cmd = sandbox.execs[0][1]
@@ -260,7 +261,7 @@ async def test_apply_patch_stages_diff_in_tmp(seeded: tuple[Database, str, str])
     patch_path = stage_cmd[3]
     assert patch_path.startswith("/tmp/.girder-patch-")
     assert patch_path.endswith(".diff")
-    assert base64.b64decode(stage_cmd[4]).decode() == "--- a\n+++ b\n"
+    assert base64.b64decode(stage_cmd[4]).decode() == diff
     assert sandbox.execs[1][1] == ["git", "apply", "--whitespace=nowarn", patch_path]
 
 

@@ -713,3 +713,41 @@ async def test_github_refused_merge_resets_clean_streak(dh: DHarness) -> None:
     project = await repo.get_project(dh.db, dh.project.id)
     assert project is not None and project.clean_merge_streak == 0
     assert any("merge refused" in c[2].lower() for c in dh.notifier.calls)
+
+
+# ------------------------------------------------------- T0 poll throttling
+
+
+@pytest.mark.parametrize("dh", [0], indirect=True)
+async def test_t0_merge_pending_poll_is_throttled(dh: DHarness) -> None:
+    """Parked T0 runs get pumped every cycle; get_pr must fire at most once
+    per poll interval (same cadence setting as the CI poll), not once per
+    pump."""
+    dh.settings.github.poll_interval_s = 30.0
+    gateway = FakeGateway(responses=[_resp(content=GOOD_VERDICT)])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    status = await _drive(d, dh.run.id)
+    assert status == "merge_pending_human"
+
+    def get_pr_calls() -> int:
+        return sum(
+            1 for m, p in dh.api.api_calls if m == "GET" and p.endswith("/pulls/7")
+        )
+
+    # first pump of the parked run fires one get_pr
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    await d.pump(run)
+    first = get_pr_calls()
+    assert first == 1
+
+    # two more pump cycles inside the interval ⇒ no additional get_pr
+    await d.pump(run)
+    await d.pump(run)
+    assert get_pr_calls() == first
+
+    # advancing past the interval ⇒ the next pump polls again
+    d._last_merge_poll[run.id] -= 31.0
+    await d.pump(run)
+    assert get_pr_calls() == first + 1

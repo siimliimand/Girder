@@ -34,6 +34,38 @@ from tests.unit.test_task_engine import GREEN_XML, ScriptSandbox, write_commit_c
 pytestmark = pytest.mark.integration
 
 
+class SentinelGateway(FakeGateway):
+    """FakeGateway with a loud fallback instead of IndexError.
+
+    Root cause of a one-off flake (IndexError: pop from empty list) in
+    ``test_skip_steering_skips_task_and_runs_the_rest``: the scripted list
+    covered exactly one attempt (3 responses), but an attempt retry is
+    legitimate engine behavior — under full-suite load the attempt wall-clock
+    can expire mid-turn, the task engine schedules attempt 2 with the same
+    3-turn script, and the 4th ``complete()`` call popped an empty list.
+    Fix: queue a second attempt's script, and make anything BEYOND that
+    fail loudly via a distinctive sentinel amendment outcome (never a bare
+    IndexError that could mask a real regression).
+    """
+
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:
+        if not self.responses:
+            self.responses.append(
+                _resp(
+                    calls=[
+                        _tc(
+                            "sentinel",
+                            "request_spec_amendment",
+                            '{"reason":"SENTINEL: unexpected extra gateway call '
+                            '(beyond the scripted attempts)",'
+                            '"suggested_change":"none"}',
+                        )
+                    ]
+                )
+            )
+        return await super().complete(*args, **kwargs)
+
+
 class Harness:
     def __init__(
         self,
@@ -186,7 +218,12 @@ async def test_skip_steering_skips_task_and_runs_the_rest(harness: Harness) -> N
     h = harness
     t1 = await _add_task(h, h.run_id, seq=1, scope_globs=["src/**"])
     await _add_task(h, h.run_id, seq=2, scope_globs=["docs/**"])
-    gateway = FakeGateway(responses=write_commit_complete())
+    # one attempt's script per task_max_attempts, plus the sentinel fallback:
+    # a legitimate attempt retry (e.g. wall-clock expiry under full-suite
+    # load) must be served, not crash the harness — see SentinelGateway.
+    gateway = SentinelGateway(
+        responses=write_commit_complete() * h.settings.limits.task_max_attempts
+    )
     await repo.insert_steering_event(h.db, h.run_id, SteeringKind.SKIP.value, {"task_id": t1.id})
 
     descriptor = await h.engine(gateway).pump_once(h.run_id)

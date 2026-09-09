@@ -1,0 +1,38 @@
+{# Amendments inbox: pending amendments across all runs (impl-plan §10 pages
+   list). Actions POST to the existing per-run resolve endpoints, which bounce
+   back here via the Referer header. #}
+{% extends "base.html" %}
+{% block content %}
+<h1>Amendments inbox</h1>
+<table>
+  <thead><tr><th>Project</th><th>Run</th><th>Intent</th><th>Task</th>
+      <th>Reason</th><th>Suggested change</th><th></th></tr></thead>
+  <tbody>
+  {% for a in pending %}
+    <tr>
+      <td>{% if a.project_id %}
+            <a href="/projects/{{ a.project_id }}">{{ a.project_name }}</a>
+          {% else %}—{% endif %}</td>
+      <td><a href="/runs/{{ a.run_id }}"><code>{{ a.run_id[:8] }}</code></a></td>
+      <td class="muted">{{ a.intent or '—' }}</td>
+      <td><code>{{ a.task_id[:8] if a.task_id else 'run' }}</code></td>
+      <td>{{ a.reason }}</td>
+      <td><code>{{ a.suggested_change }}</code></td>
+      <td>
+        <form method="post" action="/api/runs/{{ a.run_id }}/amendments/{{ a.amendment_id }}/approve">
+          <button type="submit">Approve</button>
+        </form>
+        <form method="post" action="/api/runs/{{ a.run_id }}/amendments/{{ a.amendment_id }}/reject">
+          <button type="submit">Reject</button>
+        </form>
+        <form method="post" action="/api/runs/{{ a.run_id }}/amendments/{{ a.amendment_id }}/abort">
+          <button type="submit">Abort</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7">No pending amendments.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

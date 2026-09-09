@@ -169,3 +169,16 @@ details.prompt pre {
 
 /* Post-mortem / history helpers */
 h5 { margin: 0.6rem 0 0.2rem; }
+
+/* Collapsible attempt-diff blocks (§10 diff viewer, migration 012). */
+details.diff { margin: 0.2rem 0 0.2rem 0.8rem; }
+details.diff summary { cursor: pointer; }
+details.diff pre {
+  margin: 0.3rem 0 0 0;
+  max-height: 24em;
+  overflow: auto;
+  background: #fbfbf9;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.4rem;
+}

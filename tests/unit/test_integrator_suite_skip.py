@@ -194,3 +194,69 @@ async def test_plain_merge_path_runs_suite_once(conflict_ctx) -> None:
     assert outcome.kind == "task_integrated"
     assert resolver.calls == 0
     assert ctx["suite_calls"] == [task_tip]
+
+
+# ------------------------------------------------- wave-tip audit gates the ff
+
+
+async def test_wave_tip_audited_before_run_branch_ff(conflict_ctx) -> None:
+    """The wave tip (merged combination) gets its own Layer 2/3 audit against
+    the run branch's pre-wave tip, and its result is what gates the ff."""
+    ctx = conflict_ctx
+    repo_path: Path = ctx["repo_path"]
+    base: str = ctx["base"]
+    task: Task = ctx["task"]
+    # Task branch ahead of the wave branch (clean three-way merge).
+    await _git(repo_path, "checkout", "-q", "-B", "tmp3", base)
+    (repo_path / "other.py").write_text("y = 2\n")
+    task_tip = await _commit(repo_path, "task work ff")
+    await _git(repo_path, "branch", "-f", f"task/{task.id}", task_tip)
+    await _git(repo_path, "checkout", "-q", "main")
+
+    integrator = ctx["integrator"]
+    audit_calls: list[dict[str, object]] = []
+
+    async def fake_tip_audit(repo_path: Path, **kwargs: object) -> AuditResult:
+        audit_calls.append(kwargs)
+        return AuditResult(passed=True)
+
+    integrator._audit.audit_commit = fake_tip_audit  # type: ignore[method-assign]
+
+    outcome = await integrator.integrate_wave(ctx["run"], ctx["wave"])
+    assert outcome.kind == "wave_completed"
+
+    # The tip audit ran against the merged tip, from the pre-wave run tip.
+    assert len(audit_calls) == 1
+    assert audit_calls[0]["commit"] == outcome.detail
+    assert audit_calls[0]["base_commit"] == base
+    # Its passing result is what let the ff through.
+    assert (await _git(repo_path, "rev-parse", "run/x1")).strip() == outcome.detail
+
+
+async def test_failing_wave_tip_audit_blocks_ff_and_escalates(conflict_ctx) -> None:
+    ctx = conflict_ctx
+    repo_path: Path = ctx["repo_path"]
+    base: str = ctx["base"]
+    task: Task = ctx["task"]
+    await _git(repo_path, "checkout", "-q", "-B", "tmp4", base)
+    (repo_path / "other.py").write_text("y = 2\n")
+    task_tip = await _commit(repo_path, "task work ff")
+    await _git(repo_path, "branch", "-f", f"task/{task.id}", task_tip)
+    await _git(repo_path, "checkout", "-q", "main")
+
+    integrator = ctx["integrator"]
+
+    async def failing_tip_audit(repo_path: Path, **kwargs: object) -> AuditResult:
+        return AuditResult(passed=False, test_path_violations=["tests/test_app.py"])
+
+    integrator._audit.audit_commit = failing_tip_audit  # type: ignore[method-assign]
+
+    outcome = await integrator.integrate_wave(ctx["run"], ctx["wave"])
+    assert outcome.kind == "escalated"
+    # The run branch was never moved to the unaudited tip.
+    assert (await _git(repo_path, "rev-parse", "run/x1")).strip() == base
+    # Violation recorded + escalation audit event.
+    violations = await repo.list_integrity_violations_for_run(ctx["db"], ctx["run"].id)
+    assert violations, "tip audit failure must insert an integrity violation"
+    assert await repo.get_latest_event(ctx["db"], ctx["run"].id, "wave_tip_audit_failed") \
+        is not None

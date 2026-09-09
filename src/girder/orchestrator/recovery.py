@@ -10,7 +10,11 @@ migrations, this service reconciles the world to match it:
 3. Tasks caught mid-flight (``running`` / ``verifying``) are rescheduled — or
    marked failed outright when the attempt budget is exhausted.
 4. Git/DB consistency is verified for every non-terminal run (§8.7 step 4):
-   a missing run branch is recreated from ``main``; worktree rows whose path
+   a missing run branch is recreated from ``main`` — except for runs in a
+   delivery state (pr_open … merge_pending_human), whose PR lives on the
+   remote: their branch is restored from the remote head, or the run is
+   left for operator attention (never silently rebuilt at ``main``);
+   worktree rows whose path
    vanished from disk are pruned so the scheduler rebuilds cleanly from the
    task's base commit.
 5. If anything was recovered, a notification with a recovery report goes out
@@ -23,12 +27,15 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from aiosqlite import Row
+
 from girder.config import Settings
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import (
     TERMINAL_RUN_STATUSES,
     AttemptStatus,
+    RunStatus,
     TaskStatus,
     WorktreeState,
 )
@@ -36,8 +43,22 @@ from girder.fsm import transition_attempt, transition_task
 from girder.gitops.branch import BranchOps
 from girder.gitops.worktree import WorktreeManager
 from girder.notify.notifier import Notifier
+from girder.util import run_host_cmd
 
 log = logging.getLogger(__name__)
+
+# Runs in a delivery state have (or are getting) a PR on the remote: their
+# run branch must never be silently rebuilt at local ``main`` — the pump
+# would poll/merge the PR against the wrong sha (§8.7 step 4).
+_DELIVERY_RUN_STATUSES = frozenset(
+    {
+        RunStatus.PR_OPEN,
+        RunStatus.CI_RUNNING,
+        RunStatus.CI_FIXING,
+        RunStatus.CONFORMANCE_REVIEW,
+        RunStatus.MERGE_PENDING_HUMAN,
+    }
+)
 
 
 @dataclass
@@ -48,6 +69,8 @@ class RecoveryReport:
     rescheduled_tasks: list[str] = field(default_factory=list)
     failed_tasks: list[str] = field(default_factory=list)
     recreated_branches: list[str] = field(default_factory=list)
+    restored_branches: list[str] = field(default_factory=list)
+    attention_branches: list[str] = field(default_factory=list)
 
     @property
     def anything_recovered(self) -> bool:
@@ -58,6 +81,8 @@ class RecoveryReport:
             or self.rescheduled_tasks
             or self.failed_tasks
             or self.recreated_branches
+            or self.restored_branches
+            or self.attention_branches
         )
 
     def summary(self) -> str:
@@ -67,6 +92,15 @@ class RecoveryReport:
         if self.recreated_branches:
             lines.append(
                 f"- {len(self.recreated_branches)} missing run branch(es) recreated from main"
+            )
+        if self.restored_branches:
+            lines.append(
+                f"- {len(self.restored_branches)} delivery run branch(es) restored from remote"
+            )
+        if self.attention_branches:
+            lines.append(
+                f"- {len(self.attention_branches)} delivery run branch(es) missing locally AND"
+                " remotely — operator attention required"
             )
         if self.pruned_worktrees:
             lines.append(f"- {len(self.pruned_worktrees)} worktree(s) pruned")
@@ -167,12 +201,15 @@ class RecoveryService:
     async def _reconcile_run_branches(self, report: RecoveryReport) -> None:
         """§8.7 step 4: verify git state matches the DB. A non-terminal run
         whose branch is missing from git gets it recreated from ``main``
-        (the baseline anchor) so pumping can resume; every action is logged
-        and lands in the recovery report."""
+        (the baseline anchor) so pumping can resume — except for delivery
+        states: there the PR lives on the remote, so the branch is restored
+        from the remote head, or (remote unreachable/branch absent) the run
+        is left for operator attention. Every action is logged, audited, and
+        lands in the recovery report."""
         terminal = [s.value for s in TERMINAL_RUN_STATUSES]
         rows = await self.db.fetchall(
             f"""
-            SELECT r.id AS run_id, r.branch, p.repo_path
+            SELECT r.id AS run_id, r.status AS run_status, r.branch, p.repo_path
             FROM runs r
             JOIN projects p ON r.project_id = p.id
             WHERE r.status NOT IN ({','.join('?' for _ in terminal)})
@@ -182,6 +219,9 @@ class RecoveryService:
         for row in rows:
             branch_ops = BranchOps(Path(row["repo_path"]))
             if await branch_ops.run_branch_tip(row["branch"]) is not None:
+                continue
+            if row["run_status"] in {s.value for s in _DELIVERY_RUN_STATUSES}:
+                await self._restore_delivery_branch(row, branch_ops, report)
                 continue
             base = "HEAD"
             for ref in ("main", "origin/main"):
@@ -197,6 +237,53 @@ class RecoveryService:
                 tip,
             )
             report.recreated_branches.append(row["branch"])
+
+    async def _restore_delivery_branch(
+        self, row: Row, branch_ops: BranchOps, report: RecoveryReport
+    ) -> None:
+        """A delivery-state run lost its local branch: restore it from the
+        remote (the PR's source of truth), never rebuild at ``main``."""
+        run_id, branch = row["run_id"], row["branch"]
+        remote = self.settings.github.remote
+        proc = await run_host_cmd(
+            ["git", "-C", str(branch_ops.repo_path), "fetch", remote, f"{branch}:{branch}"],
+            check=False,
+            timeout_s=120,
+        )
+        tip = await branch_ops.run_branch_tip(branch) if proc.returncode == 0 else None
+        if tip is not None:
+            log.warning(
+                "run %s: branch %s missing locally — restored from %s at %s",
+                run_id,
+                branch,
+                remote,
+                tip,
+            )
+            await repo.insert_event(
+                self.db,
+                "run_branch_restored_from_remote",
+                {"branch": branch, "remote": remote, "tip": tip},
+                run_id=run_id,
+            )
+            report.restored_branches.append(branch)
+            return
+        # Remote unreachable or branch absent remotely: rebuilding at main
+        # would point the delivery pump at the wrong sha — leave for a human.
+        log.error(
+            "run %s: delivery branch %s missing locally and not restorable from %s"
+            " (%s) — operator attention required",
+            run_id,
+            branch,
+            remote,
+            proc.stderr.strip()[:200],
+        )
+        await repo.insert_event(
+            self.db,
+            "run_branch_unrestorable",
+            {"branch": branch, "remote": remote, "detail": proc.stderr.strip()[:500]},
+            run_id=run_id,
+        )
+        report.attention_branches.append(branch)
 
     async def _verify_no_live_worktrees_on_terminal_runs(self) -> None:
         """Sanity probe: no *active* worktree row may belong to a terminal run.

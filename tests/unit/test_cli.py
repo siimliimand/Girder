@@ -1,10 +1,12 @@
 """CLI behaviours: concurrent pump scheduling (issue 23), local-sandbox guard
-(issue 27), and the ``girder review`` command (plan.md §2.3 review window)."""
+(issue 27), the ``girder review`` command (plan.md §2.3 review window), and
+the ``girder web`` bind modes (impl-plan §10: TCP loopback or UDS)."""
 
 from __future__ import annotations
 
 import asyncio
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -114,3 +116,89 @@ async def test_review_refuses_non_merged_run(db) -> None:  # type: ignore[no-unt
 
 async def test_review_refuses_unknown_run(db) -> None:  # type: ignore[no-untyped-def]
     assert await review_run(db, "no-such-run") == 1
+
+
+# ------------------------------------------------------------------ web (UDS)
+
+
+async def test_web_forwards_unix_socket_to_uvicorn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """impl-plan §10 "or UDS": a configured unix_socket reaches uvicorn's
+    ``uds=`` argument instead of host/port; a stale socket file is unlinked."""
+    import uvicorn as uvicorn_module
+
+    from girder.cli import cmd_web
+    from girder.config import Settings
+
+    captured: dict[str, object] = {}
+
+    class FakeConfig:
+        def __init__(self, app: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        @property
+        def kwargs(self) -> dict[str, object]:  # pragma: no cover - not used
+            return dict(captured)
+
+    class FakeServer:
+        def __init__(self, config: FakeConfig) -> None:
+            pass
+
+        async def serve(self) -> None:
+            return None
+
+    monkeypatch.setattr(uvicorn_module, "Config", FakeConfig)
+    monkeypatch.setattr(uvicorn_module, "Server", FakeServer)
+    monkeypatch.setattr(
+        "girder.cli.load_settings",
+        lambda: Settings.model_validate({"web": {"unix_socket": str(tmp_path / "g.sock")}}),
+    )
+    monkeypatch.setattr("girder.cli.create_app", lambda **_: object())
+
+    stale = tmp_path / "g.sock"
+    stale.write_bytes(b"")  # simulate a leftover socket from a crash
+    rc = await cmd_web(
+        Namespace(db=str(tmp_path / "db.sqlite"), migrations_dir=None,
+                  host=None, port=None, unix_socket=None)
+    )
+
+    assert rc == 0
+    assert captured.get("uds") == str(stale)
+    assert "host" not in captured and "port" not in captured
+    assert not stale.exists(), "stale socket must be unlinked before binding"
+
+
+async def test_web_without_unix_socket_binds_host_and_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import uvicorn as uvicorn_module
+
+    from girder.cli import cmd_web
+    from girder.config import Settings
+
+    captured: dict[str, object] = {}
+
+    class FakeConfig:
+        def __init__(self, app: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    class FakeServer:
+        def __init__(self, config: FakeConfig) -> None:
+            pass
+
+        async def serve(self) -> None:
+            return None
+
+    monkeypatch.setattr(uvicorn_module, "Config", FakeConfig)
+    monkeypatch.setattr(uvicorn_module, "Server", FakeServer)
+    monkeypatch.setattr("girder.cli.load_settings", lambda: Settings())
+    monkeypatch.setattr("girder.cli.create_app", lambda **_: object())
+
+    rc = await cmd_web(
+        Namespace(db=str(tmp_path / "db.sqlite"), migrations_dir=None,
+                  host=None, port=None, unix_socket=None)
+    )
+    assert rc == 0
+    assert captured.get("host") == "127.0.0.1" and captured.get("port") == 8787
+    assert "uds" not in captured
