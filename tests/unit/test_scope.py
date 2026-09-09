@@ -188,11 +188,10 @@ def test_run_command_no_path_args_allowed(scopes: TaskScopes) -> None:
 def test_run_command_read_of_existing_path_is_not_write_gated(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Existing in-scope path, read-shaped: reads stay allowed (R2) even
+    """In-root path-shaped token, read-shaped: reads stay allowed (R2) even
     though the token falls outside write_globs... and even inside them it is
-    ALLOW_LOGGED, never a write-policy hold."""
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.py").write_text("x = 1\n")
+    ALLOW_LOGGED, never a write-policy hold. Existence is not probed on the
+    host filesystem — run_command executes in the guest."""
     scopes = TaskScopes(
         write_globs=["src/widgets/**"],
         protected_globs=[".github/**"],
@@ -203,11 +202,45 @@ def test_run_command_read_of_existing_path_is_not_write_gated(
     )
 
 
-def test_run_command_unknown_path_token_ignored(scopes: TaskScopes) -> None:
-    """Path-syntax token that does not resolve under the root is ignored —
-    Layer 2/3 audits remain the backstop for indirection."""
+def test_run_command_in_root_read_shape_is_allow_logged_without_host_probe(
+    scopes: TaskScopes,
+) -> None:
+    """Path classification is purely lexical: a token that lexically
+    resolves inside the task root is a read (ALLOW_LOGGED) even though the
+    file does not exist on the orchestrator host (§6.6 R2, plan §8.5)."""
+    assert check_tool_call("run_command", {"cmd": "cat src/app.py"}, scopes) is (
+        Verdict.ALLOW_LOGGED
+    )
+
+
+def test_run_command_in_root_read_path_is_logged() -> None:
+    """The read audit trail is live: in-root reads yield ALLOW_LOGGED with
+    the conventional ``/workspace`` root, not a bare ALLOW."""
+    scopes = TaskScopes(write_globs=["src/widgets/**"], protected_globs=[".github/**"])
+    assert check_tool_call("run_command", {"cmd": "cat src/app.py"}, scopes) is (
+        Verdict.ALLOW_LOGGED
+    )
+
+
+def test_run_command_protected_read_under_absolute_root_is_violation() -> None:
+    scopes = TaskScopes(write_globs=["src/**"], protected_globs=[".github/**"])
+    assert check_tool_call(
+        "run_command", {"cmd": "cat /workspace/.github/workflows/ci.yml"}, scopes
+    ) is Verdict.VIOLATION
+
+
+def test_run_command_escape_token_is_violation(scopes: TaskScopes) -> None:
+    assert check_tool_call("run_command", {"cmd": "cat ../../etc/passwd"}, scopes) is (
+        Verdict.VIOLATION
+    )
+
+
+def test_run_command_nonexistent_in_root_token_is_still_a_read(scopes: TaskScopes) -> None:
+    """A path-shaped token inside the root that does not exist anywhere is
+    still read-shaped (ALLOW_LOGGED); the Layer 2/3 audits backstop
+    indirection."""
     assert check_tool_call("run_command", {"cmd": "python -m pytest build/app.py"}, scopes) is (
-        Verdict.ALLOW
+        Verdict.ALLOW_LOGGED
     )
 
 

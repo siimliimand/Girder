@@ -76,6 +76,10 @@ async def request_spec_amendment(
         await transition_task(db, task.id, TaskStatus.AWAITING_AMENDMENT)
         await transition_run(db, run.id, RunStatus.AWAITING_AMENDMENT)
     except InvalidTransition as exc:
+        # Do not leave a dangling 'pending' row: get_pending_amendment (used
+        # by the run pump to park) would freeze on a phantom amendment. The
+        # row is kept as 'aborted' for the audit trail (§8.4).
+        await repo.resolve_spec_amendment(db, amendment.id, status="aborted")
         raise AmendmentError(f"cannot request amendment for run {run.id}: {exc}") from exc
 
     await repo.insert_event(
@@ -206,7 +210,9 @@ async def _approve(
         + f"**Reason:** {amendment.reason}\n\n"
         + f"**Change:** {amendment.suggested_change}\n"
     )
-    new_hash = hashlib.sha256(amended_text.encode()).hexdigest()
+    # Explicit UTF-8: must match the bytes _commit_in_worktree writes (freeze.py
+    # uses encoding="utf-8") and the git blob read back by _read_branch_file.
+    new_hash = hashlib.sha256(amended_text.encode("utf-8")).hexdigest()
 
     commit_sha = await _commit_amendment(repo_path, run.branch, run.id, amended_text)
     await repo.resolve_spec_amendment(

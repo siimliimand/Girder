@@ -20,8 +20,8 @@ Verdict policy (resolved ambiguity R2 of the implementation plan):
 * ``run_command`` gets the same write policy on "any argument that resolves
   to a path" (§6.6 R2): shell redirect operands (``>`` ``>>`` ``2>`` ``&>``)
   and ``tee`` operands are write targets — out-of-scope or protected targets
-  hold the whole call. Any *other* token with path syntax that resolves to an
-  existing path under the worktree root is treated as a read (protected paths
+  hold the whole call. Any *other* token with path syntax that lexically
+  resolves under the worktree root is treated as a read (protected paths
   still violation; ordinary out-of-scope reads stay allowed — R2). Tokens that
   do not look like paths (commands, flags, pipes, heredoc text) are ignored:
   this stays a path-argument policy, and `python -c "open(...)"`-style
@@ -32,7 +32,6 @@ Verdict policy (resolved ambiguity R2 of the implementation plan):
 
 from __future__ import annotations
 
-import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -241,18 +240,15 @@ def _check_run_command(cmd: str, scopes: TaskScopes) -> Verdict:
             return Verdict.VIOLATION  # path escape, even read-shaped
         if _matches_any(rel, scopes.protected_globs):
             return Verdict.VIOLATION
-        # Existing in-worktree paths behave like read_file (R2: reads are
-        # ALLOW_LOGGED). Non-existent / unresolvable-on-host tokens are
-        # ignored — Layer 2/3 audits cover the indirection gap.
-        if _exists_under_root(rel, scopes.root):
-            return Verdict.ALLOW_LOGGED
+        # The token already resolved inside the task root (resolve_path
+        # returns None for escapes), so this is purely a path-shape
+        # classification: in-root path-shaped tokens behave like read_file
+        # (R2: reads are ALLOW_LOGGED). Protected paths and escapes were
+        # handled above. Existence is deliberately not probed on the host
+        # filesystem — run_command executes in the guest, where the host
+        # layout is meaningless (plan §8.5 / impl-plan §6.6 R2).
+        return Verdict.ALLOW_LOGGED
     return Verdict.ALLOW
-
-
-def _exists_under_root(rel: str, root: str) -> bool:
-    base = root.rstrip("/") or "/"
-    p = os.path.join(base, rel)
-    return os.path.exists(p) or os.path.isdir(os.path.dirname(p) or "/")
 
 
 def diff_target_paths(diff: str) -> list[str]:

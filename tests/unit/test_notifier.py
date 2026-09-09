@@ -126,3 +126,16 @@ async def test_multi_channel_delivery(transport: CaptureTransport) -> None:
     results = await notifier.notify("info", "both", "channels")
     assert [r.status for r in results] == ["sent", "sent"]
     assert len(transport.requests) == 2
+
+
+async def test_telegram_payload_clamped_to_4096(transport: CaptureTransport) -> None:
+    """An over-long escalation (recovery/integrity reports) is clamped to
+    Telegram's 4096-char limit and the send is still attempted — it must not
+    fail delivery with HTTP 400 (impl-plan §6.13)."""
+    notifier = _notifier(transport, ["telegram"])
+    results = await notifier.notify("critical", "recovery", "x" * 6000)
+    assert results[0].status == "sent"
+    assert len(transport.requests) == 1
+    sent = json.loads(transport.requests[0].content)
+    assert len(sent["text"]) <= 4096
+    assert sent["text"].startswith("*[CRITICAL]*")

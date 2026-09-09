@@ -254,3 +254,61 @@ async def test_failed_check_and_logs_both_empty_is_safe(db: Database) -> None:
     assert not failures[0].output_summary
     assert not failures[0].output_text
     await client.aclose()
+
+
+async def test_job_logs_fetch_is_redaction_logged(db: Database) -> None:
+    """§6.11 "all redacted-logged": the job-logs fallback goes through the same
+    _request path as every other API call, so its github_api_call audit event
+    lands in the persisted event log (404-tolerant path included)."""
+    client = _client(db, _transport([_failed_check()], job_logs="logs"))
+    failures = await client.fetch_failure_logs("abc123")
+    assert failures[0].output_text == "logs"
+    rows = await db.fetchall(
+        "SELECT payload_json FROM agent_events WHERE event_type = 'github_api_call'"
+    )
+    paths = [str(r["payload_json"]) for r in rows]
+    assert any("/actions/jobs/4242/logs" in p for p in paths)
+    await client.aclose()
+
+
+async def test_job_logs_fallback_failure_warns_and_still_logs_event(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing job-logs fetch (HTTP 500) is not silent: the github_api_call
+    event is emitted and a warning is logged instead of returning "" quietly."""
+    import logging
+
+    client = _client(db, _transport([_failed_check()], job_logs="x", logs_status=500))
+    with caplog.at_level(logging.WARNING, logger="girder.github.client"):
+        failures = await client.fetch_failure_logs("abc123")
+    assert failures[0].output_text == ""  # excerpt stays empty
+    assert any("job-logs" in r.message for r in caplog.records)
+    rows = await db.fetchall(
+        "SELECT payload_json FROM agent_events WHERE event_type = 'github_api_call'"
+    )
+    assert any("/actions/jobs/4242/logs" in str(r["payload_json"]) for r in rows)
+    await client.aclose()
+
+
+async def test_job_logs_follows_302_to_log_blob(db: Database) -> None:
+    """The Actions logs API answers with a 302 to the log blob; the redirect is
+    followed and the blob tail is redacted."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/check-runs"):
+            return httpx.Response(200, json={"check_runs": [_failed_check()]})
+        if path.endswith("/logs"):
+            return httpx.Response(
+                302, headers={"location": "http://github.test/log/blob"}, text=""
+            )
+        if path == "/log/blob":
+            return httpx.Response(200, text=f"tail with {SECRET} inside")
+        return httpx.Response(404, json={"message": f"unhandled {path}"})
+
+    client = _client(db, httpx.MockTransport(handler))
+    failures = await client.fetch_failure_logs("abc123")
+    excerpt = failures[0].output_text or ""
+    assert "tail with" in excerpt
+    assert SECRET not in excerpt
+    await client.aclose()

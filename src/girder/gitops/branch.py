@@ -137,18 +137,25 @@ class BranchOps:
         *,
         source_branch: str,
         target_branch: str,
-        audit_passed: bool,
+        audit_passed_for_commit: str,
         worktree_path: Path | None = None,
     ) -> MergeResult:
-        """Fast-forward ``target_branch`` to ``source_branch`` iff gated checks pass."""
+        """Fast-forward ``target_branch`` to ``source_branch`` iff gated checks pass.
+
+        The audit gate is bound to the exact commit (impl-plan §6.5: merge is
+        refused unless DiffAudit passed "on the exact commit being merged"):
+        ``audit_passed_for_commit`` must equal the source branch's resolved
+        tip, so a ref move between audit and merge cannot smuggle an
+        unaudited commit across the boundary.
+        """
         source_tip = await self.run_branch_tip(source_branch)
         if source_tip is None:
             return MergeResult(False, None, f"source branch not found: {source_branch}")
         target_tip = await self.run_branch_tip(target_branch)
         if target_tip is None:
             return MergeResult(False, None, f"target branch not found: {target_branch}")
-        if not audit_passed:
-            return MergeResult(False, None, "audit did not pass")
+        if audit_passed_for_commit != source_tip:
+            return MergeResult(False, None, "audit did not pass for the commit being merged")
         if worktree_path is not None and not await self._worktree_clean(worktree_path):
             return MergeResult(False, None, "source worktree is not clean")
 

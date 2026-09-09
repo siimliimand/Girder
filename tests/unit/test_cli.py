@@ -202,3 +202,67 @@ async def test_web_without_unix_socket_binds_host_and_port(
     assert rc == 0
     assert captured.get("host") == "127.0.0.1" and captured.get("port") == 8787
     assert "uds" not in captured
+
+
+# ------------------------------------------------------------- daemon startup
+
+
+def _roles_settings() -> object:
+    from girder.config import ModelsConfig, Settings
+
+    return Settings(
+        models=ModelsConfig(
+            roles=[
+                {"role": "tier1", "provider": "stub", "model": "a"},
+                {"role": "tier2", "provider": "stub", "model": "b"},
+                {"role": "tier3", "provider": "stub", "model": "c"},
+            ]
+        )
+    )
+
+
+async def test_daemon_refuses_to_start_without_model_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec §6.1: at least one model role per tier — config validation only
+    warns, but the daemon must not start pumping with an empty registry."""
+    from girder.cli import cmd_daemon
+    from girder.config import Settings
+
+    monkeypatch.setattr("girder.cli.load_settings", lambda: Settings())
+    rc = await cmd_daemon(
+        Namespace(db=":memory:", migrations_dir=None, sandbox="podman")
+    )
+    assert rc == 2
+
+
+async def test_daemon_guard_is_overridable_by_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GIRDER_ALLOW_NO_ROLES=1 opts out (test/dev harnesses)."""
+    import girder.cli as cli_module
+    from girder.cli import cmd_daemon
+    from girder.config import Settings
+
+    monkeypatch.setattr("girder.cli.load_settings", lambda: Settings())
+    monkeypatch.setenv("GIRDER_ALLOW_NO_ROLES", "1")
+
+    async def refuse_to_proceed(args: object) -> object:
+        raise RuntimeError("guard passed — reached db open")
+
+    monkeypatch.setattr(cli_module, "_open_db", refuse_to_proceed)
+    with pytest.raises(RuntimeError, match="guard passed"):
+        await cmd_daemon(Namespace(db=":memory:", migrations_dir=None, sandbox="podman"))
+
+
+async def test_daemon_starts_with_roles_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The empty-registry guard does not fire when roles exist."""
+    import girder.cli as cli_module
+    from girder.cli import cmd_daemon
+
+    monkeypatch.setattr("girder.cli.load_settings", _roles_settings)
+
+    async def refuse_to_proceed(args: object) -> object:
+        raise RuntimeError("guard passed — reached db open")
+
+    monkeypatch.setattr(cli_module, "_open_db", refuse_to_proceed)
+    with pytest.raises(RuntimeError, match="guard passed"):
+        await cmd_daemon(Namespace(db=":memory:", migrations_dir=None, sandbox="podman"))

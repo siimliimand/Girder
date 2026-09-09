@@ -8,7 +8,7 @@ import json
 import pytest
 
 from girder.db import repo
-from girder.db.models import RunStatus, TaskStatus
+from girder.db.models import AttemptStatus, RunStatus, TaskStatus
 from tests.e2e.conftest import FakeGateway, MakeCtx, git, resp, tc
 
 pytestmark = pytest.mark.e2e
@@ -31,6 +31,10 @@ Narrative.
 
 
 async def test_sc04_escape_and_out_of_scope_writes_held(make_ctx: MakeCtx) -> None:
+    """Core SC-04: escape/out-of-scope writes are HELD (never executed anywhere)
+    and logged. Because §8 blocks the merge at every tier for integrity
+    violations, the held calls also taint the whole attempt: even though a
+    later turn is clean, the attempt fails WITHOUT retry and nothing merges."""
     ctx = await make_ctx(PROPOSAL)
     gateway = FakeGateway(
         responses=[
@@ -67,14 +71,18 @@ async def test_sc04_escape_and_out_of_scope_writes_held(make_ctx: MakeCtx) -> No
     )
 
     descriptor = await ctx.engine(gateway).run_to_completion(ctx.run.id)
-    assert descriptor == "local_green"
+    assert descriptor == "failed"  # held calls taint the attempt (impl-plan §8)
 
     fresh = await repo.get_run(ctx.db, ctx.run.id)
-    assert fresh is not None and fresh.status is RunStatus.ACTIVE  # Sprint 3 terminal
+    assert fresh is not None and fresh.status is RunStatus.FAILED
     tasks = await repo.list_tasks_for_run(ctx.db, ctx.run.id)
-    assert [t.status for t in tasks] == [TaskStatus.COMPLETED]
+    assert [t.status for t in tasks] == [TaskStatus.FAILED]
 
-    attempts = await ctx.db.fetchall("SELECT id FROM attempts WHERE task_id = ?", (tasks[0].id,))
+    attempts = await ctx.db.fetchall(
+        "SELECT id, status FROM attempts WHERE task_id = ?", (tasks[0].id,)
+    )
+    assert len(attempts) == 1  # integrity violation ⇒ no retry
+    assert attempts[0]["status"] == AttemptStatus.INTEGRITY_VIOLATION.value
     held = await ctx.db.fetchall(
         "SELECT tool_name, input_json FROM tool_calls WHERE attempt_id = ? AND held = 1",
         (attempts[0]["id"],),
@@ -87,9 +95,10 @@ async def test_sc04_escape_and_out_of_scope_writes_held(make_ctx: MakeCtx) -> No
     assert not (ctx.repo_path / "etc" / "evil.txt").exists()
     assert not (ctx.repo_path.parent / "etc" / "evil.txt").exists()
 
-    # the compliant write merged; the held out-of-scope one did not
+    # the held calls block the merge at every tier: NOTHING merged — neither
+    # the compliant write nor the held ones
     branch_files = await git(ctx.repo_path, "ls-tree", "-r", "--name-only", fresh.branch)
-    assert "app/real.py" in branch_files
+    assert "app/real.py" not in branch_files
     assert "src/evil.py" not in branch_files
 
     kinds = {

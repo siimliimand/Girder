@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from girder.budget.guard import BudgetExceeded, PreflightDecision
 from girder.config import Settings
 from girder.db.models import Project, Run, RunStatus
 from girder.models.gateway import Message, ModelError, ModelResponse, Usage
@@ -145,6 +146,17 @@ async def test_gateway_failure_raises_model_error_message(repo: Path) -> None:
     assert "boom" in exc_info.value.errors
 
 
+async def test_budget_exceeded_wrapped_in_spec_generation_error(repo: Path) -> None:
+    gateway = _FakeGateway(error=BudgetExceeded(PreflightDecision(
+        allowed=False, est_in_tokens=1, est_out_tokens=1, est_cost_usd=1.0,
+        remaining_usd=0.0, reason="run budget exhausted",
+    )))
+    with pytest.raises(SpecGenerationError) as exc_info:
+        await _gen(gateway).generate(run=_run(), project=_project(repo), repo_path=repo)
+    assert any("budget" in e for e in exc_info.value.errors)
+    assert isinstance(exc_info.value.__cause__, BudgetExceeded)
+
+
 async def test_feedback_block_only_when_present(repo: Path) -> None:
     gateway = _FakeGateway(_VALID_DOC)
     await _gen(gateway).generate(
@@ -161,3 +173,27 @@ async def test_missing_readme_omits_block(tmp_path: Path) -> None:
     _, user = gateway.calls[0]
     assert 'source="README.md"' not in user.content
     assert '<untrusted-data source="file-listing">' in user.content
+
+
+async def test_conventions_file_included_as_untrusted_data(tmp_path: Path) -> None:
+    (tmp_path / "ARCHITECTURE.md").write_text("Hexagonal architecture; ports in src/ports/.")
+    gateway = _FakeGateway(_VALID_DOC)
+    await _gen(gateway).generate(run=_run(), project=_project(tmp_path), repo_path=tmp_path)
+    _, user = gateway.calls[0]
+    assert '<untrusted-data source="architecture-conventions">' in user.content
+    assert "Hexagonal architecture; ports in src/ports/." in user.content
+
+
+async def test_no_conventions_file_omits_block(tmp_path: Path) -> None:
+    gateway = _FakeGateway(_VALID_DOC)
+    await _gen(gateway).generate(run=_run(), project=_project(tmp_path), repo_path=tmp_path)
+    _, user = gateway.calls[0]
+    assert 'source="architecture-conventions"' not in user.content
+
+
+async def test_conventions_truncated_at_cap(tmp_path: Path) -> None:
+    (tmp_path / "CONTRIBUTING.md").write_text("B" * 20_000)
+    gateway = _FakeGateway(_VALID_DOC)
+    await _gen(gateway).generate(run=_run(), project=_project(tmp_path), repo_path=tmp_path)
+    _, user = gateway.calls[0]
+    assert "truncated by girder at 16000 characters" in user.content

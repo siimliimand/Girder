@@ -174,7 +174,9 @@ class WaveIntegrator:
         # created from it), so the Sprint 4 delivery pipeline picks up from
         # there via the standard ff-only gate.
         ff = await branch_ops.audit_gated_merge(
-            source_branch=wave_branch, target_branch=run.branch, audit_passed=True
+            source_branch=wave_branch,
+            target_branch=run.branch,
+            audit_passed_for_commit=wave_tip,
         )
         if not ff.merged:
             return IntegrationOutcome("failed", f"run branch ff failed: {ff.reason}")

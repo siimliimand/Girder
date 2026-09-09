@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
 DISCORD_MAX = 2000
+TELEGRAM_MAX = 4096
 
 
 @dataclass
@@ -88,7 +89,11 @@ class Notifier:
                     return ChannelResult(channel, "skipped", "missing token or chat_id")
                 response = await client.post(
                     f"{TELEGRAM_API}/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "text": payload, "parse_mode": "Markdown"},
+                    json={
+                        "chat_id": chat_id,
+                        "text": payload[:TELEGRAM_MAX],
+                        "parse_mode": "Markdown",
+                    },
                 )
                 response.raise_for_status()
                 return ChannelResult(channel, "sent")

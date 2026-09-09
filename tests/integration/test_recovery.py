@@ -171,6 +171,7 @@ async def test_recovery_recreates_deleted_run_branch(crashed_state) -> None:
 async def test_recovery_prunes_worktree_row_with_missing_path(crashed_state) -> None:
     """§8.7 step 4: a worktree row whose path vanished is pruned (the DB row
     is the stale side) so the scheduler rebuilds cleanly from base_commit."""
+
     import shutil
 
     db: Database = crashed_state["db"]
@@ -278,6 +279,34 @@ async def test_delivery_branch_without_remote_left_for_operator(
     assert "operator attention" in sent[0][2]
 
 
+async def test_empty_repository_run_left_for_operator(db: Database, tmp_path: Path) -> None:
+    """A run on a repository with zero commits: no base ref resolves, so the
+    missing run branch cannot be recreated. Recovery must leave it for
+    operator attention and keep boot alive (regression: 'git branch <b> HEAD'
+    used to raise 'not a valid object name' and crash the whole daemon)."""
+    repo_dir = tmp_path / "empty-repo"
+    repo_dir.mkdir()
+    await _git(repo_dir, "init", "-b", "master")  # no commit, like a fresh checkout
+
+    project = await repo.create_project(db, "empty-repo", str(repo_dir))
+    run = await repo.create_run(db, project.id, "intent", "run/empty1", 5.0)
+    await seed_run_status(db, run.id, RunStatus.SPEC_PENDING.value)
+
+    service = RecoveryService(db, Settings())
+    report = await service.recover()  # must not raise
+
+    assert report.unresolved_bases == [f"run/empty1 ({repo_dir})"]
+    assert report.recreated_branches == []
+    assert report.restored_branches == []
+    probe = await run_host_cmd(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", "-q", "run/empty1"],
+        check=False,
+        timeout_s=30,
+    )
+    assert probe.returncode != 0  # still nothing to point the branch at
+    assert report.anything_recovered
+
+
 async def test_worktree_manager_list_stale_is_the_65_contract(crashed_state) -> None:
     """impl-plan §6.5 ``WorktreeManager.list_stale()`` delegates to the repo's
     find_stale_worktrees query: active rows whose attempt/task went terminal."""
@@ -293,3 +322,53 @@ async def test_worktree_manager_list_stale_is_the_65_contract(crashed_state) -> 
     stale = await manager.list_stale(db)
     assert [w.path for w in stale] == [str(crashed_state["worktree"])]
     assert stale[0].attempt_id == crashed_state["attempt"].id
+
+
+async def test_recovery_resets_drifted_run_branch_to_expected_commit(
+    crashed_state,
+) -> None:
+    """impl-plan §6.12: recovery must verify the run branch exists at the
+    *expected* commit (the last integrated tip in the DB), not merely that it
+    exists — a drifted branch is force-reset and the repair is audited."""
+    db: Database = crashed_state["db"]
+    repo_dir: Path = crashed_state["repo_dir"]
+    run = crashed_state["run"]
+
+    # The DB's last integrated tip: a commit the run branch pointed at.
+    await _git(repo_dir, "checkout", "-q", "run/rec1")
+    (repo_dir / "integrated.py").write_text("wave = 1\n")
+    await _git(repo_dir, "add", "-A")
+    await _git(repo_dir, "commit", "-m", "wave work")
+    expected = await _git_out(repo_dir, "rev-parse", "run/rec1")
+    await repo.insert_event(
+        db, "wave_integrated", {"wave_id": "w0", "sequence_order": 0, "tip": expected},
+        run_id=run.id,
+    )
+    await _git(repo_dir, "checkout", "-q", "main")
+    # Drift: something force-moved the run branch back to main.
+    await _git(repo_dir, "update-ref", "refs/heads/run/rec1", "main")
+    assert await _git_out(repo_dir, "rev-parse", "run/rec1") != expected
+
+    service = RecoveryService(db, Settings())
+    report = await service.recover()
+
+    assert report.corrected_branches == ["run/rec1"]
+    assert await _git_out(repo_dir, "rev-parse", "run/rec1") == expected
+    event = await repo.get_latest_event(db, run.id, "run_branch_tip_corrected")
+    assert event is not None
+    payload = event["payload"]
+    assert payload["was"] != expected and payload["reset_to"] == expected
+
+
+async def test_recovery_leaves_branch_alone_without_expected_tip(crashed_state) -> None:
+    """No wave_integrated event ⇒ no expected commit derivable: the branch
+    identity check must stay a no-op (§6.12 fallback to existence check)."""
+    db: Database = crashed_state["db"]
+    repo_dir: Path = crashed_state["repo_dir"]
+    before = await _git_out(repo_dir, "rev-parse", "run/rec1")
+
+    service = RecoveryService(db, Settings())
+    report = await service.recover()
+
+    assert report.corrected_branches == []
+    assert await _git_out(repo_dir, "rev-parse", "run/rec1") == before

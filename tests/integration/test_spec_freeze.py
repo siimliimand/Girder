@@ -178,3 +178,24 @@ async def test_tamper_evidence_hash_changes(git_repo: Path, tmp_path: Path) -> N
         for db in dbs:
             await db.close()
     assert hashes[0] != hashes[1]
+
+
+async def test_non_ascii_hash_matches_committed_bytes(
+    db: Database, git_repo: Path, tmp_path: Path
+) -> None:
+    """The hash must cover the bytes actually committed (explicit UTF-8 write),
+    not just the in-memory text (Phase 1 exit criterion 2)."""
+    proposal = PROPOSAL.replace("Narrative.", "Narrative — émoji 🚀 naïve.")
+    project = await repo.create_project(db, "utf8", str(git_repo))
+    run = await repo.create_run(db, project.id, "intént 🚀", "run/utf8", 5.0)
+    await seed_run_status(db, run.id, RunStatus.SPEC_PENDING.value)
+    fresh = await repo.get_run(db, run.id)
+    assert fresh is not None
+    result = await approve_and_freeze(
+        db, project=project, run=fresh, proposal_text=proposal,
+        repo_path=git_repo, worktree_base=tmp_path / "wt",
+    )
+    blob = await _git(git_repo, "show", f"{run.branch}:openspec/proposals/{run.id}.md")
+    assert blob == proposal
+    assert result.spec_hash == hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    assert result.spec_hash == hashlib.sha256(proposal.encode("utf-8")).hexdigest()

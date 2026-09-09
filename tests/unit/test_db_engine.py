@@ -296,12 +296,20 @@ async def test_mid_migration_failure_leaves_no_partial_state(tmp_path: Path) -> 
     clean instead of tripping over half-applied DDL."""
     migrations = tmp_path / "migrations"
     shutil.copytree(default_migrations_dir(), migrations)
-    (migrations / "012_atomicity_probe.sql").write_text(
+    # Probe beyond every shipped version so the probe cannot collide with a
+    # real migration number (a collision made MAX(version) after the failure
+    # depend on iterdir() ordering across filesystems).
+    shipped = [
+        int(p.name.split("_", 1)[0]) for p in migrations.iterdir() if p.suffix == ".sql"
+    ]
+    probe_version = max(shipped) + 1
+    probe_name = f"{probe_version:03d}_atomicity_probe.sql"
+    (migrations / probe_name).write_text(
         "CREATE TABLE probe_should_not_exist (id INTEGER);\n"
         "INSERT INTO no_such_table VALUES (1);\n"
     )
 
-    with pytest.raises(MigrationError, match="012_atomicity_probe"):
+    with pytest.raises(MigrationError, match=probe_name):
         await Database.open(tmp_path / "g.db", migrations_dir=migrations)
 
     db = await Database.open(tmp_path / "g.db", migrations_dir=migrations, run_migrations=False)
@@ -311,6 +319,6 @@ async def test_mid_migration_failure_leaves_no_partial_state(tmp_path: Path) -> 
         )
         assert probe is None
         v = await db.fetchone("SELECT MAX(version) AS v FROM schema_migrations")
-        assert v["v"] == 11  # the failed migration's version row is absent
+        assert v["v"] == max(shipped)  # the failed migration's version row is absent
     finally:
         await db.close()

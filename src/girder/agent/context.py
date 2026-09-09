@@ -83,7 +83,12 @@ def compact(
     Keeps ``messages[0]`` (system) and ``messages[1]`` (task brief) verbatim,
     elides ``<untrusted-data>`` bodies from the rest, and returns a scratchpad
     string summarizing files written, commands run, and errors seen. The
-    caller re-injects the scratchpad as a system-role message.
+    caller re-injects the scratchpad as a system-role message placed AFTER the
+    head pair.
+
+    Invariant (§8.5): ``messages[:2]`` is always ``[system, task brief]``;
+    scratchpads live in the tail and are re-distilled (collapsed into the new
+    scratchpad) on every compaction.
     """
     del context_window  # the decision was made by should_compact; kept for symmetry
     if stats is None:

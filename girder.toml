@@ -10,6 +10,8 @@ test_signal_patterns = [
   "**/test_*.py",
   "**/*_test.py",
   "**/conftest.py",
+  "tests/fixtures/**",
+  "**/mocks/**",
 ]
 protected_read_paths = [
   ".github/**",
@@ -55,10 +57,32 @@ merge_method = "squash"  # merge | squash | rebase (T1/T2 auto-merge)
 [notify]
 channels = []
 
-# [models.roles] — declare tier1/tier2/tier3 when Sprint 2 wires the gateway:
-# [[models.roles]]
-# role = "tier1"
-# provider = "openrouter"
-# model = "<frontier-reasoning-model-id>"
-# price_in_per_mtok = 0.0
-# price_out_per_mtok = 0.0
+# Model registry (D7): the role is the commitment, the model id is config.
+# All tiers on OpenRouter's rolling "latest" DeepSeek V4 Flash alias.
+# Pricing/context pulled from openrouter.ai/api/v1/models on 2026-09-09.
+[[models.roles]]
+role = "tier1"  # specs, plan estimation, review
+provider = "openrouter"
+model = "~deepseek/deepseek-v4-flash-latest"
+context_window = 1_310_720
+max_output_tokens = 8192
+price_in_per_mtok = 0.05
+price_out_per_mtok = 0.16
+
+[[models.roles]]
+role = "tier2"  # coding attempts
+provider = "openrouter"
+model = "~deepseek/deepseek-v4-flash-latest"
+context_window = 1_310_720
+max_output_tokens = 8192
+price_in_per_mtok = 0.05
+price_out_per_mtok = 0.16
+
+[[models.roles]]
+role = "tier3"  # summaries, triage, utility calls
+provider = "openrouter"
+model = "~deepseek/deepseek-v4-flash-latest"
+context_window = 1_310_720
+max_output_tokens = 8192
+price_in_per_mtok = 0.05
+price_out_per_mtok = 0.16

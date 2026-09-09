@@ -57,7 +57,8 @@ async def approve_and_freeze(
     if run.status != RunStatus.SPEC_PENDING:
         raise FreezeError(f"run {run.id} must be spec_pending to freeze (is {run.status})")
 
-    spec_hash = hashlib.sha256(proposal_text.encode()).hexdigest()
+    # Explicit UTF-8, matching the encoding the commit path writes below.
+    spec_hash = hashlib.sha256(proposal_text.encode("utf-8")).hexdigest()
 
     branch = run.branch
     base = await _resolve_base(repo_path, branch)
@@ -155,7 +156,7 @@ async def _commit_in_worktree(
     try:
         proposals = wt_path / "openspec" / "proposals"
         proposals.mkdir(parents=True, exist_ok=True)
-        (proposals / f"{run_id}.md").write_text(proposal_text)
+        (proposals / f"{run_id}.md").write_text(proposal_text, encoding="utf-8")
         await run_host_cmd(
             ["git", "-C", str(wt_path), "add", f"openspec/proposals/{run_id}.md"], timeout_s=60
         )

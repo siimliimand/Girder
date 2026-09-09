@@ -273,3 +273,17 @@ async def test_unknown_decision(ctx: Ctx) -> None:
         await resolve_amendment(
             ctx.db, project=ctx.project, run=ctx.run, amendment=amendment, decision="maybe"
         )
+
+
+async def test_failed_parking_does_not_leave_pending_row(ctx: Ctx) -> None:
+    """When the FSM parking transitions fail, the amendment row must not stay
+    'pending' — get_pending_amendment would otherwise freeze the run pump on a
+    phantom amendment (§8.4). The row is kept as 'aborted' for the audit trail."""
+    # Make the run transition illegal (aborted runs cannot be parked).
+    await seed_run_status(ctx.db, ctx.run.id, RunStatus.ABORTED.value)
+    with pytest.raises(AmendmentError, match="cannot request amendment"):
+        await _request(ctx)
+    rows = await repo.list_amendments_for_run(ctx.db, ctx.run.id)
+    assert len(rows) == 1
+    assert rows[0].status == "aborted"
+    assert await repo.get_pending_amendment(ctx.db, ctx.run.id) is None

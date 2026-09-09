@@ -23,6 +23,7 @@ migrations, this service reconciles the world to match it:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,8 @@ class RecoveryReport:
     recreated_branches: list[str] = field(default_factory=list)
     restored_branches: list[str] = field(default_factory=list)
     attention_branches: list[str] = field(default_factory=list)
+    unresolved_bases: list[str] = field(default_factory=list)
+    corrected_branches: list[str] = field(default_factory=list)
 
     @property
     def anything_recovered(self) -> bool:
@@ -83,6 +86,8 @@ class RecoveryReport:
             or self.recreated_branches
             or self.restored_branches
             or self.attention_branches
+            or self.unresolved_bases
+            or self.corrected_branches
         )
 
     def summary(self) -> str:
@@ -101,6 +106,16 @@ class RecoveryReport:
             lines.append(
                 f"- {len(self.attention_branches)} delivery run branch(es) missing locally AND"
                 " remotely — operator attention required"
+            )
+        if self.unresolved_bases:
+            lines.append(
+                f"- {len(self.unresolved_bases)} run branch(es) not recreatable — no base commit"
+                " exists (empty repository?) — operator attention required"
+            )
+        if self.corrected_branches:
+            lines.append(
+                f"- {len(self.corrected_branches)} run branch(es) had drifted from the"
+                " DB's expected commit — reset"
             )
         if self.pruned_worktrees:
             lines.append(f"- {len(self.pruned_worktrees)} worktree(s) pruned")
@@ -204,7 +219,9 @@ class RecoveryService:
         (the baseline anchor) so pumping can resume — except for delivery
         states: there the PR lives on the remote, so the branch is restored
         from the remote head, or (remote unreachable/branch absent) the run
-        is left for operator attention. Every action is logged, audited, and
+        is left for operator attention. Runs in repositories with no commits
+        at all (nothing to recreate from) are likewise left for operator
+        attention — never a boot failure. Every action is logged, audited, and
         lands in the recovery report."""
         terminal = [s.value for s in TERMINAL_RUN_STATUSES]
         rows = await self.db.fetchall(
@@ -218,17 +235,37 @@ class RecoveryService:
         )
         for row in rows:
             branch_ops = BranchOps(Path(row["repo_path"]))
-            if await branch_ops.run_branch_tip(row["branch"]) is not None:
+            tip = await branch_ops.run_branch_tip(row["branch"])
+            if tip is not None:
+                await self._verify_branch_identity(row, tip, branch_ops, report)
                 continue
             if row["run_status"] in {s.value for s in _DELIVERY_RUN_STATUSES}:
                 await self._restore_delivery_branch(row, branch_ops, report)
                 continue
-            base = "HEAD"
-            for ref in ("main", "origin/main"):
+            base = None
+            # HEAD (checked last) covers repos whose default branch is not
+            # ``main``; it only fails to resolve when no commit exists at all.
+            for ref in ("main", "origin/main", "HEAD"):
                 sha = await branch_ops.resolve_ref(ref)
                 if sha is not None:
                     base = sha
                     break
+            if base is None:
+                # Empty repository — no commit exists to recreate the branch
+                # from. Leave the run for operator attention (a commit must
+                # land before baseline can run anyway); one unresolvable run
+                # must not fail boot for every other project.
+                log.warning(
+                    "run %s: branch %s missing and no base ref resolves in %s"
+                    " (repository has no commits?) — left for operator attention",
+                    row["run_id"],
+                    row["branch"],
+                    row["repo_path"],
+                )
+                report.unresolved_bases.append(
+                    f"{row['branch']} ({row['repo_path']})"
+                )
+                continue
             tip = await branch_ops.ensure_run_branch(row["branch"], base_commit=base)
             log.warning(
                 "run %s: branch %s missing from git — recreated at %s",
@@ -237,6 +274,67 @@ class RecoveryService:
                 tip,
             )
             report.recreated_branches.append(row["branch"])
+
+    async def _verify_branch_identity(
+        self, row: Row, tip: str, branch_ops: BranchOps, report: RecoveryReport
+    ) -> None:
+        """impl-plan §6.12: verify the branch exists *at the expected commit*.
+
+        The expected tip is the last commit the DB saw integrated into the run
+        branch (the ``tip`` of the latest ``wave_integrated`` event — the run
+        branch is ff'd to it before the event lands). On divergence the branch
+        is force-reset to the expected commit and the repair is audited; when
+        no expected value can be derived (no integration has happened yet),
+        any tip is consistent and the branch is left alone. Recovery runs at
+        boot, before the pump — no concurrent process can race the reset.
+        """
+        if row["run_status"] in {s.value for s in _DELIVERY_RUN_STATUSES}:
+            return  # delivery pump reconciles against the remote PR head
+        r = await self.db.fetchone(
+            """
+            SELECT payload_json FROM agent_events
+            WHERE run_id = ? AND event_type = 'wave_integrated'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (row["run_id"],),
+        )
+        if r is None:
+            return  # nothing integrated yet — no expected commit in the DB
+        expected = json.loads(r["payload_json"]).get("tip")
+        if not isinstance(expected, str) or expected == tip:
+            return
+        moved = await branch_ops.reset_branch(row["branch"], base_ref=expected)
+        if moved is None:
+            log.error(
+                "run %s: branch %s at %s, expected %s — CAS reset failed,"
+                " left for operator attention",
+                row["run_id"],
+                row["branch"],
+                tip,
+                expected,
+            )
+            await repo.insert_event(
+                self.db,
+                "run_branch_divergence_unresolved",
+                {"branch": row["branch"], "actual": tip, "expected": expected},
+                run_id=row["run_id"],
+            )
+            report.attention_branches.append(row["branch"])
+            return
+        log.warning(
+            "run %s: branch %s had drifted to %s — reset to expected commit %s",
+            row["run_id"],
+            row["branch"],
+            tip,
+            moved,
+        )
+        await repo.insert_event(
+            self.db,
+            "run_branch_tip_corrected",
+            {"branch": row["branch"], "was": tip, "reset_to": moved},
+            run_id=row["run_id"],
+        )
+        report.corrected_branches.append(row["branch"])
 
     async def _restore_delivery_branch(
         self, row: Row, branch_ops: BranchOps, report: RecoveryReport

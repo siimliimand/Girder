@@ -82,6 +82,11 @@ class SandboxNetwork(BaseModel):
     # Interpreter used to run project test suites (baseline + verify loop).
     # "python3" is the portable default; the CI parity image may pin another.
     python_bin: str = "python3"
+    # Host package-cache root bound read-only into every attempt container
+    # (plan.md Phase 0 task 3, impl-plan §6.4/§8.1): subdirs pip/ npm/ cargo/
+    # map onto the image's PIP_CACHE_DIR/npm_config_cache/CARGO_HOME paths
+    # (/cache/*). A missing host subdir simply skips that mount.
+    cache_dir: str = "/var/cache/orchestrator"
 
 
 class GithubConfig(BaseModel):

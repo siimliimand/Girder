@@ -217,7 +217,9 @@ async def test_abort_wins_while_paused_and_clears_flag(harness: Harness) -> None
 async def test_skip_steering_skips_task_and_runs_the_rest(harness: Harness) -> None:
     h = harness
     t1 = await _add_task(h, h.run_id, seq=1, scope_globs=["src/**"])
-    await _add_task(h, h.run_id, seq=2, scope_globs=["docs/**"])
+    # same src/** scope as the scripted compliant attempt — an out-of-scope
+    # write would be held and taint the attempt (§8), drowning the skip signal
+    await _add_task(h, h.run_id, seq=2, scope_globs=["src/**"])
     # one attempt's script per task_max_attempts, plus the sentinel fallback:
     # a legitimate attempt retry (e.g. wall-clock expiry under full-suite
     # load) must be served, not crash the harness — see SentinelGateway.
@@ -227,7 +229,9 @@ async def test_skip_steering_skips_task_and_runs_the_rest(harness: Harness) -> N
     await repo.insert_steering_event(h.db, h.run_id, SteeringKind.SKIP.value, {"task_id": t1.id})
 
     descriptor = await h.engine(gateway).pump_once(h.run_id)
-    assert descriptor == "wave_executed"
+    # t2 completes in the same pump now that its scope matches the script, so
+    # the wave finishes outright instead of deferring to a later pump
+    assert descriptor == "wave_completed"
     statuses = {r["id"]: r["status"] for r in await h.db.fetchall("SELECT id, status FROM tasks")}
     assert statuses[t1.id] == TaskStatus.SKIPPED.value
     assert all(s != TaskStatus.SKIPPED.value for k, s in statuses.items() if k != t1.id)

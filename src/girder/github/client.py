@@ -326,18 +326,42 @@ class GitHubClient:
         return runs
 
     async def _job_logs(self, check: CheckRun) -> str:
-        """Redacted tail of the Actions job logs for *check* ("" when unavailable)."""
+        """Redacted tail of the Actions job logs for *check* ("" when unavailable).
+
+        Routed through :meth:`_request` so the fetch lands in the redacted
+        ``github_api_call`` audit log like every other call (impl-plan §6.11:
+        "all redacted-logged"). The API answers the logs path with a 302 to the
+        log blob (followed here) and 404 for jobs whose logs expired (kept
+        tolerant, as for PRs without check runs); anything else logs a warning
+        instead of failing silently.
+        """
         if check.id is None:
             return ""
         owner, name = await self.owner_repo()
+        path = f"/repos/{owner}/{name}/actions/jobs/{check.id}/logs"
         try:
-            resp = await self._client.get(
-                f"/repos/{owner}/{name}/actions/jobs/{check.id}/logs",
-                follow_redirects=True,  # the API 302s to the log blob
+            resp = await self._request("GET", path, ok=frozenset({302, 404}))
+            if resp.status_code == 302:
+                resp = await self._client.get(
+                    resp.headers["location"],
+                    follow_redirects=True,  # the API 302s to the log blob
+                )
+                if resp.status_code >= 400:
+                    log.warning(
+                        "job-logs fetch for check %s failed: HTTP %s (redirect target)",
+                        check.id,
+                        resp.status_code,
+                    )
+                    return ""
+            elif resp.status_code == 404:
+                return ""  # logs expired / unavailable — tolerated
+        except (GitHubError, httpx.TransportError, KeyError) as exc:
+            await repo.insert_event(
+                self.db,
+                "github_api_call",
+                {"method": "GET", "path": path, "status": f"error: {exc}"},
             )
-        except httpx.TransportError:
-            return ""
-        if resp.status_code >= 400:
+            log.warning("job-logs fetch for check %s failed: %s", check.id, exc)
             return ""
         return self._redact_sync(resp.text[-_LOG_TAIL_CHARS:])
 

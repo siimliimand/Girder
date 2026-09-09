@@ -192,13 +192,12 @@ class DeliveryEngine:
 
     async def _pump_ci_running(self, run: Run) -> str:
         # Poll deadline (impl-plan §6.11: timeout ⇒ escalated, never poll
-        # forever). Measured from the run's FIRST entry into ci_running —
-        # ci_fixing → ci_running re-entries do not reset it — and derived
-        # from the persisted state_transition event, so it survives a
-        # restart (fresh boot re-derives the same deadline).
-        ts = await repo.get_first_transition_ts_to(
-            self.db, run.id, RunStatus.CI_RUNNING.value
-        )
+        # forever). The baseline is the run's most recent entry into
+        # ci_running — a diagnostic fix push (ci_fixing → ci_running) resets
+        # the clock, so fix-episode time never eats the post-fix CI budget —
+        # and is derived from the persisted state_transition events, so it
+        # survives a restart (fresh boot re-derives the same deadline).
+        ts = await self._ci_running_baseline(run)
         if ts is not None:
             entered = datetime.fromisoformat(ts)
             waited_s = (datetime.now(UTC) - entered).total_seconds()
@@ -214,6 +213,21 @@ class DeliveryEngine:
         if snapshot is None:
             return "ci_pending"
         return await self._classify_and_route(run, sha, snapshot)
+
+    async def _ci_running_baseline(self, run: Run) -> str | None:
+        """Timestamp of the ci_running entry the poll deadline is measured from.
+
+        The most recent ``ci_fixing → ci_running`` transition (the fix push)
+        when one exists — so a fix episode buys a fresh CI budget — falling
+        back to the first ci_running entry when no fix has occurred. Both come
+        from persisted events, so a restart re-derives the same deadline.
+        """
+        latest = await repo.get_latest_event(self.db, run.id, "state_transition")
+        if latest is not None and latest["payload"].get("to") == RunStatus.CI_RUNNING.value:
+            return str(latest["ts"])
+        return await repo.get_first_transition_ts_to(
+            self.db, run.id, RunStatus.CI_RUNNING.value
+        )
 
     async def _classify_and_route(self, run: Run, sha: str, snapshot: CiSnapshot) -> str:
         """Green ⇒ conformance; red ⇒ classify (baseline/flaky) then fix or escalate."""
@@ -442,13 +456,19 @@ class DeliveryEngine:
         return "merged"
 
     async def _pump_merge_pending(self, run: Run) -> str:
-        """T0: wait for the human merge click; detect out-of-band merges.
+        """Wait for the merge: T0 for the human click, T1/T2 for window capacity.
 
         get_pr is throttled to ``settings.github.poll_interval_s`` per run
         (same cadence as the CI poll) — parked runs get pumped on every cycle,
         and an unthrottled poll would hammer the GitHub API. The last-poll
         map is in-memory and resets on daemon restart: worst case that costs
-        one extra poll."""
+        one extra poll.
+
+        §2.3: the T1 review window only pauses NEW runs — a T1 run parked by a
+        full window re-evaluates the (freshly derived) unreviewed count on
+        every poll and auto-merges once the user marks prior merges reviewed.
+        A T2 run parked without an earned streak re-checks the streak the same
+        way. T0 keeps waiting for the human merge click unconditionally."""
         assert run.pr_number is not None
         interval = self.settings.github.poll_interval_s
         last = self._last_merge_poll.get(run.id)
@@ -456,13 +476,20 @@ class DeliveryEngine:
             return "merge_pending_human"
         self._last_merge_poll[run.id] = time.monotonic()
         pr = await self.github.get_pr(run.pr_number)
+        project = await self._project_of(run)
         if pr.get("merged"):
-            project = await self._project_of(run)
             merge_sha = pr.get("merge_commit_sha")
             await self._post_merge(run, project, str(merge_sha) if merge_sha else None)
             await transition_run(self.db, run.id, RunStatus.MERGED,
                                  payload={"merge_sha": merge_sha})
             return "merged"
+        tier = project.autonomy_tier
+        if tier == 1:
+            unreviewed = await repo.count_unreviewed_merges(self.db, project.id)
+            if unreviewed < self.settings.autonomy.t1_review_window:
+                return await self._merge(run, project)
+        elif tier == 2 and project.clean_merge_streak >= self.settings.autonomy.t2_required_streak:
+            return await self._merge(run, project)
         return "merge_pending_human"
 
     async def _post_merge(self, run: Run, project: Project, merge_sha: str | None) -> None:

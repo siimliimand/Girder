@@ -62,7 +62,9 @@ async def test_merge_refused_when_audit_failed(repo: Path) -> None:
     await _git(repo, "checkout", "-q", "main")
     ops = BranchOps(repo)
     result = await ops.audit_gated_merge(
-        source_branch="task/t1", target_branch="run/r1", audit_passed=False
+        source_branch="task/t1",
+        target_branch="run/r1",
+        audit_passed_for_commit="0" * 40,  # not the commit being merged
     )
     assert result == result.__class__(merged=False, merged_commit=None, reason=result.reason)
     assert result.reason
@@ -84,7 +86,7 @@ async def test_merge_refused_non_ff(repo: Path) -> None:
     (repo / "task.py").write_text("t\n")
     src_tip = await _commit(repo, "task work")
     result = await ops.audit_gated_merge(
-        source_branch="task/t2", target_branch="run/r2", audit_passed=True
+        source_branch="task/t2", target_branch="run/r2", audit_passed_for_commit=src_tip
     )
     assert not result.merged
     assert "fast-forward" in (result.reason or "")
@@ -106,7 +108,7 @@ async def test_merge_succeeds_ff_and_updates_target(repo: Path, tmp_path: Path) 
     result = await ops.audit_gated_merge(
         source_branch="task/t3",
         target_branch="run/r3",
-        audit_passed=True,
+        audit_passed_for_commit=src_tip,
         worktree_path=ref.path,
     )
     assert result.merged
@@ -120,11 +122,13 @@ async def test_merge_refused_when_worktree_dirty(repo: Path, tmp_path: Path) -> 
     await ops.ensure_run_branch("run/r4", base_commit=base)
     mgr = WorktreeManager(repo, base=tmp_path / "wt")
     ref = await mgr.create("run4", "t4", base)
+    (ref.path / "clean.py").write_text("c\n")
+    src_tip = await _commit(ref.path, "work")
     (ref.path / "dirty.py").write_text("d\n")
     result = await ops.audit_gated_merge(
         source_branch="task/t4",
         target_branch="run/r4",
-        audit_passed=True,
+        audit_passed_for_commit=src_tip,
         worktree_path=ref.path,
     )
     assert not result.merged
@@ -136,10 +140,45 @@ async def test_merge_refused_missing_branch(repo: Path) -> None:
     ops = BranchOps(repo)
     await ops.ensure_run_branch("run/r5", base_commit=base)
     result = await ops.audit_gated_merge(
-        source_branch="task/ghost", target_branch="run/r5", audit_passed=True
+        source_branch="task/ghost", target_branch="run/r5", audit_passed_for_commit="e" * 40
     )
     assert not result.merged
     assert "not found" in (result.reason or "")
+
+
+# --- audit bound to the exact commit (impl-plan §6.5) ---
+
+
+async def test_merge_refused_when_audit_sha_is_not_the_source_tip(repo: Path) -> None:
+    await _git(repo, "branch", "run/r6")
+    await _git(repo, "checkout", "-q", "-b", "task/t6")
+    (repo / "app.py").write_text("x = 6\n")
+    src_tip = await _commit(repo, "work")
+    # a *second* commit after the audited one: the audit is now stale
+    (repo / "app.py").write_text("x = 7\n")
+    await _commit(repo, "more work")
+    await _git(repo, "checkout", "-q", "main")
+    ops = BranchOps(repo)
+    result = await ops.audit_gated_merge(
+        source_branch="task/t6", target_branch="run/r6", audit_passed_for_commit=src_tip
+    )
+    assert not result.merged
+    assert await ops.run_branch_tip("run/r6") != src_tip
+
+
+async def test_merge_succeeds_when_audit_sha_matches_source_tip(repo: Path) -> None:
+    await _git(repo, "branch", "run/r7")
+    await _git(repo, "checkout", "-q", "-b", "task/t7")
+    (repo / "app.py").write_text("x = 7\n")
+    src_tip = await _commit(repo, "work")
+    await _git(repo, "checkout", "-q", "main")
+    ops = BranchOps(repo)
+    result = await ops.audit_gated_merge(
+        source_branch="task/t7", target_branch="run/r7", audit_passed_for_commit=src_tip
+    )
+    assert result.merged
+    assert result.merged_commit == src_tip
+    assert await ops.run_branch_tip("run/r7") == src_tip
 
 
 # --- integrate_branch (three-way integration, Sprint 5) ---

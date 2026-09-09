@@ -497,6 +497,43 @@ async def _resolve_amendment_route(
 # ------------------------------------------------------------------------ JSON
 
 
+def _project_json(project: Project, timestamps: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "id": project.id,
+        "name": project.name,
+        "repo_path": project.repo_path,
+        "autonomy_tier": project.autonomy_tier,
+        "clean_merge_streak": project.clean_merge_streak,
+        "created_at": (timestamps or {}).get("created_at"),
+        "updated_at": (timestamps or {}).get("updated_at"),
+    }
+
+
+async def _project_timestamps(db: Database, project_id: str) -> dict[str, Any]:
+    # created_at/updated_at live in the projects table but not on the Project
+    # dataclass (girder.db is another workstream) — read them directly here.
+    row = await db.fetchone(
+        "SELECT created_at, updated_at FROM projects WHERE id = ?", (project_id,)
+    )
+    return dict(row) if row is not None else {}
+
+
+@router.get("/api/projects")
+async def projects_json(request: Request) -> JSONResponse:
+    db: Database = request.app.state.db
+    projects = await repo.list_projects(db)
+    return JSONResponse(
+        [_project_json(p, await _project_timestamps(db, p.id)) for p in projects]
+    )
+
+
+@router.get("/api/projects/{pid}")
+async def project_json(request: Request, pid: str) -> JSONResponse:
+    db: Database = request.app.state.db
+    project = await _require_project(db, pid)
+    return JSONResponse(_project_json(project, await _project_timestamps(db, pid)))
+
+
 @router.get("/api/runs/{rid}")
 async def run_json(request: Request, rid: str) -> JSONResponse:
     db: Database = request.app.state.db

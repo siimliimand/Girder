@@ -1287,3 +1287,18 @@ async def set_project_tier(db: Database, project_id: str, tier: int) -> None:
         (tier, utcnow_iso(), project_id),
     )
     await db.conn.commit()
+
+
+async def count_held_tool_calls(db: Database, attempt_id: str) -> int:
+    """Count held or scope-violating tool calls for one attempt (impl-plan §8).
+
+    A ``held=1`` row means the registry refused to execute the call; any such
+    row taints the whole attempt — completion may never rest on work the
+    orchestrator never ran. Used by the verify step to fail the attempt
+    without retry before any merge can happen."""
+    row = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tool_calls WHERE attempt_id = ?"
+        " AND (scope_violation = 1 OR held = 1)",
+        (attempt_id,),
+    )
+    return int(row["n"]) if row is not None else 0

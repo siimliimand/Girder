@@ -253,6 +253,47 @@ async def test_spec_amendment_outcome(seeded: tuple[Database, str, Attempt, Task
     assert outcome.amendment == ("impossible", "swap x for y")
 
 
+async def test_repeated_compaction_retains_system_and_task_brief(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """§8.5: messages[:2] is always [system, task brief] across any number of
+    compactions; scratchpads live in the tail and collapse to exactly ONE."""
+    _db, _run_id, _attempt, _task = seeded
+
+    class _SmallWindowGateway(FakeGateway):
+        def role_config(self, role: str) -> Any:
+            cfg = super().role_config(role)
+            cfg.context_window = 1000  # compact above ~700 estimated tokens
+            return cfg
+
+    runtime = _runtime(seeded, _SmallWindowGateway([]), FakeSandbox())
+    system_text = "SYSTEM INVARIANTS"
+    brief_text = "TASK BRIEF with FROZEN SPEC SLICE: immutable-marker"
+    messages = [
+        Message(role="system", content=system_text),
+        Message(role="user", content=brief_text),
+    ]
+
+    def _filler(n: int) -> Message:
+        return Message(
+            role="user",
+            content='<untrusted-data source="read_file:src/big.py">\n'
+            + ("X" * 600 * n)
+            + "</untrusted-data>",
+        )
+
+    for _round in range(3):
+        for _ in range(3):
+            messages.append(_filler(5))
+        messages = runtime._maybe_compact(messages)
+        assert messages[0].content == system_text
+        assert messages[1].content == brief_text
+        assert "immutable-marker" in messages[1].content
+        scratchpads = [m for m in messages if "Scratchpad (prior progress)" in m.content]
+        assert len(scratchpads) == 1
+        assert messages[2] is scratchpads[0]
+
+
 async def test_guidance_and_schema_reach_the_gateway(
     seeded: tuple[Database, str, Attempt, Task],
 ) -> None:

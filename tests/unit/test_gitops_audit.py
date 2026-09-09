@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -208,6 +209,23 @@ async def test_manifest_from_commit_matches_capture(repo: Path, tmp_path: Path) 
     from_worktree = await _audit().capture_test_manifest(repo)
     assert from_commit.root_hash == from_worktree.root_hash
     assert from_commit.files == from_worktree.files
+
+
+async def test_manifest_from_commit_hashes_non_utf8_bytes(repo: Path) -> None:
+    """manifest_from_commit must hash raw bytes like capture_test_manifest does.
+
+    A test file with non-UTF-8 content used to be text-decoded (``git show``
+    + ``encode``), which mangled the bytes and produced a false content-hash
+    mismatch against the worktree-side raw-byte hash (impl-plan §6.5).
+    """
+    raw = b"def test_bin():\n    data = b'\xff\xfe\x00bin'\n"
+    (repo / "tests" / "test_bin.py").write_bytes(raw)
+    await _git(repo, "add", "-A")
+    await _git(repo, "commit", "-m", "binary test file")
+    commit = (await _git(repo, "rev-parse", "HEAD")).strip()
+
+    from_commit = await _audit().manifest_from_commit(repo, commit)
+    assert from_commit.files["tests/test_bin.py"] == hashlib.sha256(raw).hexdigest()
 
 
 async def test_audit_commit_test_path_violation(repo: Path) -> None:

@@ -334,3 +334,33 @@ async def test_generation_failure_recorded(tmp_path: Path) -> None:
         panel = await client.get(f"/runs/{rid}/panel")
         assert panel.status_code == 200
         assert "Generation failed" in panel.text
+
+
+async def test_project_json_endpoints(tmp_path: Path) -> None:
+    """§10: GET /api/projects[/{id}] return project JSON (list includes a
+    created project; single-get returns it; unknown id ⇒ 404)."""
+    fake = _FakeGenerator()
+    app = make_app(tmp_path, fake)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        pid = await make_project(client, tmp_path, name="jsonproj")
+
+        listed = await client.get("/api/projects")
+        assert listed.status_code == 200
+        items = listed.json()
+        assert isinstance(items, list)
+        matches = [p for p in items if p["id"] == pid]
+        assert len(matches) == 1
+        row = matches[0]
+        assert row["name"] == "jsonproj"
+        assert row["autonomy_tier"] == 0
+        assert row["clean_merge_streak"] == 0
+        assert row["repo_path"].endswith("repo")
+        assert {"created_at", "updated_at"} <= set(row)
+
+        single = await client.get(f"/api/projects/{pid}")
+        assert single.status_code == 200
+        assert single.json()["id"] == pid
+        assert single.json()["name"] == "jsonproj"
+
+        missing = await client.get("/api/projects/nope")
+        assert missing.status_code == 404

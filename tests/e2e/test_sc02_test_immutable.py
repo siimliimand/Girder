@@ -111,10 +111,11 @@ async def test_sc02_test_write_held_then_direct_mutation_fails_run(make_ctx: Mak
     fresh = await repo.get_run(ctx.db, ctx.run.id)
     assert fresh is not None and fresh.status is RunStatus.FAILED
     tasks = await repo.list_tasks_for_run(ctx.db, ctx.run.id)
-    # Sprint 5 wave mode: both tasks run concurrently in wave 0; task 2's
-    # integrity violation fails the run BEFORE integration, so task 1 is left
-    # verified-but-unintegrated and the run branch never moves.
-    assert [t.status for t in tasks] == [TaskStatus.VERIFY_PASSED, TaskStatus.FAILED]
+    # Sprint 5 wave mode: both tasks run concurrently in wave 0. Task 1's held
+    # test-write taints its own attempt (impl-plan §8: held calls block the
+    # merge at every tier) and task 2's mechanical audit violation fails its
+    # attempt — both fail WITHOUT retry and the run branch never moves.
+    assert [t.status for t in tasks] == [TaskStatus.FAILED, TaskStatus.FAILED]
     tip_after = (await git(ctx.repo_path, "rev-parse", fresh.branch)).strip()
     assert tip_after == tip_before  # an integrity-violating run never merges
 
@@ -123,6 +124,8 @@ async def test_sc02_test_write_held_then_direct_mutation_fails_run(make_ctx: Mak
         "SELECT id, status FROM attempts WHERE task_id = ? ORDER BY attempt_num", (tasks[0].id,)
     )
     assert len(attempts1) == 1
+    # the held test write fails task 1's attempt without retry (§8)
+    assert attempts1[0]["status"] == AttemptStatus.INTEGRITY_VIOLATION.value
     held = await ctx.db.fetchall(
         "SELECT tool_name, input_json FROM tool_calls WHERE attempt_id = ? AND held = 1",
         (attempts1[0]["id"],),

@@ -13,10 +13,13 @@ Illegal edges raise :class:`InvalidTransition` rather than being tolerated.
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 from typing import Any
 
-from girder.db.engine import Database
-from girder.db.models import AttemptStatus, RunStatus, TaskStatus
+from girder.db import repo
+from girder.db.engine import Database, default_migrations_dir
+from girder.db.models import AttemptStatus, RunStatus, TaskStatus, TaskType
 from girder.util import utcnow_iso
 
 _TABLE = {"run": "runs", "task": "tasks", "attempt": "attempts"}
@@ -54,8 +57,16 @@ _RUN_EDGES: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.ESCALATED,
         }
     ),
+    # §5.1: "active / any → failed" — a task exhausting task_max_attempts
+    # fails the run even while the run sits awaiting a user amendment.
     RunStatus.AWAITING_AMENDMENT: frozenset(
-        {RunStatus.ACTIVE, RunStatus.PR_OPEN, RunStatus.ABORTED, RunStatus.BUDGET_EXHAUSTED}
+        {
+            RunStatus.ACTIVE,
+            RunStatus.PR_OPEN,
+            RunStatus.FAILED,
+            RunStatus.ABORTED,
+            RunStatus.BUDGET_EXHAUSTED,
+        }
     ),
     RunStatus.PR_OPEN: frozenset(
         {RunStatus.CI_RUNNING, RunStatus.ABORTED, RunStatus.ESCALATED, RunStatus.BUDGET_EXHAUSTED}
@@ -95,7 +106,9 @@ _RUN_EDGES: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.FAILED: frozenset(),
     RunStatus.ABORTED: frozenset(),
     RunStatus.BUDGET_EXHAUSTED: frozenset({RunStatus.ABORTED}),
-    RunStatus.ESCALATED: frozenset({RunStatus.ACTIVE, RunStatus.MERGED, RunStatus.ABORTED}),
+    # §5.1: escalated is a hard stop — a human reviews at every tier (D4).
+    # No automated exit exists: only an explicit operator abort leaves it.
+    RunStatus.ESCALATED: frozenset({RunStatus.ABORTED}),
 }
 
 # Task states (impl-plan §5.2). Terminal: completed / failed / skipped /
@@ -284,6 +297,71 @@ async def _attempt_context(conn: Any, attempt_id: str) -> str | None:
     return r["run_id"] if r else None
 
 
+# ------------------------------------------------------------------ boot self-test
+
+
+class FsmSelfTestError(RuntimeError):
+    """Raised by :func:`self_test` when the edge tables and the engine disagree."""
+
+    def __init__(self, failures: list[str]) -> None:
+        super().__init__(
+            "FSM self-test failed: " + "; ".join(failures[:10])
+            + (f" (+{len(failures) - 10} more)" if len(failures) > 10 else "")
+        )
+        self.failures = failures
+
+
+async def self_test(db_path: Path | None = None) -> None:
+    """Boot-time self-test (impl-plan §6.3 / Phase 0 exit criterion 1).
+
+    Walks a synthetic run/task/attempt through every declared edge against a
+    throwaway database (``*db_path*`` or a fresh temp file) and asserts every
+    undeclared edge raises :class:`InvalidTransition`. Raises
+    :class:`FsmSelfTestError` on any disagreement between the tables and the
+    guarded transition engine — the daemon and the web app call this once at
+    startup to fail fast rather than mid-run.
+    """
+    tmp: tempfile.TemporaryDirectory[str] | None = None
+    if db_path is None:
+        tmp = tempfile.TemporaryDirectory(prefix="girder-fsm-selftest-")
+        db_path = Path(tmp.name) / "fsm.db"
+    db = await Database.open(db_path, migrations_dir=default_migrations_dir())
+    failures: list[str] = []
+    try:
+        project = await repo.create_project(db, "fsm-selftest", "/fsm-selftest")
+        run = await repo.create_run(db, project.id, "boot self-test", "run/fsm-selftest", 0.0)
+        wave = await repo.get_or_create_wave0(db, run.id)
+        task = await repo.create_task(db, wave.id, 0, "boot self-test", TaskType.CODE_CHANGE)
+        attempt = await repo.create_attempt(db, task.id, "0" * 40)
+        plan: list[tuple[str, str, str, Any, dict[Any, frozenset[Any]]]] = [
+            ("run", "runs", run.id, RunStatus, _RUN_EDGES),
+            ("task", "tasks", task.id, TaskStatus, _TASK_EDGES),
+            ("attempt", "attempts", attempt.id, AttemptStatus, _ATTEMPT_EDGES),
+        ]
+        for kind, table, row_id, enum_cls, edges in plan:
+            legal = {(f.value, t.value) for f, targets in edges.items() for t in targets}
+            states = [s.value for s in enum_cls]
+            for src in states:
+                for dst in states:
+                    # Direct write before EVERY probe: a successful transition
+                    # must not leak into the next one's source state.
+                    await db.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (src, row_id))
+                    await db.conn.commit()
+                    try:
+                        await transition(db, kind, row_id, dst)
+                        ok = (src, dst) in legal
+                    except InvalidTransition:
+                        ok = (src, dst) not in legal
+                    if not ok:
+                        failures.append(f"{kind} {src}->{dst} disagrees with the edge table")
+        if failures:
+            raise FsmSelfTestError(failures)
+    finally:
+        await db.close()
+        if tmp is not None:
+            tmp.cleanup()
+
+
 # Convenience wrappers keep call sites readable.
 async def transition_run(db: Database, run_id: str, new: RunStatus | str, **payload: Any) -> str:
     return await transition(db, "run", run_id, str(new), payload=payload or None)
@@ -303,8 +381,10 @@ __all__ = [
     "_ATTEMPT_EDGES",
     "_RUN_EDGES",
     "_TASK_EDGES",
+    "FsmSelfTestError",
     "InvalidTransition",
     "current_status",
+    "self_test",
     "transition",
     "transition_attempt",
     "transition_run",

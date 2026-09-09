@@ -23,6 +23,8 @@ def test_defaults_when_no_toml_found(tmp_path: Path) -> None:
     assert settings.limits.task_max_attempts == 3
     assert settings.autonomy.tier == 0  # every project starts supervised (§2.3)
     assert settings.sandbox.runtime == "podman"
+    # package-cache root for RO mounts into attempt containers (§8.1, §6.4)
+    assert settings.sandbox.cache_dir == "/var/cache/orchestrator"
     assert settings.models.roles == []
 
 

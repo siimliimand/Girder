@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from girder.budget.guard import BudgetExceeded
 from girder.config import Settings
 from girder.db.models import Project, Run
 from girder.models.gateway import Message, ModelError, ModelGateway
@@ -24,6 +25,17 @@ from girder.specs.validator import OPENSPEC_TEMPLATE, SpecValidationError, parse
 _MAX_README_CHARS = 16_000
 _MAX_FILE_LISTING_LINES = 100
 _TRUNCATION_MARKER = "[...truncated by girder at {} characters]"
+
+# Candidate repo files carrying existing architecture conventions (plan.md
+# Phase 1 task 1: prompt injects "README, existing architecture conventions,
+# and target user intent"). First existing candidates win; import order only.
+_CONVENTIONS_CANDIDATES = (
+    "ARCHITECTURE.md",
+    "CONTRIBUTING.md",
+    "docs/architecture.md",
+    "docs/conventions.md",
+    "CLAUDE.md",
+)
 
 # D11 framing, adapted from docs/implementation-plan.md §7 (agent prompt
 # architecture). Repository content is data, never instructions.
@@ -66,16 +78,37 @@ class SpecGenerationError(RuntimeError):
         super().__init__("spec generation failed: " + "; ".join(errors))
 
 
-def _read_readme(repo_path: Path) -> str | None:
-    """README.md contents, hard-capped at 16_000 chars (never fatal)."""
-    readme = repo_path / "README.md"
+def _read_capped(path: Path, cap: int = _MAX_README_CHARS) -> str | None:
+    """File contents, hard-capped at *cap* chars (never fatal)."""
     try:
-        text = readme.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    if len(text) > _MAX_README_CHARS:
-        text = text[:_MAX_README_CHARS] + "\n" + _TRUNCATION_MARKER.format(_MAX_README_CHARS)
+    if len(text) > cap:
+        text = text[:cap] + "\n" + _TRUNCATION_MARKER.format(cap)
     return text
+
+
+def _read_readme(repo_path: Path) -> str | None:
+    """README.md contents, hard-capped at 16_000 chars (never fatal)."""
+    return _read_capped(repo_path / "README.md")
+
+
+def _read_conventions(repo_path: Path) -> str | None:
+    """First existing architecture-conventions candidate file(s), capped.
+
+    Loads up to the first two candidates that exist so a repo split across
+    ARCHITECTURE.md + CONTRIBUTING.md is still covered without bloating the
+    prompt; None when the repo carries none.
+    """
+    parts: list[str] = []
+    for name in _CONVENTIONS_CANDIDATES:
+        if len(parts) >= 2:
+            break
+        text = _read_capped(repo_path / name)
+        if text is not None:
+            parts.append(text)
+    return "\n\n".join(parts) if parts else None
 
 
 def _file_listing(repo_path: Path) -> str | None:
@@ -130,6 +163,12 @@ class SpecGenerator:
         ]
         try:
             response = await self.gateway.complete("tier1", messages, run_id=run.id)
+        except BudgetExceeded as exc:
+            # Uniform error contract: callers of generate() handle
+            # SpecGenerationError, never gateway internals directly. The API
+            # layer records it via spec_generation_failed; the budget guard
+            # has already done its own preflight bookkeeping.
+            raise SpecGenerationError([f"budget exceeded: {exc}"]) from exc
         except ModelError as exc:
             raise SpecGenerationError([str(exc)]) from exc
 
@@ -150,6 +189,12 @@ class SpecGenerator:
         readme = _read_readme(repo_path)
         if readme is not None:
             parts.append(f'<untrusted-data source="README.md">\n{readme}\n</untrusted-data>')
+        conventions = _read_conventions(repo_path)
+        if conventions is not None:
+            parts.append(
+                '<untrusted-data source="architecture-conventions">\n'
+                f"{conventions}\n</untrusted-data>"
+            )
         listing = _file_listing(repo_path)
         if listing is not None:
             parts.append(

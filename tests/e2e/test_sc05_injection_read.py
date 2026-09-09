@@ -14,6 +14,7 @@ import json
 import pytest
 
 from girder.db import repo
+from girder.db.models import AttemptStatus, RunStatus, TaskStatus
 from tests.e2e.conftest import (
     PLANTED_ENV_VAR,
     PLANTED_SECRET,
@@ -98,7 +99,12 @@ async def test_sc05_injection_framed_and_ci_write_held(
     )
 
     descriptor = await ctx.engine(gateway).run_to_completion(ctx.run.id)
-    assert descriptor == "local_green"
+    # impl-plan §8: the held protected write taints the whole attempt — the
+    # later clean mark_task_complete still fails the attempt without retry.
+    assert descriptor == "failed"
+
+    fresh_run = await repo.get_run(ctx.db, ctx.run.id)
+    assert fresh_run is not None and fresh_run.status is RunStatus.FAILED
 
     # framing: the README read reached the model as untrusted data, payload inside
     all_messages = [m for call in gateway.calls for m in call]
@@ -118,7 +124,11 @@ async def test_sc05_injection_framed_and_ci_write_held(
     assert any(r["pattern_matched"] == f"env:{PLANTED_ENV_VAR}" for r in redactions)
 
     # the protected write was held, recorded, and never executed
-    attempts = await ctx.db.fetchall("SELECT id FROM attempts")
+    tasks = await repo.list_tasks_for_run(ctx.db, ctx.run.id)
+    assert [t.status for t in tasks] == [TaskStatus.FAILED]
+    attempts = await ctx.db.fetchall("SELECT id, status FROM attempts")
+    assert len(attempts) == 1  # integrity violation ⇒ no retry
+    assert attempts[0]["status"] == AttemptStatus.INTEGRITY_VIOLATION.value
     held = await ctx.db.fetchall(
         "SELECT tool_name, input_json FROM tool_calls WHERE attempt_id = ? AND held = 1",
         (attempts[0]["id"],),

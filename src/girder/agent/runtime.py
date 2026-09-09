@@ -375,10 +375,14 @@ class AgentRuntime:
         compacted, scratchpad = compact(
             messages, context_window=self._context_window, stats=stats
         )
+        # Invariant: messages[:2] is always [system, task brief] — the new
+        # scratchpad goes after the head pair, so repeated compactions never
+        # displace the task brief (which carries the frozen spec slice).
+        # Prior scratchpads live in the tail and are re-distilled by compact().
         return [
             compacted[0],
-            Message(role="system", content=f"[TRUSTED] Scratchpad (prior progress):\n{scratchpad}"),
             compacted[1],
+            Message(role="system", content=f"[TRUSTED] Scratchpad (prior progress):\n{scratchpad}"),
             *compacted[2:][-_TAIL_AFTER_COMPACTION:],
         ]
 

@@ -383,6 +383,26 @@ class TaskEngine:
                     "/workspace/" + test_dir.strip("/")
                 )
                 snapshot_dirs.append(snapshot_dir)
+        # §8.1 package cache (plan.md Phase 0 task 3, impl-plan §6.4): bind the
+        # host cache dirs read-only at the paths the image's env vars point at
+        # (PIP_CACHE_DIR/npm_config_cache/CARGO_HOME = /cache/*) so pip/npm/
+        # cargo never fetch over the public internet per worktree. A missing
+        # host subdir (dev machine, first boot) just skips that mount.
+        cache_root = Path(self.settings.sandbox.cache_dir)
+        for cache_sub, container_path in (
+            ("pip", "/cache/pip"),
+            ("npm", "/cache/npm"),
+            ("cargo", "/cache/cargo"),
+        ):
+            host_dir = cache_root / cache_sub
+            if host_dir.is_dir():
+                spec.ro_mounts[str(host_dir)] = container_path
+            else:
+                log.debug(
+                    "attempt %s: package cache %s missing — RO cache mount skipped",
+                    attempt.id,
+                    host_dir,
+                )
         self._snapshot_dirs[spec.name] = snapshot_dirs
 
         await self.sandbox.start(spec)
@@ -449,6 +469,16 @@ class TaskEngine:
         integrate: bool = True,
     ) -> _VerifyStep:
         await transition_task(self.db, task.id, TaskStatus.VERIFYING)
+        # §8 (impl-plan): integrity violations block the merge at every tier —
+        # ANY held/scope-violating tool call taints this attempt, even when the
+        # terminal turn itself was clean (runtime.py only catches the
+        # same-turn case). The ledger rows were already written by the tool
+        # registry (exactly once); fail the attempt without retry here.
+        held_count = await repo.count_held_tool_calls(self.db, attempt.id)
+        if held_count:
+            reason = f"{held_count} held scope-violating tool call(s) on attempt {attempt.id}"
+            await self._fail_without_retry(run, task, attempt, reason)
+            return _VerifyStep("integrity_violation", reason)
         exec_res = await self.sandbox.exec(
             container,
             verify_cmd(self.settings.sandbox.python_bin),
@@ -578,7 +608,7 @@ class TaskEngine:
         merge = await BranchOps(self.repo_path).audit_gated_merge(
             source_branch=worktree.branch,
             target_branch=run.branch,
-            audit_passed=True,
+            audit_passed_for_commit=head.stdout.strip(),
             worktree_path=worktree.path,
         )
         if not merge.merged:
@@ -675,7 +705,10 @@ class TaskEngine:
         next_guidance = await self._retry_or_fail(run, task, tail, event=event, note=note)
         if next_guidance is None:
             return _VerifyStep("failed", tail)
-        return _VerifyStep("retry", detail)
+        # Feedback to the next attempt must be the redacted tail (Phase 2
+        # task 5): the raw detail can carry git stderr with secret-shaped
+        # content (e.g. a merge-refusal echoing a token).
+        return _VerifyStep("retry", tail)
 
     async def _retry_or_fail(
         self, run: Run, task: Task, tail: str, *, event: str, note: str

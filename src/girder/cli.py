@@ -17,7 +17,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from girder import __version__
+from girder import __version__, fsm
 from girder.api.app import create_app
 from girder.budget.guard import BudgetGuard
 from girder.config import (
@@ -226,6 +226,15 @@ async def _pump_one(
 
 async def cmd_daemon(args: argparse.Namespace) -> int:
     settings = load_settings()
+    # §6.1: at least one model role per tier — config validation only warns,
+    # but a daemon that cannot call a model must not start (issue 16).
+    if not settings.models.roles and os.environ.get("GIRDER_ALLOW_NO_ROLES") != "1":
+        log.error(
+            "no model roles configured — the daemon cannot drive a run."
+            " Declare [[models.roles]] (tier1..tier3) in girder.toml"
+            " (set GIRDER_ALLOW_NO_ROLES=1 to override)"
+        )
+        return 2
     secrets = load_secrets()
     redactor = Redactor(secrets.redaction_secret_env_names)
     notifier = _build_notifier(settings, None)
@@ -242,6 +251,9 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
 
     log.info("girder daemon starting (db=%s, sandbox=%s)", args.db, args.sandbox)
     try:
+        # §6.3 boot-time self-test: fail fast if the edge tables and the
+        # guarded transition engine ever disagree.
+        await fsm.self_test()
         report = await RecoveryService(db, settings, notifier=notifier).recover()
         log.info("%s", report.summary())
         gc_task = asyncio.create_task(

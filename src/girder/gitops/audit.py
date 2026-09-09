@@ -100,6 +100,24 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+async def _git_binary(cwd: Path, *args: str) -> bytes:
+    """Run a git plumbing command capturing raw bytes (run_host_cmd decodes)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(cwd),
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    if proc.returncode != 0:
+        raise GitOpsError(
+            f"git {' '.join(args)} failed: {stderr_b.decode(errors='replace').strip()[:500]}"
+        )
+    return stdout_b
+
+
 class DiffAudit:
     def __init__(
         self, *, test_signal_patterns: list[str], protected_read_paths: list[str]
@@ -142,8 +160,8 @@ class DiffAudit:
         for rel in rels:
             if not _matches_any(rel, self.test_signal_patterns):
                 continue
-            blob = await _git(repo_path, "show", f"{commit}:{rel}")
-            files[rel] = _hash_bytes(blob.encode())
+            blob = await _git_binary(repo_path, "cat-file", "blob", f"{commit}:{rel}")
+            files[rel] = _hash_bytes(blob)
         lines = "".join(f"{p}\0{h}\n" for p, h in sorted(files.items()))
         return TestManifest(root_hash=_hash_bytes(lines.encode()), files=files)
 

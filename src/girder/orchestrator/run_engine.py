@@ -652,7 +652,6 @@ class RunEngine:
         if results is None:
             return "aborted"  # abort steering observed mid-wave
         crashes = [r for r in results if isinstance(r, BaseException)]
-        crashes = [r for r in results if isinstance(r, BaseException)]
         if crashes:
             # Every engine has settled; re-raise the first programming error.
             raise crashes[0]

@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from girder import fsm
 from girder.budget.guard import BudgetGuard
 from girder.config import Secrets, Settings, load_secrets
 from girder.db import repo
@@ -66,6 +67,9 @@ def create_app(
         db = await Database.open(
             db_path, migrations_dir=migrations_dir or default_migrations_dir()
         )
+        # §6.3 boot-time self-test: fail fast if the edge tables and the
+        # guarded transition engine ever disagree.
+        await fsm.self_test()
         secrets_ = secrets or load_secrets()
         redactor = Redactor(secrets_.redaction_secret_env_names)
         budget = BudgetGuard(db)

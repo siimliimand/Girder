@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -333,6 +333,57 @@ async def test_t1_review_window_full_parks_for_human(dh: DHarness) -> None:
     assert fresh is not None and fresh.status is RunStatus.MERGE_PENDING_HUMAN
 
 
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_t1_parked_by_review_window_resumes_after_review(dh: DHarness) -> None:
+    """§2.3: the review window only pauses NEW runs — a T1 run parked by a full
+    window re-evaluates on the next pump and merges once prior merges are
+    reviewed, without waiting for a human click."""
+    old_runs = []
+    for i in range(3):
+        other = await repo.create_run(dh.db, dh.project.id, f"old {i}", f"run/old{i}", 1.0)
+        await seed_run_status(dh.db, other.id, "merged")
+        old_runs.append(other)
+    gateway = FakeGateway(responses=[_resp(content=GOOD_VERDICT)])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    status = await _drive(d, dh.run.id)
+    assert status == "merge_pending_human"
+    assert dh.api.merge_calls == 0
+
+    # the user marks the prior merges reviewed → the window has capacity again
+    for other in old_runs:
+        await repo.insert_event(
+            dh.db, "merge_reviewed", {"run_id": other.id}, run_id=other.id
+        )
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    assert await d.pump(run) == "merged"
+    assert dh.api.merge_calls == 1
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.MERGED
+
+
+# --------------------------------------------------------------------- T0
+
+
+@pytest.mark.parametrize("dh", [0], indirect=True)
+async def test_t0_parked_run_ignores_review_window(dh: DHarness) -> None:
+    """T0 waits for the human merge click no matter what the review window
+    looks like — window capacity never auto-merges a supervised run."""
+    gateway = FakeGateway(responses=[_resp(content=GOOD_VERDICT)])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    status = await _drive(d, dh.run.id)
+    assert status == "merge_pending_human"
+    # zero unreviewed merges: a T1 run would merge here; the T0 run must not
+    run = await repo.get_run(dh.db, dh.run.id)
+    assert run is not None
+    assert await d.pump(run) == "merge_pending_human"
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.MERGE_PENDING_HUMAN
+    assert dh.api.merge_calls == 0
+
+
 # --------------------------------------------------------------------- T2
 
 
@@ -605,9 +656,10 @@ async def test_ci_pending_within_window_keeps_polling(dh: DHarness) -> None:
 
 
 @pytest.mark.parametrize("dh", [1], indirect=True)
-async def test_ci_fixing_reentry_does_not_reset_poll_deadline(dh: DHarness) -> None:
-    """Semantic pin: the deadline starts at the FIRST ci_running entry; a
-    ci_fixing → ci_running re-entry does not buy a fresh budget."""
+async def test_ci_fix_push_resets_poll_deadline(dh: DHarness) -> None:
+    """The fix push (ci_fixing → ci_running re-entry) buys a fresh CI budget:
+    diagnostic-fix time must not eat the post-fix poll deadline and must not
+    escalate a run whose fix worked."""
     dh.settings.github.poll_timeout_s = 3600.0
     gateway = FakeGateway(responses=[])
     d = dh.delivery(gateway)
@@ -615,15 +667,31 @@ async def test_ci_fixing_reentry_does_not_reset_poll_deadline(dh: DHarness) -> N
     await _enter_ci_running_and_backdate(dh, d, age_s=3601.0)
 
     # simulate a fix episode: ci_running → ci_fixing → ci_running; the newest
-    # ci_running transition event carries a FRESH timestamp, but the deadline
-    # must still be derived from the first (backdated) entry
+    # ci_running transition event carries a FRESH timestamp — the effective
+    # deadline moves off the stale (backdated) first entry
+    before = await repo.get_run(dh.db, dh.run.id)
+    assert before is not None
+    baseline_before = await d._ci_running_baseline(before)
     await transition_run(dh.db, dh.run.id, RunStatus.CI_FIXING, payload={"failed": ["x"]})
     await transition_run(dh.db, dh.run.id, RunStatus.CI_RUNNING, payload={"fix": "y"})
     fresh = await repo.get_run(dh.db, dh.run.id)
     assert fresh is not None and fresh.status is RunStatus.CI_RUNNING
+    baseline_after = await d._ci_running_baseline(fresh)
+    assert baseline_after is not None and baseline_before is not None
+    assert baseline_after > baseline_before  # the deadline moved forward
 
     run = await repo.get_run(dh.db, dh.run.id)
     assert run is not None
+    assert await d.pump(run) == "ci_pending"  # NOT escalated on the stale clock
+
+    # once the POST-FIX episode itself outlives the budget, escalation fires
+    old = (datetime.now(UTC) - timedelta(seconds=3601.0)).isoformat()
+    await dh.db.execute(
+        "UPDATE agent_events SET ts = ? WHERE run_id = ? AND event_type ="
+        " 'state_transition' AND json_extract(payload_json, '$.to') = 'ci_running'",
+        (old, dh.run.id),
+    )
+    await dh.db.conn.commit()
     assert await d.pump(run) == "escalated"
 
 

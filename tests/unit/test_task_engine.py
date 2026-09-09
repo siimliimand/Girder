@@ -230,7 +230,7 @@ async def harness(db: Database, tmp_path: Path) -> AsyncIterator[Harness]:
         limits=LimitsConfig(
             task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60
         ),
-        sandbox=SandboxNetwork(),
+        sandbox=SandboxNetwork(cache_dir=str(tmp_path / "pkg-cache")),
     )
     wt_base = tmp_path / "wt"
     sandbox = ScriptSandbox(suite_results=[], suite_xml=GREEN_XML)
@@ -819,3 +819,98 @@ async def test_container_killed_after_suite_before_audit(
     # backstop (idempotent by design)
     assert sandbox.events == ["suite", "kill", "audit", "kill"]
     assert sandbox.events.index("kill") < sandbox.events.index("audit")
+
+
+async def test_cache_mounts_added_when_host_dirs_exist(harness: Harness) -> None:
+    """§8.1 (plan.md Phase 0 task 3 / impl-plan §6.4): the pip/npm/cargo host
+    cache dirs are bound read-only at the image's /cache/* paths so package
+    managers never fetch over the public internet per worktree."""
+    h = harness
+    cache_root = h.repo_path.parent / "pkg-cache"
+    for sub in ("pip", "npm", "cargo"):
+        (cache_root / sub).mkdir(parents=True, exist_ok=True)
+    h.settings.sandbox.cache_dir = str(cache_root)
+    h.settings.project.test_directories = []
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete())
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    mounts = h.sandbox.started[0].ro_mounts
+    assert mounts[str(cache_root / "pip")] == "/cache/pip"
+    assert mounts[str(cache_root / "npm")] == "/cache/npm"
+    assert mounts[str(cache_root / "cargo")] == "/cache/cargo"
+    # cache mounts must be read-only renderable (-v host:container:ro)
+    assert all(not v.startswith("/workspace") for v in mounts.values())
+
+
+async def test_cache_mounts_skipped_when_host_dirs_missing(harness: Harness) -> None:
+    """A missing host cache dir (dev machine, first boot) skips the mount
+    silently — attempt start never crashes on it."""
+    h = harness
+    h.settings.sandbox.cache_dir = str(h.repo_path.parent / "no-such-cache")
+    h.settings.project.test_directories = []
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete())
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+    assert h.sandbox.started[0].ro_mounts == {}
+
+
+async def test_merge_refusal_secret_is_redacted_in_retry_guidance(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 2 task 5: retry guidance is the REDACTED detail — a merge refusal
+    echoing secret-shaped git stderr must not reach the next attempt's prompt."""
+    h = harness
+    task = await _seed_task(h)
+    secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+
+    async def _refuse(self: BranchOps, **kwargs: object) -> object:
+        from girder.gitops.branch import MergeResult
+
+        return MergeResult(False, None, f"error: push denied for {secret}")
+
+    monkeypatch.setattr(BranchOps, "audit_gated_merge", _refuse)  # every attempt refused
+    gateway = FakeGateway(responses=[*write_commit_complete(), *write_commit_complete()])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "failed"  # attempts exhausted, guidance carried the refusal
+
+    # the raw secret never reaches any model message on attempt 2
+    attempt2_messages = gateway.calls[len(write_commit_complete())]
+    blob = "\n".join(str(getattr(m, "content", "")) for m in attempt2_messages)
+    assert secret not in blob
+    assert "push denied" in blob  # the (redacted) reason itself is still useful
+
+
+async def test_held_call_in_earlier_turn_fails_attempt_without_retry(
+    harness: Harness,
+) -> None:
+    """impl-plan §8: ANY held/scope-violating tool call taints the attempt —
+    a held call in an earlier turn followed by a clean mark_task_complete
+    still fails the attempt WITHOUT retry (block merge at every tier)."""
+    h = harness
+    task = await _seed_task(h)  # scope_globs = ["src/**"]
+    gateway = FakeGateway(
+        responses=[
+            # earlier turn: out-of-scope write → registry holds it
+            _resp(calls=[_tc("1", "write_file", '{"path":"tests/evil.py","content":"x=1\\n"}')]),
+            # clean, in-scope remainder + clean terminal turn
+            _resp(calls=[_tc("2", "write_file", '{"path":"src/app.py","content":"y=2\\n"}')]),
+            _resp(calls=[_tc("3", "run_command", '{"cmd":"git add -A && git commit -m work"}')]),
+            _resp(calls=[_tc("4", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "integrity_violation"
+
+    fresh = await repo.get_task(h.db, task.id)
+    assert fresh is not None and fresh.status is TaskStatus.FAILED
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 1  # no retry
+    assert attempts[0]["status"] == AttemptStatus.INTEGRITY_VIOLATION.value
+    held = await h.db.fetchall(
+        "SELECT * FROM tool_calls WHERE attempt_id = ? AND held = 1", (attempts[0]["id"],)
+    )
+    assert len(held) == 1
+    assert h.notifier.calls  # integrity violation notified

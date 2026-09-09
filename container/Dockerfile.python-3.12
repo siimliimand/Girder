@@ -20,7 +20,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # testing works). PIN these to the exact versions the project's GitHub Actions
 # workflow installs — `container/parity-check.sh <image> ci-env-dump.txt`
 # fails the build when image and CI diverge.
-RUN pip install --no-cache-dir pytest==8.3.2
+#
+# CI runs `uv sync` (full [project].dependencies + the pytest dev group), so
+# the image must bake that whole set, not pytest alone — a suite whose
+# conftest imports the project under test fails to even collect without it
+# (first girder-on-girder baseline escalated exactly this way). Versions
+# mirror the uv.lock resolution of 2026-09-09; re-pin when the lock moves.
+RUN pip install --no-cache-dir \
+        aiosqlite==0.22.1 \
+        fastapi==0.141.1 \
+        httpx==0.28.1 \
+        jinja2==3.1.6 \
+        pydantic==2.13.5 \
+        pydantic-settings==2.15.0 \
+        python-multipart==0.0.32 \
+        pyyaml==6.0.3 \
+        uvicorn==0.52.4 \
+        pytest==9.1.1 \
+        pytest-asyncio==1.4.0
+
+# src-layout projects on this stack run their suite from the mounted
+# worktree; this makes the mounted package importable from any commit
+# (non-src layouts are unaffected — a missing path on PYTHONPATH is ignored).
+ENV PYTHONPATH=/workspace/src
 
 # Agent user; uid/gid are overridden at container start to the worktree owner.
 RUN useradd --create-home --uid 10001 agent

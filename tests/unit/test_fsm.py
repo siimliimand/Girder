@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from girder import fsm
 from girder.db import repo
 from girder.db.models import AttemptStatus, RunStatus, TaskStatus, TaskType
 from girder.fsm import (
@@ -241,6 +242,7 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         ("awaiting_amendment", "active"),
         ("awaiting_amendment", "pr_open"),
         ("awaiting_amendment", "aborted"),
+        ("awaiting_amendment", "failed"),  # §5.1: "active / any → failed"
         ("awaiting_amendment", "budget_exhausted"),
         ("pr_open", "ci_running"),
         ("pr_open", "aborted"),
@@ -266,8 +268,8 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         ("merge_pending_human", "aborted"),
         ("merge_pending_human", "escalated"),
         ("budget_exhausted", "aborted"),
-        ("escalated", "active"),
-        ("escalated", "merged"),
+        # §5.1: escalated is a hard stop (D4 — human review at every tier);
+        # only an explicit operator abort leaves it.
         ("escalated", "aborted"),
     }
     expected_tasks = {
@@ -442,3 +444,47 @@ async def test_undeclared_self_transition_rejected(db) -> None:  # type: ignore[
     await transition_attempt(db, attempt.id, AttemptStatus.RUNNING)
     with pytest.raises(InvalidTransition):
         await transition_attempt(db, attempt.id, AttemptStatus.RUNNING)
+
+
+# ------------------------------------------------------------------ self-test (§6.3)
+
+
+async def test_self_test_passes_and_needs_no_fixture(db) -> None:  # type: ignore[no-untyped-def]
+    """Boot-time self-test: walks its own temp DB, not the fixture's."""
+    await fsm.self_test()  # must not raise
+
+
+async def test_self_test_fails_when_tables_and_engine_disagree(
+    db, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Sabotage the engine (accept every transition): the self-test must
+    catch illegal edges that no longer raise."""
+    from girder import fsm as fsm_module
+
+    async def permissive(db, kind, row_id, new_state, payload=None):  # type: ignore[no-untyped-def]
+        return str(new_state)
+
+    monkeypatch.setattr(fsm_module, "transition", permissive)
+    with pytest.raises(fsm.FsmSelfTestError, match="run draft->spec_approved"):
+        await fsm.self_test()
+
+
+async def test_awaiting_amendment_may_go_failed(db) -> None:  # type: ignore[no-untyped-def]
+    """§5.1: task exhausts task_max_attempts while the run awaits amendment."""
+    _, run, _, _, _ = await _seed(db)
+    await transition_run(db, run.id, RunStatus.SPEC_PENDING)
+    await _force_status(db, "runs", run.id, RunStatus.AWAITING_AMENDMENT.value)
+    assert await transition_run(db, run.id, RunStatus.FAILED) == "failed"
+
+
+async def test_escalated_is_a_hard_stop(db) -> None:  # type: ignore[no-untyped-def]
+    """§5.1 / D4: no automated exit from escalated — only operator abort."""
+    _, run, _, _, _ = await _seed(db)
+    await transition_run(db, run.id, RunStatus.SPEC_PENDING)
+    await _force_status(db, "runs", run.id, RunStatus.ESCALATED.value)
+    with pytest.raises(InvalidTransition, match="escalated -> merged"):
+        await transition_run(db, run.id, RunStatus.MERGED)
+    with pytest.raises(InvalidTransition, match="escalated -> active"):
+        await transition_run(db, run.id, RunStatus.ACTIVE)
+    # explicit operator abort remains possible
+    assert await transition_run(db, run.id, RunStatus.ABORTED) == "aborted"
