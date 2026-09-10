@@ -194,8 +194,11 @@ def _ctx(tmp_path: Path, settings: Settings | None, **kw: object) -> SimpleNames
 
 
 def test_validate_bad_stack(tmp_path: Path) -> None:
+    # Settings must stay constructible: strict registry validation in config.py
+    # (stacks commit) rejects unknown stacks at the model layer; the CLI-level
+    # check under test is driven via the `stack` ctx override instead.
     failures = collect_validation_failures(
-        _ctx(tmp_path, _settings(project={"stack": "ruby-3.4", "test_directories": ["tests"]}),
+        _ctx(tmp_path, _settings(project={"stack": "python-3.12", "test_directories": ["tests"]}),
              stack="ruby-3.4"),
         check_sandbox=False,
     )
@@ -282,9 +285,11 @@ def test_validate_missing_test_directory(tmp_path: Path) -> None:
 
 
 def test_validate_collects_all_failures_not_just_first(tmp_path: Path) -> None:
+    # Same as test_validate_bad_stack: unknown stack is enforced by Settings
+    # itself now, so keep the model valid and test the CLI check via ctx.
     settings = Settings.model_validate(
         {
-            "project": {"stack": "ruby-3.4", "test_directories": ["tests"]},
+            "project": {"stack": "python-3.12", "test_directories": ["tests"]},
             "models": {"roles": []},
         }
     )
