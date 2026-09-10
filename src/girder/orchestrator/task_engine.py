@@ -55,6 +55,7 @@ from girder.gitops.branch import BranchOps
 from girder.gitops.worktree import DEFAULT_BASE, WorktreeManager, WorktreeRef
 from girder.guard.redact import Redactor, redact_and_log
 from girder.guard.scope import TaskScopes
+from girder.index.inject import codebase_index_guidance
 from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
 from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
@@ -262,7 +263,9 @@ class TaskEngine:
                 try:
                     outcome = await runtime.execute_attempt(
                         spec_slice=fresh.spec_slice_md,
-                        guidance=_effective_guidance(),
+                        guidance=await codebase_index_guidance(
+                            _effective_guidance(), self.db, fresh, worktree.path, self.settings.limits
+                        ),
                         deadline_s=deadline,
                     )
                     # Verify (+ merge unless deferred) while the container is

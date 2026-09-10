@@ -21,6 +21,7 @@ _TASK_WRITABLE_FIELDS = frozenset(
         "spec_slice_md",
         "depends_on_json",
         "wave_id",
+        "codebase_index_json",
     }
 )
 
@@ -79,6 +80,7 @@ def _row_to_task(r: Row) -> Task:
         test_content_hash=r["test_content_hash"],
         attempts_used=r["attempts_used"],
         depends_on=json.loads(r["depends_on_json"]),
+        codebase_index_json=r["codebase_index_json"],
     )
 
 

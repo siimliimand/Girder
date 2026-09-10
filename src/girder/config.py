@@ -96,6 +96,11 @@ class LimitsConfig(BaseModel):
     conflict_resolution_attempts: int = 2
     tool_output_max_lines: int = 100
     tool_output_max_tokens: int = 4000
+    # WP 8.4 codebase index: injected as a [TRUSTED] block at attempt start
+    # (rebuilt per attempt, R-SP8-4). inject_index_max_tokens bounds the block
+    # by dropping whole directories, lowest-relevance first.
+    inject_index: bool = True
+    inject_index_max_tokens: int = 2000
 
 
 class SandboxNetwork(BaseModel):
@@ -228,6 +233,8 @@ class Settings(BaseSettings):
         if self.budget.run_cap_usd <= 0:
             errors.append(f"budget.run_cap_usd must be > 0 (got {self.budget.run_cap_usd})")
         for name, value in self.limits.__dict__.items():
+            if isinstance(value, bool):
+                continue  # inject_index is a flag, not a positive quantity
             if value <= 0:
                 errors.append(f"limits.{name} must be > 0 (got {value})")
         if not self.project.test_directories:
