@@ -52,6 +52,7 @@ from girder.sandbox.engine import SandboxEngine
 from girder.sandbox.local import LocalExecSandbox
 from girder.sandbox.podman import PodmanEngine
 from girder.specs.amendment import AmendmentError, resolve_amendment
+from girder.stacks import STACK_REGISTRY
 
 log = logging.getLogger("girder")
 
@@ -584,9 +585,6 @@ async def cmd_prune(args: argparse.Namespace) -> int:
 
 # ----------------------------------------------------------------- validate (WP 13.3)
 
-# Sprint-11 multi-stack has not landed (no STACK_REGISTRY yet); the known set is
-# the single stack the codebase currently ships (config.ProjectConfig default).
-KNOWN_STACKS = frozenset({"python-3.12"})
 
 _MODEL_TIERS = ("tier1", "tier2", "tier3")
 
@@ -751,26 +749,34 @@ def collect_validation_failures(
     """Run every WP 13.3 check, collecting ALL failures (never stop at the first)."""
     failures: list[str] = []
     if ctx.config_error is not None:
+        # load_settings() already validates project.stack against STACK_REGISTRY,
+        # so this message names an unknown stack when that was the problem.
+        # Collect it as ONE failure and keep running the remaining checks.
         failures.append(f"girder.toml: {ctx.config_error}")
     settings = ctx.settings
     if settings is None:
         if ctx.config_error is None:
             failures.append("girder.toml: could not load settings")
-        return failures
-    failures.extend(_check_model_roles(settings))
-    if ctx.stack not in KNOWN_STACKS:
-        failures.append(
-            f"project.stack: {ctx.stack!r} is not a known stack"
-            f" (known: {', '.join(sorted(KNOWN_STACKS))})"
-        )
+    else:
+        failures.extend(_check_model_roles(settings))
+        # Direct-registry check: catches contexts built without load_settings.
+        if ctx.stack not in STACK_REGISTRY:
+            failures.append(
+                f"project.stack: {ctx.stack!r} is not a known stack"
+                f" (known: {', '.join(sorted(STACK_REGISTRY))})"
+            )
+    # Secrets checks do not depend on settings, so they run even when the
+    # config failed to load — collect ALL detectable failures, never stop early.
     if ctx.secrets_error is not None:
         failures.append(f"secrets: {ctx.secrets_error}")
     elif ctx.secrets is not None:
         failures.extend(_check_secrets())
-        failures.extend(_check_api_keys(settings, ctx.secrets))
-    if check_sandbox:
+        if settings is not None:
+            failures.extend(_check_api_keys(settings, ctx.secrets))
+    if check_sandbox and settings is not None:
         failures.extend(_check_runtime_and_image(ctx.stack))
-    failures.extend(_check_test_directories(settings, ctx.config_root))
+    if settings is not None:
+        failures.extend(_check_test_directories(settings, ctx.config_root))
     return failures
 
 
