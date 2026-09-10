@@ -12,3 +12,6 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+# Claude Code agent worktrees
+.claude/worktrees/
