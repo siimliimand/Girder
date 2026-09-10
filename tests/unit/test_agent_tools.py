@@ -397,17 +397,21 @@ async def test_symbol_outline_dispatches_stack_plugin_argv(
     assert sandbox.execs == [("ctr", expected, 120.0)]
 
 
-async def test_symbol_outline_non_python_fallback_unchanged(
+async def test_symbol_outline_non_python_fallback_pattern(
     seeded: tuple[Database, str, str],
 ) -> None:
-    """WS-07B: non-.py paths keep the byte-identical grep fallback."""
+    """WS-07B: non-.py paths use the spec's grep fallback (Go/Rust included)."""
     db, run_id, attempt_id = seeded
     sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
     await _registry(sandbox, db, run_id, attempt_id).execute(
         "view_symbol_outline", {"path": "src/a.go"}
     )
     assert sandbox.execs == [
-        ("ctr", ["grep", "-nE", r"^\s*(def|class|function)\b", "src/a.go"], 120.0)
+        (
+            "ctr",
+            ["grep", "-nE", r"^\s*(def|class|function|func|pub fn)\b", "src/a.go"],
+            120.0,
+        )
     ]
 # ---------------------------------------------------------------------------
 # WP 7.1-7.5: new tools. RealSandbox actually executes argv in a tmpdir so

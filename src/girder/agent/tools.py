@@ -796,7 +796,7 @@ class ToolRegistry:
         if path.endswith(".py"):
             return await self._exec(self.stack.symbol_outline_command(path))
         return await self._exec(
-            ["grep", "-nE", r"^\s*(def|class|function)\b", path]
+            ["grep", "-nE", r"^\s*(def|class|function|func|pub fn)\b", path]
         )
 
     async def _run_command(self, args: dict[str, Any]) -> tuple[bool, str]:
