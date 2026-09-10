@@ -179,6 +179,11 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8787
     unix_socket: str | None = None
+    # Console API key (WP 12.5). Empty/unset ⇒ no auth (loopback default).
+    # When set, all routes need Authorization: Bearer / X-API-Key. Override via
+    # GIRDER_WEB__API_KEY or `girder web --api-key`; secrets.toml [web]
+    # api_key works too (Secrets.web_api_key).
+    api_key: str = ""
 
 
 class ModelsConfig(BaseModel):
@@ -294,6 +299,9 @@ class Secrets(BaseModel):
     notify_discord_webhook_url: str | None = None
     notify_slack_bot_token: str | None = None
     notify_slack_signing_secret: str | None = None  # request signing for /api/webhooks/slack
+    # WP 12.5: secrets.toml "[web] api_key = …" flattens to web_api_key
+    # (load_secrets). Fallback when settings.web.api_key is empty.
+    web_api_key: str | None = None
     redaction_secret_env_names: list[str] = Field(
         default_factory=lambda: [
             "GITHUB_TOKEN",

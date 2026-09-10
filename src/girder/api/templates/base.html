@@ -47,5 +47,37 @@
       });
     })();
   </script>
+  {# WP 12.5: when the console requires an API key, store it in
+     localStorage("girder_api_key") (e.g. localStorage.setItem("girder_api_key","…")
+     in the browser console once). Every fetch then carries X-API-Key and every
+     form POST gets it appended as api_key; 401/403 responses surface a hint. #}
+  <script>
+    (function () {
+      var KEY = "girder_api_key";
+      var key = null;
+      try { key = localStorage.getItem(KEY); } catch (e) {}
+      if (!key) return;
+      var origFetch = window.fetch;
+      window.fetch = function (input, init) {
+        init = init || {};
+        var headers = new Headers((init && init.headers) || (input && input.headers) || {});
+        headers.set("X-API-Key", key);
+        init.headers = headers;
+        return origFetch.call(this, input, init).then(function (resp) {
+          if (resp.status === 401 || resp.status === 403) {
+            console.error("Girder: request rejected (" + resp.status + ") — " +
+              "check the API key in localStorage(\"" + KEY + "\").");
+          }
+          return resp;
+        });
+      };
+      document.addEventListener("submit", function (ev) {
+        var form = ev.target;
+        if (!form || !form.action || /[?&]api_key=/.test(form.action)) return;
+        form.action += (form.action.indexOf("?") === -1 ? "?" : "&") + "api_key=" +
+          encodeURIComponent(key);
+      }, true);
+    })();
+  </script>
 </body>
 </html>

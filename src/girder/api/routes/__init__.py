@@ -8,8 +8,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from girder.api.auth import require_api_key
 from girder.api.routes import (
     amendments as _amendments,
     clarify as _clarify,
@@ -37,7 +38,10 @@ from girder.api.routes._shared import (
     run_context as _run_context,
 )
 
-router = APIRouter()
+# WP 12.5: single auth enforcement point for every console route. Static
+# assets live on the /static mount (not this router) and are exempt
+# structurally; /metrics and webhooks opt out via auth.PUBLIC_PATH_PREFIXES.
+router = APIRouter(dependencies=[Depends(require_api_key)])
 for _module in (
     _projects,
     _runs,

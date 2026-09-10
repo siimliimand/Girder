@@ -122,6 +122,11 @@ async def cmd_web(args: argparse.Namespace) -> int:
     )
     host = args.host if args.host is not None else settings.web.host
     port = args.port if args.port is not None else settings.web.port
+    api_key = getattr(args, "api_key", None)
+    if api_key is not None:
+        # The auth dependency reads the key from app.state.settings at request
+        # time, so mutating the Settings object before create_app is enough.
+        settings.web.api_key = api_key
     uds = getattr(args, "unix_socket", None) or settings.web.unix_socket
     if uds is not None:
         # UDS bind (§10: "or UDS /run/girder.sock"): clear a stale socket from
@@ -864,6 +869,12 @@ def main(argv: list[str] | None = None) -> int:
         dest="unix_socket",
         default=None,
         help="bind a Unix domain socket instead of host/port (default: settings.web.unix_socket)",
+    )
+    web_parser.add_argument(
+        "--api-key",
+        default=None,
+        help="require this API key on every console request (default:"
+        " settings.web.api_key / GIRDER_WEB__API_KEY; empty = no auth)",
     )
     review_parser = sub.add_parser(
         "review", help="mark a merged run as human-reviewed (T1 review window, §2.3)"
