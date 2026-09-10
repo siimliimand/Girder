@@ -115,6 +115,11 @@ class SandboxNetwork(BaseModel):
 class GithubConfig(BaseModel):
     remote: str = "origin"
     pr_template: str | None = None
+    # WP 9.1: inbound webhook receiver. Off by default — flip on once the
+    # deployment has a public HTTPS route to /api/webhooks/github and
+    # github_webhook_secret is configured.
+    webhook_enabled: bool = False
+    bot_account: str = ""  # GitHub username watched for issue assignments
     api_url: str = "https://api.github.com"  # overridable for tests / proxies
     poll_interval_s: float = 30.0  # CI checks poll cadence (impl-plan §6.11)
     poll_timeout_s: float = 3600.0  # exceeded ⇒ escalate, never poll forever
@@ -122,8 +127,9 @@ class GithubConfig(BaseModel):
 
 
 class NotifyConfig(BaseModel):
-    channels: list[str] = Field(default_factory=list)  # subset of {"telegram","discord"}
+    channels: list[str] = Field(default_factory=list)  # subset of {"telegram","discord","slack"}
     telegram_chat_id: str | None = None
+    slack_channel: str | None = None  # Slack channel id for SlackNotifier deliveries
 
 
 class ModelRole(BaseModel):
@@ -252,6 +258,10 @@ class Secrets(BaseModel):
         [notify]
         telegram_bot_token = "…"
         discord_webhook_url = "…"
+        slack_bot_token = "…"
+        slack_signing_secret = "…"
+        [github]
+        webhook_secret = "…"
         [redaction]
         secret_env_names = ["GITHUB_TOKEN", …]
 
@@ -262,8 +272,11 @@ class Secrets(BaseModel):
     models_anthropic_api_key: str | None = None
     models_openai_api_key: str | None = None
     github_token: str | None = None
+    github_webhook_secret: str | None = None  # HMAC-SHA256 verify of inbound webhooks (WP 9.1)
     notify_telegram_bot_token: str | None = None
     notify_discord_webhook_url: str | None = None
+    notify_slack_bot_token: str | None = None
+    notify_slack_signing_secret: str | None = None  # request signing for /api/webhooks/slack
     redaction_secret_env_names: list[str] = Field(
         default_factory=lambda: [
             "GITHUB_TOKEN",
