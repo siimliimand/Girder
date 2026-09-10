@@ -144,6 +144,11 @@ class DiffAudit:
         lines = "".join(f"{p}\0{h}\n" for p, h in sorted(files.items()))
         return TestManifest(root_hash=_hash_bytes(lines.encode()), files=files)
 
+    async def commit_has_path(self, repo_path: Path, commit: str, rel_path: str) -> bool:
+        """True when *rel_path* (file or directory) exists in ``<commit>``'s tree."""
+        out = await _git(repo_path, "ls-tree", commit, "--", rel_path)
+        return bool(out.strip())
+
     async def manifest_from_commit(self, repo_path: Path, commit: str) -> TestManifest:
         """Hash every blob in ``<commit>``'s tree matching a test-signal pattern."""
         out = await _git(repo_path, "ls-tree", "-r", commit)

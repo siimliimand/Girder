@@ -30,6 +30,7 @@ from girder.db.models import (
     WorktreeState,
 )
 from girder.gitops.branch import BranchOps
+from girder.gitops.worktree import WorktreeManager
 from girder.guard.redact import Redactor
 from girder.orchestrator.task_engine import TaskEngine, TaskOutcome
 from girder.sandbox.engine import ContainerSpec, ExecResult
@@ -1161,3 +1162,44 @@ async def test_allow_empty_baseline_flag_lets_empty_verify_suite_pass(harness: H
         "SELECT event_type FROM agent_events WHERE run_id = ?", (h.run.id,)
     )
     assert not any(e["event_type"] == "verify_failed" for e in events)
+
+
+async def test_allow_empty_baseline_testless_repo_completes(harness: Harness) -> None:
+    """Full dogfood repro: a repo with NO tests dir at the attempt's base
+    commit (flag set, baseline green) must not crash _start_attempt on the
+    Layer-1 snapshot (git archive -- tests) — the attempt completes and the
+    snapshot is skipped instead."""
+    h = harness
+    await _git(h.repo_path, "rm", "-rq", "tests")
+    (h.repo_path / "girder.toml").write_text("[project]\nname = 'p'\nallow_empty_baseline = true\n")
+    await _git(h.repo_path, "add", "-A")
+    await _git(h.repo_path, "commit", "-qm", "remove test suite")
+    await _git(h.repo_path, "update-ref", f"refs/heads/{h.run.branch}", "HEAD")
+    h.sandbox = ScriptSandbox(suite_results=[ExecResult(5, "", "")], suite_xml=EMPTY_XML)
+    task = await _seed_task(h)
+
+    outcome = await h.engine(FakeGateway(responses=write_commit_complete())).execute_task(
+        h.run, task
+    )
+
+    assert outcome.kind == "completed"
+    fresh = await repo.get_task(h.db, task.id)
+    assert fresh is not None and fresh.status is TaskStatus.COMPLETED
+
+
+async def test_retry_after_crashed_start_heals_orphan_worktree(harness: Harness) -> None:
+    """An attempt that dies mid-_start_attempt leaves its worktree dir behind;
+    the retry must clear the orphan and provision fresh instead of dying on
+    FileExistsError (the 5dc835f7 dogfood failure)."""
+    h = harness
+    task = await _seed_task(h)
+    # orphan: provision the path the way a crashed attempt would have left it
+    orphan = await WorktreeManager(h.repo_path, h.wt_base).create(h.run.id, task.id, "HEAD")
+    assert orphan.path.is_dir()
+
+    outcome = await h.engine(FakeGateway(responses=write_commit_complete())).execute_task(
+        h.run, task
+    )
+
+    assert outcome.kind == "completed"
+    assert not orphan.path.exists()  # healed: replaced by the fresh provision

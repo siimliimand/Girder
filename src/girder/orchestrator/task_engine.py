@@ -407,7 +407,15 @@ class TaskEngine:
         # and `worktree add -b` falls back to a detached checkout at this base
         # when the branch already exists.
         wt_base_commit = self._salvage_tips.pop(task.id, base_commit)
-        ref = await manager.create(run.id, task.id, wt_base_commit)
+        try:
+            ref = await manager.create(run.id, task.id, wt_base_commit)
+        except FileExistsError:
+            # A prior attempt crashed mid-_start_attempt (after provisioning,
+            # before its teardown could prune). Attempts are sequential per
+            # task, so the path can only be an orphan here — clear it and
+            # provision fresh.
+            await manager.heal_orphan(run.id, task.id)
+            ref = await manager.create(run.id, task.id, wt_base_commit)
         await repo.create_worktree(self.db, attempt.id, str(ref.path), ref.branch)
         attempt.worktree_path = str(ref.path)  # keep the local object in sync for teardown
         await repo.update_attempt_fields(
@@ -435,6 +443,18 @@ class TaskEngine:
                     attempt.id,
                 )
             for test_dir in test_dirs:
+                # A test-less repo (allow_empty_baseline) has no test dirs at
+                # the base commit: skip the snapshot instead of crashing the
+                # attempt — Layer 1 has nothing to protect there; Layers 2/3
+                # still cover the (empty) test-signal surface.
+                if not await self._audit.commit_has_path(self.repo_path, base_commit, test_dir):
+                    log.info(
+                        "attempt %s: test dir %r absent at base commit — "
+                        "Layer 1 RO snapshot skipped",
+                        attempt.id,
+                        test_dir,
+                    )
+                    continue
                 snapshot_dir = Path(tempfile.mkdtemp(prefix="girder-snap-"))
                 await self._audit.materialize_test_snapshot(
                     self.repo_path, base_commit, [test_dir], snapshot_dir

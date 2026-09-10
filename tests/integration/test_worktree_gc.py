@@ -146,6 +146,41 @@ async def test_recreate_after_crash_reuses_stale_branch(git_repo: Path, tmp_path
     await manager.remove(ref2.path, force=True)
 
 
+async def test_heal_orphan_clears_crash_leftover(git_repo: Path, tmp_path: Path) -> None:
+    """An attempt crashing mid-_start_attempt leaves the worktree behind;
+    heal_orphan clears it so the retry can provision fresh."""
+    manager = WorktreeManager(git_repo, base=tmp_path / "wts")
+    ref = await manager.create("run1", "task1", "HEAD")
+
+    await manager.heal_orphan("run1", "task1")
+
+    assert not ref.path.exists()
+    ref2 = await manager.create("run1", "task1", "HEAD")  # retry provisions
+    assert ref2.path.is_dir()
+    await manager.remove(ref2.path, force=True)
+
+
+async def test_heal_orphan_removes_unregistered_leftover_dir(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A crash can leave a bare (non-git-registered) directory; heal_orphan
+    still clears it — the namespace is WorktreeManager-owned."""
+    manager = WorktreeManager(git_repo, base=tmp_path / "wts")
+    leftover = tmp_path / "wts" / "run2" / "task2"
+    leftover.mkdir(parents=True)
+    (leftover / "junk").write_text("x")
+
+    await manager.heal_orphan("run2", "task2")
+
+    assert not leftover.exists()
+
+
+async def test_heal_orphan_noop_when_path_absent(git_repo: Path, tmp_path: Path) -> None:
+    manager = WorktreeManager(git_repo, base=tmp_path / "wts")
+    await manager.heal_orphan("runX", "taskX")  # must not raise
+    assert not (tmp_path / "wts" / "runX").exists()
+
+
 # ------------------------------------------------------------------------ GC
 
 

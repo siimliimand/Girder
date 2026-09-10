@@ -11,6 +11,7 @@ git-level worktree and vice versa.
 from __future__ import annotations
 
 import builtins
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -130,6 +131,23 @@ class WorktreeManager:
         await run_host_cmd(
             ["git", "-C", str(self.repo_path), "worktree", "prune"], check=False, timeout_s=60
         )
+
+    async def heal_orphan(self, run_id: str, task_id: str) -> None:
+        """Clear a leftover worktree path for ``<run>/<task>`` before re-provision.
+
+        An attempt that crashes mid-``_start_attempt`` (after provisioning,
+        before its teardown can prune) leaves the directory behind; attempts
+        are sequential per task, so at retry time that path is always an
+        orphan, never a live sibling. The git metadata is removed when the
+        dir is still registered; a plain leftover dir is rmtree'd. D8: the
+        directory is disposable — the task branch keeps the evidence.
+        """
+        path = self.base / run_id / task_id
+        if not path.exists():
+            return
+        await self.remove(path, force=True)
+        if path.exists():  # not a registered worktree (e.g. crash left a bare dir)
+            shutil.rmtree(path, ignore_errors=True)
 
     async def list(self) -> list[str]:
         result = await run_host_cmd(
