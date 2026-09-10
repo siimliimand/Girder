@@ -131,6 +131,7 @@ async def harness(db: Database, tmp_path: Path) -> AsyncIterator[Harness]:
             attempt_max_turns=6,
             attempt_wallclock_s=60,
             ci_fix_attempts=1,
+            planning_turns=0,  # WP 8.1 phase is orthogonal here; scripted turns write early
         ),
         sandbox=SandboxNetwork(),
     )

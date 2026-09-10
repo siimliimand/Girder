@@ -61,6 +61,7 @@ async def test_attempt_start_inject_disabled(harness: Harness) -> None:  # noqa:
         attempt_max_turns=6,
         attempt_wallclock_s=60,
         inject_index=False,
+        planning_turns=0,
     )
     task = await _seed_task(h)
     gw = FakeGateway(responses=write_commit_complete())

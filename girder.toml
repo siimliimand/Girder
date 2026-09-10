@@ -34,6 +34,7 @@ run_cap_usd = 5.00
 [limits]
 attempt_wallclock_s = 900
 attempt_max_turns = 60   # deepseek-v4-flash is a reasoning model: explore-heavy; this budget is surfaced to the agent in its system prompt
+planning_turns = 5   # WP 8.1 planning phase: write tools held until a PLAN block (or this many turns)
 task_max_attempts = 3
 ci_fix_attempts = 3
 conflict_resolution_attempts = 2

@@ -8,8 +8,9 @@ scratchpad string the runtime re-injects as a trusted system message.
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from girder.models.gateway import Message
 
@@ -38,6 +39,65 @@ class CompactionStats:
     tokens_before: int = 0
     tokens_after: int = 0
     scratchpad: str = ""
+
+
+_SCRATCHPAD_PREFIX = "[TRUSTED] Scratchpad"
+
+
+@dataclass
+class Scratchpad:
+    """WP 8.2: structured, orchestrator-maintained scratchpad.
+
+    Populated by the tool registry (files_read / files_written / test_results),
+    the runtime (plan, milestones), and the retry loop (prior_attempt_summary).
+    Survives compaction with zero distillation cost: only its JSON rendering is
+    refreshed at context index 2.
+    """
+
+    plan: str = ""
+    files_read: list[str] = field(default_factory=list)
+    files_written: list[str] = field(default_factory=list)
+    test_results: list[str] = field(default_factory=list)
+    milestones: list[str] = field(default_factory=list)
+    prior_attempt_summary: str | None = None
+
+    def note_read(self, path: str) -> None:
+        if path and path not in self.files_read:
+            self.files_read.append(path)
+
+    def note_write(self, path: str) -> None:
+        if path and path not in self.files_written:
+            self.files_written.append(path)
+
+    def note_test(self, summary: str) -> None:
+        if summary and summary not in self.test_results:
+            self.test_results.append(summary)
+
+    def to_json(self) -> str:
+        """Compact JSON rendering (injected/refreshed verbatim on compaction)."""
+        return json.dumps(
+            {
+                "plan": self.plan,
+                "files_read": self.files_read,
+                "files_written": self.files_written,
+                "test_results": self.test_results,
+                "milestones": self.milestones,
+                "prior_attempt_summary": self.prior_attempt_summary,
+            },
+            ensure_ascii=False,
+        )
+
+
+def scratchpad_message(scratchpad: Scratchpad) -> Message:
+    """The trusted system message carrying the scratchpad JSON (index 2)."""
+    return Message(
+        role="system",
+        content=f"{_SCRATCHPAD_PREFIX}:\n{scratchpad.to_json()}",
+    )
+
+
+def is_scratchpad_message(message: Message) -> bool:
+    return message.role == "system" and message.content.startswith(_SCRATCHPAD_PREFIX)
 
 
 def should_compact(messages: list[Message], context_window: int) -> bool:
@@ -77,6 +137,7 @@ def compact(
     *,
     context_window: int,
     stats: CompactionStats | None = None,
+    structured: Scratchpad | None = None,
 ) -> tuple[list[Message], str]:
     """Deterministically compact a conversation (pure — the input is not mutated).
 
@@ -89,6 +150,12 @@ def compact(
     Invariant (§8.5): ``messages[:2]`` is always ``[system, task brief]``;
     scratchpads live in the tail and are re-distilled (collapsed into the new
     scratchpad) on every compaction.
+
+    WP 8.2: when a structured :class:`Scratchpad` is supplied, it IS the
+    scratchpad — no distillation pass runs over the conversation at all, and
+    stale structured-scratchpad messages are dropped from the tail (the caller
+    re-injects the fresh JSON at index 2). The free-text distillation remains
+    only as the fallback for pre-8.2 / scratchpad-less conversations.
     """
     del context_window  # the decision was made by should_compact; kept for symmetry
     if stats is None:
@@ -96,10 +163,18 @@ def compact(
     stats.tokens_before = sum(estimate_tokens(m.content) for m in messages)
     stats.turns_dropped = max(len(messages) - 2, 0)
     kept_head = messages[:2]
-    # The scratchpad is distilled from the ORIGINAL text: elision removes the
-    # untrusted bodies before the error lines inside them would be scanned.
-    scratchpad = _build_scratchpad("\n\n".join(m.content for m in messages[2:]))
-    elided = [Message(m.role, _elide(m.content)) for m in messages[2:]]
+    if structured is not None:
+        scratchpad = structured.to_json()
+        elided = [
+            Message(m.role, _elide(m.content))
+            for m in messages[2:]
+            if not is_scratchpad_message(m)
+        ]
+    else:
+        # The scratchpad is distilled from the ORIGINAL text: elision removes the
+        # untrusted bodies before the error lines inside them would be scanned.
+        scratchpad = _build_scratchpad("\n\n".join(m.content for m in messages[2:]))
+        elided = [Message(m.role, _elide(m.content)) for m in messages[2:]]
     stats.scratchpad = scratchpad
     stats.tokens_after = sum(estimate_tokens(m.content) for m in kept_head + elided)
     return kept_head + elided, scratchpad

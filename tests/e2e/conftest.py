@@ -175,8 +175,14 @@ def resp(calls: list[Any] | None = None, content: str | None = None) -> Any:
 
 
 def write_resp(tc_id: str, path: str, content: str) -> Any:
-    """One scripted model turn: a JSON-safe ``write_file`` tool call."""
-    return resp(calls=[tc(tc_id, "write_file", json.dumps({"path": path, "content": content}))])
+    """One scripted model turn: a JSON-safe ``write_file`` tool call.
+
+    The response carries a PLAN block (WP 8.1) so the planning phase unlocks
+    in the same turn and the scripted write executes."""
+    return resp(
+        content=f"PLAN:\n- Write: {path}\n- Test: pytest",
+        calls=[tc(tc_id, "write_file", json.dumps({"path": path, "content": content}))],
+    )
 
 
 COMMIT_TURN = resp(calls=[tc("c", "run_command", '{"cmd":"git add -A && git commit -m work"}')])
@@ -249,6 +255,7 @@ def settings() -> Settings:
             task_max_attempts=2,
             attempt_max_turns=8,
             attempt_wallclock_s=120,
+            planning_turns=0,  # WP 8.1 phase is unit-tested; e2e scripts route on exact flow
         ),
         sandbox=SandboxNetwork(),
     )

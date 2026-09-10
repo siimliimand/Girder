@@ -188,7 +188,7 @@ async def dh(
     settings = Settings(
         project=ProjectConfig(test_directories=["tests"]),
         limits=LimitsConfig(task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60,
-                            ci_fix_attempts=2),
+                            ci_fix_attempts=2, planning_turns=0),
         sandbox=SandboxNetwork(),
         github=GithubConfig(poll_interval_s=0.0),
     )

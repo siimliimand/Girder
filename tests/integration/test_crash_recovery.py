@@ -85,7 +85,9 @@ async def seeded(db: Database, tmp_path: Path):
 
     settings = Settings(
         project=ProjectConfig(test_directories=["tests"]),
-        limits=LimitsConfig(task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60),
+        limits=LimitsConfig(
+            task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60, planning_turns=0
+        ),
         sandbox=SandboxNetwork(),
     )
     return db, project, fresh, repo_path, task_a, task_b, attempt, ref, settings, tmp_path

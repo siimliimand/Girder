@@ -202,3 +202,79 @@ def test_generator_prompt_carries_task_sizing_clause() -> None:
 
     assert "within the orchestrator's turn budget" in _SYSTEM_TEMPLATE
     assert "one task per section" in _SYSTEM_TEMPLATE
+
+
+# ------------------------------------------------- WP 8.2 structured scratchpad
+
+
+def test_scratchpad_dedupes_preserving_order() -> None:
+    from girder.agent.context import Scratchpad
+
+    pad = Scratchpad()
+    pad.note_read("b.py")
+    pad.note_read("a.py")
+    pad.note_read("b.py")
+    pad.note_read("")  # empty paths are dropped
+    pad.note_write("src/x.py")
+    pad.note_write("src/x.py")
+    pad.note_test("PASSED: 1  FAILED: 0  ERROR: 0")
+    pad.note_test("PASSED: 0  FAILED: 1  ERROR: 0")
+    assert pad.files_read == ["b.py", "a.py"]
+    assert pad.files_written == ["src/x.py"]
+    assert len(pad.test_results) == 2
+    assert '"files_read": ["b.py", "a.py"]' in pad.to_json()
+
+
+def test_scratchpad_message_shape_and_detection() -> None:
+    from girder.agent.context import Scratchpad, is_scratchpad_message, scratchpad_message
+
+    pad = Scratchpad(plan="PLAN: x", prior_attempt_summary="brief")
+    msg = scratchpad_message(pad)
+    assert msg.role == "system"
+    assert msg.content.startswith("[TRUSTED] Scratchpad:")
+    assert '"prior_attempt_summary": "brief"' in msg.content
+    assert is_scratchpad_message(msg)
+    assert not is_scratchpad_message(Message(role="user", content=msg.content))
+    assert not is_scratchpad_message(Message(role="system", content="[TRUSTED] other"))
+
+
+def test_compact_structured_skips_distillation_and_stale_scratchpads() -> None:
+    """WP 8.2: with a structured scratchpad the returned scratchpad IS the
+    structured JSON (no free-text distillation) and stale structured-scratchpad
+    messages are dropped from the tail."""
+    from girder.agent.context import Scratchpad, scratchpad_message
+
+    pad = Scratchpad(plan="PLAN: x")
+    pad.note_write("src/new.py")
+    msgs = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="brief"),
+        scratchpad_message(Scratchpad(plan="stale")),
+        Message(
+            role="user",
+            content='<untrusted-data source="write_file:src/old.py">\nsecret\n</untrusted-data>',
+        ),
+    ]
+    out, scratchpad = compact(msgs, context_window=10_000, structured=pad)
+    assert "src/new.py" in scratchpad and "old.py" not in scratchpad  # structured, not distilled
+    assert sum(1 for m in out if "Scratchpad" in m.content) == 0  # stale block dropped
+    assert out[0].content == "sys" and out[1].content == "brief"
+    assert "elided" in out[-1].content  # untrusted bodies still elided
+
+
+# ----------------------------------------------------- WP 8.1 prompt additions
+
+
+def test_system_prompt_announces_planning_phase() -> None:
+    text = build_system_prompt(
+        task=_task(), spec_slice="s", turn_budget=20, planning_turns=5
+    )
+    assert "REQUIRED PLANNING PHASE (turns 1-5)" in text
+    assert "Do NOT call write_file, edit_file, or apply_patch before" in text
+
+
+def test_system_prompt_omits_planning_phase_when_disabled() -> None:
+    text = build_system_prompt(
+        task=_task(), spec_slice="s", turn_budget=20, planning_turns=0
+    )
+    assert "PLANNING PHASE" not in text

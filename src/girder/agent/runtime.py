@@ -23,22 +23,46 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from typing import Any, cast
 
 from girder.agent import prompts
-from girder.agent.context import CompactionStats, compact, should_compact
-from girder.agent.tools import TOOL_SCHEMAS, ToolExecResult, ToolRegistry
+from girder.agent.context import (
+    CompactionStats,
+    Scratchpad,
+    compact,
+    scratchpad_message,
+    should_compact,
+)
+from girder.agent.tools import (
+    _NEW_TOOL_ALIASES,
+    _WRITE_TOOLS,
+    TOOL_SCHEMAS,
+    ToolExecResult,
+    ToolRegistry,
+    _gate_new_tool,
+)
 from girder.config import LimitsConfig
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Attempt, SteeringKind, Task
 from girder.guard.redact import Redactor, redact_and_log
-from girder.guard.scope import TaskScopes
+from girder.guard.scope import TaskScopes, Verdict, check_tool_call
 from girder.models.gateway import Message, ModelGateway, ModelToolCall
 from girder.sandbox.engine import SandboxEngine
 from girder.stacks import STACK_REGISTRY, StackPlugin
 
 # Recent tail preserved across compaction so the loop stays coherent (§8.5).
 _TAIL_AFTER_COMPACTION = 6
+
+# WP 8.1 planning-phase hold: a plain tool RESULT — the tool is not executed,
+# the call is not recorded, and it is NOT a held (scope-violated) call, so it
+# never taints the attempt's integrity ledger.
+_PLANNING_HOLD_OUTPUT = (
+    "[planning phase] Write tools are not available until you have output a "
+    "PLAN block."
+)
+
+_PLAN_MAX_CHARS = 2000
 
 _NO_TOOL_NUDGE = (
     "You must act via tools; call mark_task_complete when the task is done "
@@ -129,6 +153,10 @@ class AgentRuntime:
         self._scopes = scopes  # kept for budget-aware prompts (protected globs)
         self._redactor = redactor
         self._context_window = gateway.role_config(model_role).context_window
+        # WP 8.1/8.2 per-attempt state: the structured scratchpad shared with
+        # the tool registry, and the planning-phase latch.
+        self._scratchpad = Scratchpad()
+        self._plan_emitted = False
         self._registry = ToolRegistry(
             sandbox=sandbox,
             container=container,
@@ -140,6 +168,7 @@ class AgentRuntime:
             run_id=run_id,
             task=task,
             stack=stack or STACK_REGISTRY["python-3.12"],
+            scratchpad=self._scratchpad,
         )
 
     async def execute_attempt(
@@ -148,6 +177,7 @@ class AgentRuntime:
         spec_slice: str,
         guidance: str | None = None,
         deadline_s: float | None = None,
+        prior_attempt_summary: str | None = None,
     ) -> AttemptOutcome:
         """Run the turn loop to a terminal tool, the turn cap, or the deadline.
 
@@ -156,7 +186,10 @@ class AgentRuntime:
         — the gateway call and each tool execution run under
         ``asyncio.wait_for`` bounded by the remaining wall-clock (§8.3.2).
         Killing the container remains the caller's job.
+        ``prior_attempt_summary`` (WP 8.3) lands in the structured scratchpad
+        so the retry brief survives compaction.
         """
+        self._scratchpad.prior_attempt_summary = prior_attempt_summary
         messages = [
             Message(
                 role="system",
@@ -165,6 +198,7 @@ class AgentRuntime:
                     spec_slice=spec_slice,
                     turn_budget=self.limits.attempt_max_turns,
                     read_restricted=self._scopes.protected_globs,
+                    planning_turns=self.limits.planning_turns,
                 ),
             ),
             Message(
@@ -193,6 +227,7 @@ class AgentRuntime:
             milestone = _milestone_for_turn(turns_used, self.limits.attempt_max_turns)
             if milestone is not None and milestone not in fired_milestones:
                 fired_milestones.add(milestone)
+                self._scratchpad.milestones.append(milestone)
                 messages.append(
                     Message(role="user", content=prompts.build_directive_message(milestone))
                 )
@@ -238,8 +273,15 @@ class AgentRuntime:
                 messages = self._maybe_compact(messages)
                 continue
 
+            # WP 8.1: a PLAN block in the response unlocks write tools from
+            # this turn on (the planning budget is a ceiling, not a delay).
+            if not self._plan_emitted and "PLAN:" in (response.content or ""):
+                self._plan_emitted = True
+                self._scratchpad.plan = (response.content or "")[:_PLAN_MAX_CHARS]
             try:
-                calls = await self._run_calls(response.tool_calls, deadline_s=deadline_s)
+                calls = await self._run_calls(
+                    response.tool_calls, deadline_s=deadline_s, turn=turns_used
+                )
             except _MidTurnDeadline:
                 return await self._finish(
                     "timeout", None, "wall-clock deadline exhausted mid-turn", turns_used
@@ -369,7 +411,7 @@ class AgentRuntime:
         return messages
 
     async def _run_calls(
-        self, tool_calls: list[ModelToolCall], *, deadline_s: float | None = None
+        self, tool_calls: list[ModelToolCall], *, deadline_s: float | None = None, turn: int = 0
     ) -> list[tuple[str, dict[str, object], ToolExecResult]]:
         """Defensively parse ``arguments_json``, then execute each call.
 
@@ -377,10 +419,31 @@ class AgentRuntime:
         error result and the turn still counts. Each execution is bounded by
         the remaining wall-clock (§8.3.2); exhaustion raises
         :class:`_MidTurnDeadline` so the caller takes the timeout path.
+        WP 8.1 (R-SP8-1): during the planning phase a write tool returns a
+        plain synthetic result — the registry never sees the call, so no
+        tool_calls row (held or otherwise) is written and the attempt's
+        integrity ledger stays clean.
         """
         loop = asyncio.get_running_loop()
+        planning = not self._plan_emitted and turn <= max(0, self.limits.planning_turns)
         executed: list[tuple[str, dict[str, object], ToolExecResult]] = []
         for tc in tool_calls:
+            if planning and tc.name in _WRITE_TOOLS:
+                # The planning hold never launders a would-be integrity
+                # violation: a write the scope gate would hold still goes
+                # through the registry and is recorded as held (R-SP8-1).
+                try:
+                    hold_args = cast("dict[str, Any]", json.loads(tc.arguments_json))
+                    verdict = check_tool_call(tc.name, hold_args, self._scopes)
+                    if verdict is Verdict.ALLOW and tc.name in _NEW_TOOL_ALIASES:
+                        verdict = _gate_new_tool(tc.name, hold_args, self._scopes)
+                except (ValueError, TypeError):
+                    verdict = Verdict.ALLOW
+                if verdict is not Verdict.VIOLATION:
+                    executed.append(
+                        (tc.name, {}, ToolExecResult(ok=False, output=_PLANNING_HOLD_OUTPUT))
+                    )
+                    continue
             try:
                 args: dict[str, object] = json.loads(tc.arguments_json)
                 if not isinstance(args, dict):
@@ -457,17 +520,21 @@ class AgentRuntime:
         if not should_compact(messages, self._context_window):
             return messages
         stats = CompactionStats()
-        compacted, scratchpad = compact(
-            messages, context_window=self._context_window, stats=stats
+        # WP 8.2: with a structured scratchpad the refresh is free — the JSON
+        # block at index 2 is regenerated from registry-maintained state and
+        # NO distillation pass runs over the conversation (no model call).
+        # compact() falls back to free-text distillation only for callers
+        # without a structured scratchpad.
+        compacted, _scratchpad = compact(
+            messages, context_window=self._context_window, stats=stats, structured=self._scratchpad
         )
         # Invariant: messages[:2] is always [system, task brief] — the new
         # scratchpad goes after the head pair, so repeated compactions never
         # displace the task brief (which carries the frozen spec slice).
-        # Prior scratchpads live in the tail and are re-distilled by compact().
         return [
             compacted[0],
             compacted[1],
-            Message(role="system", content=f"[TRUSTED] Scratchpad (prior progress):\n{scratchpad}"),
+            scratchpad_message(self._scratchpad),
             *compacted[2:][-_TAIL_AFTER_COMPACTION:],
         ]
 

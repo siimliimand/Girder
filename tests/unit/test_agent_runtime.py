@@ -45,7 +45,9 @@ class FakeGateway:
 
 
 SCOPES = TaskScopes(write_globs=["src/**"], protected_globs=[".github/**"])
-LIMITS = LimitsConfig(attempt_max_turns=3)
+# planning_turns=0 keeps the WP 8.1 planning phase out of the way for the
+# pre-existing tests; the planning tests below override it explicitly.
+LIMITS = LimitsConfig(attempt_max_turns=3, planning_turns=0)
 
 
 @pytest.fixture
@@ -292,7 +294,7 @@ async def test_repeated_compaction_retains_system_and_task_brief(
         assert messages[0].content == system_text
         assert messages[1].content == brief_text
         assert "immutable-marker" in messages[1].content
-        scratchpads = [m for m in messages if "Scratchpad (prior progress)" in m.content]
+        scratchpads = [m for m in messages if m.content.startswith("[TRUSTED] Scratchpad")]
         assert len(scratchpads) == 1
         assert messages[2] is scratchpads[0]
 
@@ -484,3 +486,260 @@ async def test_dirty_probe_failure_fails_open(
     outcome = await _runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
 
     assert outcome.status == "succeeded"
+
+
+# ------------------------------------------------------- WP 8.1 planning phase
+
+PLANNING_LIMITS = LimitsConfig(attempt_max_turns=3, planning_turns=5)
+
+
+def _planning_runtime(
+    seeded: tuple[Database, str, Attempt, Task],
+    gateway: FakeGateway,
+    sandbox: SandboxEngine,
+    limits: LimitsConfig = PLANNING_LIMITS,
+) -> AgentRuntime:
+    db, run_id, attempt, task = seeded
+    return AgentRuntime(
+        gateway=gateway,  # type: ignore[arg-type]
+        sandbox=sandbox,
+        container="ctr",
+        scopes=SCOPES,
+        limits=limits,
+        redactor=Redactor(),
+        db=db,
+        run_id=run_id,
+        attempt=attempt,
+        task=task,
+    )
+
+
+async def test_planning_phase_holds_write_tools_without_recording_them(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """WP 8.1 (R-SP8-1): during the planning phase a write tool returns the
+    synthetic planning result and the registry NEVER sees the call — no
+    tool_calls row, held or otherwise, and nothing reaches the sandbox."""
+    db, _run_id, attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "write_file", '{"path":"src/a.py","content":"x"}')]),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    sandbox = FakeSandbox()
+    outcome = await _planning_runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+    # the write never executed — only the terminal gate's read-only dirty
+    # probe may touch the sandbox
+    assert all(cmd[:2] == ["git", "status"] for _, cmd, _ in sandbox.execs)
+    rows = await repo.list_tool_calls_for_attempt(db, attempt.id)
+    assert [r["tool_name"] for r in rows] == ["mark_task_complete"]  # no write row at all
+    # the model got the planning message as a plain tool result
+    second_turn_messages = gateway.calls[1][1]
+    assert any(
+        "[planning phase] Write tools are not available" in m.content
+        for m in second_turn_messages
+        if m.role == "user"
+    )
+
+
+async def test_planning_hold_does_not_taint_the_integrity_ledger(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """The planning hold must be invisible to the held-call machinery: a
+    mark_task_complete in the SAME turn as a planning-held write is a clean
+    completion (held=False), and count_held_tool_calls stays at zero."""
+    db, _run_id, attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(
+                calls=[
+                    _tc("1", "write_file", '{"path":"src/a.py","content":"x"}'),
+                    _tc("2", "mark_task_complete", '{"summary":"done"}'),
+                ]
+            ),
+        ]
+    )
+    outcome = await _planning_runtime(seeded, gateway, FakeSandbox()).execute_attempt(
+        spec_slice="s"
+    )
+    assert outcome.status == "succeeded"  # NOT integrity_violation
+    assert await repo.count_held_tool_calls(db, attempt.id) == 0
+    rows = await db.fetchall("SELECT kind FROM integrity_violations")
+    assert rows == []
+
+
+async def test_plan_block_unlocks_write_tools_same_turn(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """A PLAN block in the response unlocks write tools immediately — the
+    planning budget is a ceiling, not a delay."""
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(
+                content="PLAN:\n- Read: src/a.py\n- Write: src/b.py\n- Test: pytest",
+                calls=[_tc("1", "write_file", '{"path":"src/b.py","content":"x"}')],
+            ),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
+    outcome = await _planning_runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+    assert any(cmd[0] == "mkdir" for _, cmd, _ in sandbox.execs)  # the write ran
+
+
+async def test_planning_turns_zero_disables_the_phase(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "write_file", '{"path":"src/a.py","content":"x"}')]),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
+    outcome = await _planning_runtime(
+        seeded, gateway, sandbox, limits=LimitsConfig(attempt_max_turns=3, planning_turns=0)
+    ).execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+    assert any(cmd[0] == "mkdir" for _, cmd, _ in sandbox.execs)
+
+
+async def test_planning_budget_announced_in_system_prompt(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway([_resp(calls=[_tc("1", "mark_task_complete", '{"summary":"s"}')])])
+    await _planning_runtime(seeded, gateway, FakeSandbox()).execute_attempt(spec_slice="s")
+    system = gateway.calls[0][1][0].content
+    assert "REQUIRED PLANNING PHASE (turns 1-5)" in system
+    assert "PLAN:" in system
+
+
+# --------------------------------------------- WP 8.2 structured scratchpad
+
+
+class _SmallWindowGateway(FakeGateway):
+    def role_config(self, role: str) -> Any:
+        cfg = super().role_config(role)
+        cfg.context_window = 1000
+        return cfg
+
+
+async def test_compaction_refreshes_structured_scratchpad_without_distillation(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """WP 8.2: with a structured scratchpad, compaction refreshes the index-2
+    JSON block from registry-maintained state — messages[:2] survive verbatim
+    and NO distillation (gateway) call happens."""
+    _db, _run_id, _attempt, _task = seeded
+    gateway = _SmallWindowGateway([])
+    runtime = _planning_runtime(seeded, gateway, FakeSandbox(), limits=LIMITS)
+    runtime._scratchpad.plan = "PLAN: write the thing"
+    runtime._scratchpad.note_read("src/a.py")
+    runtime._scratchpad.note_write("src/b.py")
+    runtime._scratchpad.milestones.append("Half your turns are spent")
+
+    system_text = "SYSTEM INVARIANTS"
+    brief_text = "TASK BRIEF immutable-marker"
+    messages = [
+        Message(role="system", content=system_text),
+        Message(role="user", content=brief_text),
+        Message(
+            role="user",
+            content='<untrusted-data source="read_file:src/a.py">\n'
+            + ("X" * 6000)
+            + "</untrusted-data>",
+        ),
+    ]
+    messages = runtime._maybe_compact(messages)
+    assert gateway.calls == []  # no distillation model call
+    assert messages[0].content == system_text
+    assert messages[1].content == brief_text
+    scratch = messages[2]
+    assert scratch.role == "system"
+    assert scratch.content.startswith("[TRUSTED] Scratchpad:")
+    assert '"files_read": ["src/a.py"]' in scratch.content
+    assert '"plan": "PLAN: write the thing"' in scratch.content
+    # second compaction refreshes in place — never two scratchpad messages
+    messages.append(
+        Message(
+            role="user",
+            content='<untrusted-data source="read_file:src/a.py">\n'
+            + ("Y" * 6000)
+            + "</untrusted-data>",
+        )
+    )
+    messages = runtime._maybe_compact(messages)
+    scratchpads = [m for m in messages if m.content.startswith("[TRUSTED] Scratchpad")]
+    assert len(scratchpads) == 1 and messages[2] is scratchpads[0]
+
+
+async def test_milestones_and_reads_land_in_the_scratchpad(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """Milestone directives and executed reads are mirrored into the
+    structured scratchpad."""
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "read_file", '{"path":"src/a.py"}')]),
+            _resp(content="still exploring"),
+            _resp(content="still exploring"),
+            _resp(content="still exploring"),
+            _resp(content="still exploring"),
+        ]
+    )
+    runtime = _planning_runtime(
+        seeded, gateway, FakeSandbox(results=[ExecResult(0, "body\n", "")]),
+        limits=LimitsConfig(attempt_max_turns=5, planning_turns=0),
+    )
+    outcome = await runtime.execute_attempt(spec_slice="s")
+    assert outcome.status == "failed"  # ran out of turns
+    pad = runtime._scratchpad
+    assert "src/a.py" in pad.files_read
+    assert any("Half your turns" in m for m in pad.milestones)
+    assert any("Final turns" in m for m in pad.milestones)
+
+
+async def test_prior_attempt_summary_lands_in_scratchpad(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """WP 8.3 wiring: the retry brief passed as prior_attempt_summary is kept
+    on the new attempt's structured scratchpad (and thus survives compaction)."""
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway([_resp(calls=[_tc("1", "mark_task_complete", '{"summary":"s"}')])])
+    runtime = _planning_runtime(seeded, gateway, FakeSandbox(), limits=LIMITS)
+    await runtime.execute_attempt(
+        spec_slice="s", prior_attempt_summary="[TRUSTED] Retry brief (attempt 1 failed):"
+    )
+    assert runtime._scratchpad.prior_attempt_summary == (
+        "[TRUSTED] Retry brief (attempt 1 failed):"
+    )
+
+
+async def test_planning_hold_never_laundered_scope_violation_still_recorded(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """A write the scope gate would hold (tests/** is out of scope) stays a
+    recorded integrity violation even during the planning phase — the
+    planning hold only suppresses writes that would have been allowed."""
+    db, _run_id, attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "write_file", '{"path":"tests/test_x.py","content":"boom"}')]),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"ok"}')]),
+        ]
+    )
+    outcome = await _planning_runtime(seeded, gateway, FakeSandbox()).execute_attempt(
+        spec_slice="s"
+    )
+    assert outcome.status == "succeeded"  # held but not terminal-turn-tainted
+    rows = await repo.list_tool_calls_for_attempt(db, attempt.id)
+    bad = next(r for r in rows if r["tool_name"] == "write_file")
+    assert bad["scope_violation"] and bad["held"]
+    assert await repo.count_held_tool_calls(db, attempt.id) == 1

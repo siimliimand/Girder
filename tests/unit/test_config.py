@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from girder.config import (
     DEFAULT_SECRETS_PATH,
@@ -315,3 +316,13 @@ def test_web_unix_socket_default_and_toml(tmp_path: Path) -> None:
     # host/port keep their defaults; they are simply unused in UDS mode.
     assert settings.web.host == "127.0.0.1"
     assert settings.web.port == 8787
+
+
+def test_planning_turns_zero_is_valid_but_negative_is_not() -> None:
+    """WP 8.1: 0 disables the planning phase (and passes the Settings range
+    check); negative values are rejected by the field constraint."""
+    from girder.config import LimitsConfig
+
+    assert LimitsConfig(planning_turns=0).planning_turns == 0
+    with pytest.raises(ValidationError):
+        LimitsConfig(planning_turns=-1)

@@ -222,6 +222,7 @@ run_cap_usd = 5.00                         # hard financial stop per run
 [limits]
 attempt_wallclock_s = 600
 attempt_max_turns = 20
+planning_turns = 5                        # write tools held until a PLAN block (WP 8.1); 0 disables
 task_max_attempts = 3
 ci_fix_attempts = 3
 conflict_resolution_attempts = 2

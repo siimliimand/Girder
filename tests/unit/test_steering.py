@@ -101,7 +101,8 @@ class Harness:
 def settings() -> Settings:
     return Settings(
         project=ProjectConfig(test_directories=["tests"]),
-        limits=LimitsConfig(task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60),
+        limits=LimitsConfig(task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60,
+                           planning_turns=0),
         sandbox=SandboxNetwork(),
     )
 
@@ -290,7 +291,7 @@ async def test_inject_absorbed_mid_turn_as_trusted_message(db: Database) -> None
         sandbox=FakeSandbox(),
         container="ctr",
         scopes=TaskScopes(write_globs=["src/**"]),
-        limits=LimitsConfig(attempt_max_turns=3),
+        limits=LimitsConfig(attempt_max_turns=3, planning_turns=0),
         redactor=Redactor(),
         db=db,
         run_id=run.id,

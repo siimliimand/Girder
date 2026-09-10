@@ -128,7 +128,9 @@ async def ctx(db: Database, tmp_path: Path) -> AsyncIterator[Ctx]:
     assert fresh is not None and fresh.status is RunStatus.SPEC_APPROVED
     settings = Settings(
         project=ProjectConfig(test_directories=["tests"]),
-        limits=LimitsConfig(task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60),
+        limits=LimitsConfig(
+            task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60, planning_turns=0
+        ),
         sandbox=SandboxNetwork(),
     )
     yield Ctx(

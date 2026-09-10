@@ -53,12 +53,15 @@ def build_system_prompt(
     spec_slice: str,
     turn_budget: int | None = None,
     read_restricted: Sequence[str] = (),
+    planning_turns: int | None = None,
 ) -> str:
     """The invariant-carrying system message (§7). The task itself is *not* here.
 
     ``turn_budget`` / ``read_restricted`` add a compact working-method block
     (budget awareness + survey-before-read) so the agent can pace itself
     against the turn cap instead of dying in read-only exploration.
+    ``planning_turns`` (WP 8.1, R-SP8-1) announces the mandatory planning
+    phase; the runtime enforces it mechanically by holding write tools.
     """
     del task, spec_slice  # framing is task-independent; kept for call-site symmetry
     method = ""
@@ -70,6 +73,24 @@ def build_system_prompt(
             if read_restricted
             else ""
         )
+        planning = ""
+        if planning_turns:
+            planning = (
+                "\n\nREQUIRED PLANNING PHASE (turns 1-"
+                + str(planning_turns)
+                + "):\n"
+                "Before writing ANY file, output a plan in this format:\n"
+                "  PLAN:\n"
+                "  - Read: [list files you need to read]\n"
+                "  - Understand: [what you need to learn from them]\n"
+                "  - Write: [list files to create or modify, one per bullet]\n"
+                "  - Test: [which tests you'll run to verify]\n"
+                "\n"
+                "Do NOT call write_file, edit_file, or apply_patch before "
+                "outputting PLAN — write tools are mechanically unavailable "
+                "until you do (or until the planning budget above elapses).\n"
+                "After outputting PLAN, proceed to execution."
+            )
         method = (
             "\n\nWORKING METHOD:\n"
             f"- Your turn budget for this attempt is {turn_budget}."
@@ -81,6 +102,7 @@ def build_system_prompt(
             "beyond half the budget is a failure mode.\n"
             "- mark_task_complete MUST end your attempt: if turns run out "
             "first, the attempt is destroyed and uncommitted work is lost."
+            + planning
         )
     return _SYSTEM_INVARIANTS + method
 

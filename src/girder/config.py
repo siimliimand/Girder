@@ -91,6 +91,10 @@ class BudgetConfig(BaseModel):
 class LimitsConfig(BaseModel):
     attempt_wallclock_s: int = 600
     attempt_max_turns: int = 20
+    # WP 8.1 planning phase (R-SP8-1): write tools are held until the agent
+    # outputs a PLAN block or `planning_turns` turns elapse — whichever comes
+    # first (the budget is a ceiling, not a delay). 0 disables the phase.
+    planning_turns: int = Field(default=5, ge=0)
     task_max_attempts: int = 3
     ci_fix_attempts: int = 3
     conflict_resolution_attempts: int = 2
@@ -249,6 +253,8 @@ class Settings(BaseSettings):
         for name, value in self.limits.__dict__.items():
             if isinstance(value, bool):
                 continue  # inject_index is a flag, not a positive quantity
+            if name == "planning_turns" and value == 0:
+                continue  # WP 8.1: 0 legally disables the planning phase
             if value <= 0:
                 errors.append(f"limits.{name} must be > 0 (got {value})")
         if not self.project.test_directories:
