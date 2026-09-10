@@ -150,7 +150,13 @@
 (function () {
   var log = document.getElementById("event-log");
   var note = document.getElementById("stream-note");
-  var es = new EventSource("/api/runs/{{ run.id }}/events?after_id=0");
+  var key = null;
+  try { key = localStorage.getItem("girder_api_key"); } catch (e) {}
+  var esUrl = "/api/runs/{{ run.id }}/events?after_id=0";
+  if (key) {
+    esUrl += "&api_key=" + encodeURIComponent(key);  {# EventSource cannot send headers #}
+  }
+  var es = new EventSource(esUrl);
 
   {# WP 12.2 live DAG: task state_transition events carry
      payload={entity:"task", id, from, to} (fsm.transition payload shape) —

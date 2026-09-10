@@ -104,6 +104,11 @@ def test_public_prefix_exemption_mechanism() -> None:
     assert is_public_path("/metrics")
     assert is_public_path("/api/webhooks/github/push")
     assert not is_public_path("/api/projects")
+    # boundary: non-slash-prefixed entries are exact-or-under, not raw prefix
+    assert not is_public_path("/metricsEvil")
+    assert not is_public_path("/metrics-fake")
+    assert not is_public_path("/api/webhooksX/evil")
+    assert is_public_path("/metrics/")
 
 
 async def test_public_path_exempt_end_to_end() -> None:
@@ -113,6 +118,17 @@ async def test_public_path_exempt_end_to_end() -> None:
     # /metrics is a live WP 12.3 endpoint now — but never 401/403: the
     # exemption wins over the configured API key.
     assert resp.status_code not in (401, 403)
+
+
+async def test_metrics_lookalikes_require_key() -> None:
+    # The exemption is a boundary, not a raw prefix: /metricsEvil must not
+    # ride /metrics' exemption. Lookalikes match no route, so they 404 —
+    # the point is they are never exempt (200) either.
+    app = _app(api_key=KEY)
+    async with _client(app) as client, app.router.lifespan_context(app):
+        for path in ("/metricsEvil", "/metrics-fake"):
+            resp = await client.get(path, follow_redirects=False)
+            assert resp.status_code == 404
 
 
 async def test_compare_digest_rejects_tampered_bearer_prefix() -> None:

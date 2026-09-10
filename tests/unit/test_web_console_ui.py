@@ -81,6 +81,25 @@ async def test_run_page_tasks_carry_task_id_and_status_badge(tmp_path: Path) -> 
         assert 'p.id' in resp.text and 'p.to' in resp.text
 
 
+async def test_run_page_eventsource_carries_api_key(tmp_path: Path) -> None:
+    """EventSource cannot send headers (WP 12.5): the run page must append the
+    localStorage key as ?api_key= to the SSE URL, skipping it when unset."""
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+
+        resp = await client.get(f"/runs/{r.id}")
+        assert resp.status_code == 200
+        assert 'localStorage.getItem("girder_api_key")' in resp.text
+        assert '"&api_key=" + encodeURIComponent(key)' in resp.text
+        assert 'if (key)' in resp.text
+        assert 'new EventSource(esUrl)' in resp.text
+        # base.html's GET-form guard: never leak the key into a GET URL
+        assert 'toLowerCase() === "get"' in resp.text
+
+
 # ---------------------------------------------------------- WP 12.6 diff viewer
 
 

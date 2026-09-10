@@ -74,6 +74,7 @@
       document.addEventListener("submit", function (ev) {
         var form = ev.target;
         if (!form || !form.action || /[?&]api_key=/.test(form.action)) return;
+        if ((form.method || "").toLowerCase() === "get") return;  // never leak the key into the URL/history
         form.action += (form.action.indexOf("?") === -1 ? "?" : "&") + "api_key=" +
           encodeURIComponent(key);
       }, true);

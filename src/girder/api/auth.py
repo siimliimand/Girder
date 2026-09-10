@@ -3,8 +3,10 @@
 NOT OAuth, NOT sessions (explicit non-goals). When ``[web] api_key`` is
 empty/unset the whole console stays anonymous (localhost default); when set,
 every route on the aggregated router requires ``Authorization: Bearer <key>``
-or ``X-API-Key: <key>`` (``?api_key=`` is also accepted so the server-rendered
-HTML forms work without JS).
+or ``X-API-Key: <key>`` (``?api_key=`` is also accepted on **every** route —
+it exists because ``EventSource`` and plain HTML forms cannot set headers —
+with the tradeoff that a key sent this way may land in access logs and browser
+history for whatever route it was used on).
 
 Enforcement is a single router-level dependency installed once in
 :mod:`girder.api.routes` (not app middleware): the static asset ``/static``
@@ -36,8 +38,19 @@ _QUERY_PARAM = "api_key"  # fallback channel for plain HTML form POSTs
 
 
 def is_public_path(path: str) -> bool:
-    """True for paths exempt from the API-key check (see PUBLIC_PATH_PREFIXES)."""
-    return path.startswith(PUBLIC_PATH_PREFIXES)
+    """True for paths exempt from the API-key check (see PUBLIC_PATH_PREFIXES).
+
+    Entries ending in "/" are prefix matches; entries without a trailing "/"
+    match only the exact path or anything under it — so ``/metricsEvil`` is
+    NOT exempt despite sharing the ``/metrics`` prefix.
+    """
+    for prefix in PUBLIC_PATH_PREFIXES:
+        if prefix.endswith("/"):
+            if path.startswith(prefix):
+                return True
+        elif path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
 
 
 def _presented_key(request: Request) -> str | None:
