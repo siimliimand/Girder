@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import shlex
 import time
@@ -28,7 +29,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from girder.agent.context import estimate_tokens
+from girder.agent.context import Scratchpad, estimate_tokens
 from girder.config import LimitsConfig
 from girder.db import repo
 from girder.db.engine import Database
@@ -39,6 +40,7 @@ from girder.sandbox.engine import SandboxEngine
 from girder.stacks import StackPlugin
 
 _TERMINAL_TOOLS = ("mark_task_complete", "request_spec_amendment")
+logger = logging.getLogger(__name__)
 _WRITE_TOOLS = ("write_file", "apply_patch", "edit_file")
 _READ_TOOLS = (
     "read_file",
@@ -58,7 +60,6 @@ _B64_DECODE_SNIPPET = (
 )
 _PATCH_PREFIX = "/tmp/.girder-patch"
 _MATCH_CAP = 200  # rg / grep match cap before truncation
-_RUN_TESTS_JUNIT = "/tmp/.girder-run-tests.xml"
 
 # edit_file (WP 7.1): replace lines start..end (1-indexed, inclusive) with the
 # base64-argv replacement. Out-of-range ranges fail via assert — a silent
@@ -584,6 +585,7 @@ class ToolRegistry:
         run_id: str,
         task: Task,
         stack: StackPlugin,
+        scratchpad: Scratchpad | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.container = container
@@ -595,6 +597,9 @@ class ToolRegistry:
         self.run_id = run_id
         self.task = task
         self.stack = stack
+        # WP 8.2: structured scratchpad shared with the runtime; the registry
+        # records reads/writes/tests on every executed call (dedupe upstream).
+        self.scratchpad = scratchpad if scratchpad is not None else Scratchpad()
         # Clean name -> handler registry (WS-02 hooks tool execution here).
         self._handlers: dict[str, Callable[[dict[str, Any]], Awaitable[tuple[bool, str]]]] = {
             "read_file": self._read_file,
@@ -611,6 +616,21 @@ class ToolRegistry:
             "run_tests": self._run_tests,
             "search_symbols": self._search_symbols,
         }
+        # Scratchpad extraction (WP 8.2): tool name -> which list a successful
+        # call contributes to. Read tools contribute only when a path argument
+        # is present (dedupe preserving order happens in Scratchpad).
+        self._scratchpad_reads = frozenset(
+            {
+                "read_file",
+                "find_files",
+                "ripgrep",
+                "search_symbols",
+                "list_directory",
+                "git_status",
+                "git_diff",
+                "view_symbol_outline",
+            }
+        )
 
     async def execute(self, name: str, args: dict[str, Any]) -> ToolExecResult:
         """Gate, dispatch, truncate, redact, log. Never raises outward."""
@@ -633,6 +653,7 @@ class ToolRegistry:
 
         try:
             ok, raw = await self._dispatch(name, args)
+            self._record_scratchpad(name, args, raw, ok=ok)
         except CommandDenied as exc:
             # Denylisted commands are held like scope violations — the verdict
             # column must agree with scope_violation=1/held=1.
@@ -666,6 +687,30 @@ class ToolRegistry:
         if handler is None:
             return False, f"error: unknown tool {name!r}"
         return await handler(args)
+
+    def _record_scratchpad(
+        self, name: str, args: dict[str, Any], raw: str, *, ok: bool
+    ) -> None:
+        """WP 8.2: feed an executed tool call into the structured scratchpad.
+
+        Read tools contribute their path argument (when one is involved);
+        write tools contribute the written path; run_tests contributes its
+        stable first-line summary (even on a red suite — a FAILED count is
+        exactly what a retry needs). Purely additive: never raises.
+        """
+        try:
+            if name == "run_tests":
+                first = raw.splitlines()[0].strip() if raw.splitlines() else ""
+                if first.startswith("PASSED:"):
+                    self.scratchpad.note_test(first)
+            elif not ok:
+                return
+            elif name in self._scratchpad_reads:
+                self.scratchpad.note_read(str(args.get("path") or ""))
+            elif name in _WRITE_TOOLS:
+                self.scratchpad.note_write(str(args.get("path") or ""))
+        except Exception:  # pragma: no cover - observability must never bite
+            logger.debug("scratchpad recording failed for %s", name, exc_info=True)
 
     async def worktree_dirty_with_output(self) -> tuple[bool, str]:
         """``(bounce-worthy dirt, porcelain output)`` for the terminal-tool gate.
@@ -811,7 +856,11 @@ class ToolRegistry:
         raw_paths = args.get("paths") or []
         paths = [str(p) for p in raw_paths]
         timeout = min(float(args.get("timeout_s") or 120.0), 600.0)
-        cmd = ["pytest", "--tb=short", "--no-header", "-q", f"--junitxml={_RUN_TESTS_JUNIT}"]
+        # WS-02 fix: the JUnit path is attempt-scoped — the old fixed
+        # /tmp/.girder-run-tests.xml raced between concurrent run_tests
+        # invocations inside one container.
+        junit_path = f"/tmp/.girder-run-tests-{self.attempt_id[-8:]}.xml"
+        cmd = ["pytest", "--tb=short", "--no-header", "-q", f"--junitxml={junit_path}"]
         cmd.extend(paths)
         keyword = str(args.get("keyword") or "")
         if keyword:
@@ -819,7 +868,7 @@ class ToolRegistry:
         screen_command(_run_tests_command(args))  # same denylist as run_command
         ok, raw = await self._exec(cmd, timeout_s=timeout)
         # The JUnit report lives inside the container; fetch it, then parse.
-        xml_ok, xml_text = await self._exec(["cat", _RUN_TESTS_JUNIT])
+        xml_ok, xml_text = await self._exec(["cat", junit_path])
         if not xml_ok or not xml_text.strip():
             # No report (collection error, pytest missing, …): fall back to
             # the raw pytest output rather than inventing a summary.

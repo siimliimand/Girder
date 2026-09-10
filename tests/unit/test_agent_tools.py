@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from girder.agent.context import Scratchpad
 from girder.agent.tools import (
     _MATCH_CAP,
     TOOL_SCHEMAS,
@@ -81,7 +82,13 @@ async def seeded(db: Database) -> tuple[Database, str, str]:
     return db, run.id, attempt.id
 
 
-def _registry(sandbox: FakeSandbox, db: Database, run_id: str, attempt_id: str) -> ToolRegistry:
+def _registry(
+    sandbox: FakeSandbox,
+    db: Database,
+    run_id: str,
+    attempt_id: str,
+    scratchpad: Scratchpad | None = None,
+) -> ToolRegistry:
     return ToolRegistry(
         sandbox=sandbox,
         container="ctr",
@@ -93,6 +100,7 @@ def _registry(sandbox: FakeSandbox, db: Database, run_id: str, attempt_id: str) 
         run_id=run_id,
         task=TASK,
         stack=STACK_REGISTRY["python-3.12"],
+        scratchpad=scratchpad,
     )
 
 
@@ -728,15 +736,18 @@ async def test_run_tests_builds_pytest_command_and_summary(
         "run_tests", {"paths": ["tests/test_api.py"], "keyword": "rate_limit and not slow"}
     )
     pytest_cmd = sandbox.execs[0][1]
+    # WS-02: the JUnit report path is attempt-scoped (concurrent run_tests
+    # calls in one container raced on the old fixed /tmp path).
+    junit = f"/tmp/.girder-run-tests-{attempt_id[-8:]}.xml"
     assert pytest_cmd[:5] == [
         "pytest",
         "--tb=short",
         "--no-header",
         "-q",
-        "--junitxml=/tmp/.girder-run-tests.xml",
+        f"--junitxml={junit}",
     ]
     assert pytest_cmd[5:] == ["tests/test_api.py", "-k", "rate_limit and not slow"]
-    assert sandbox.execs[1][1] == ["cat", "/tmp/.girder-run-tests.xml"]
+    assert sandbox.execs[1][1] == ["cat", junit]
     assert result.output.startswith("PASSED: 1  FAILED: 1  ERROR: 1  SKIPPED: 1")
     assert "FAILURES:" in result.output
     rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
@@ -834,3 +845,50 @@ async def test_search_symbols_real_definitions_and_usages(
     uses = await registry.execute("search_symbols", {"name": "Foo", "kind": "usage"})
     assert "return Foo()" in uses.output
 
+
+
+# ------------------------------------------------ WP 8.2 structured scratchpad
+
+
+async def test_registry_populates_structured_scratchpad(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """Successful reads/writes/tests are recorded in the shared scratchpad,
+    deduped preserving order; held calls contribute nothing."""
+    db, run_id, attempt_id = seeded
+    pad = Scratchpad()
+    registry = _registry(FakeSandbox(), db, run_id, attempt_id, scratchpad=pad)
+    ok_results = [ExecResult(0, "body\n", ""), ExecResult(0, "", "")]
+    sandbox = FakeSandbox(results=ok_results)
+    registry.sandbox = sandbox
+    await registry.execute("read_file", {"path": "src/a.py"})
+    await registry.execute("read_file", {"path": "src/a.py"})  # dedupe
+    await registry.execute("write_file", {"path": "src/b.py", "content": "x"})
+    # run_tests: pytest cmd exec + junit cat exec, both scripted
+    registry.sandbox = FakeSandbox(
+        results=[
+            ExecResult(1, "out\n", ""),
+            ExecResult(0, _JUNIT, ""),
+            ExecResult(0, _JUNIT, ""),
+        ]
+    )
+    await registry.execute("run_tests", {})
+    await registry.execute("write_file", {"path": "tests/test_x.py", "content": "boom"})  # held
+    assert pad.files_read == ["src/a.py"]
+    assert pad.files_written == ["src/b.py"]  # the held out-of-scope write is NOT recorded
+    assert pad.test_results and pad.test_results[0].startswith("PASSED: 1  FAILED: 1")
+    # serialization round-trips through the compact JSON block
+    assert '"files_read": ["src/a.py"]' in pad.to_json()
+
+
+async def test_run_tests_junit_path_is_attempt_scoped(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """WS-02 fix: concurrent run_tests calls sharing a container must not race
+    on one fixed /tmp JUnit path — the report path embeds the attempt id."""
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "", ""), ExecResult(0, _JUNIT, "")])
+    await _registry(sandbox, db, run_id, attempt_id).execute("run_tests", {})
+    junit = f"/tmp/.girder-run-tests-{attempt_id[-8:]}.xml"
+    assert f"--junitxml={junit}" in sandbox.execs[0][1]
+    assert sandbox.execs[1][1] == ["cat", junit]
