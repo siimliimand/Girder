@@ -60,29 +60,14 @@ from girder.notify.notifier import Notifier
 from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
 from girder.sandbox.engine import ContainerSpec, SandboxEngine
 from girder.specs import amendment as spec_amendment
+from girder.stacks import STACK_REGISTRY, VERIFY_XML
 from girder.util import run_host_cmd, utcnow_iso
 
 log = logging.getLogger(__name__)
 
-VERIFY_XML = ".girder-verify.xml"
-
-
-def verify_cmd(python_bin: str) -> list[str]:
-    """Verification suite argv under the configured interpreter (§5.5)."""
-    return [
-        python_bin,
-        "-m",
-        "pytest",
-        "-q",
-        f"--junitxml=/workspace/{VERIFY_XML}",
-        "-p",
-        "no:cacheprovider",
-    ]
-
-
-# Default-interpreter form kept for callers that have no Settings in hand
-# (orchestrator.suites); the engine itself uses ``verify_cmd(python_bin)``.
-VERIFY_CMD = verify_cmd("python3")
+# Compatibility re-export: the verify command now lives in the stack plugin
+# (WS-07); orchestrator.suites still imports VERIFY_CMD from here.
+VERIFY_CMD = STACK_REGISTRY["python-3.12"].test_command()
 _VERIFY_TIMEOUT_S = 900.0
 _TAIL_CHARS = 2000
 
@@ -272,6 +257,7 @@ class TaskEngine:
                     run_id=run.id,
                     attempt=attempt,
                     task=fresh,
+                    stack=STACK_REGISTRY[self.settings.project.stack],
                 )
                 try:
                     outcome = await runtime.execute_attempt(
@@ -565,7 +551,9 @@ class TaskEngine:
             return _VerifyStep("integrity_violation", reason)
         exec_res = await self.sandbox.exec(
             container,
-            verify_cmd(self.settings.sandbox.python_bin),
+            STACK_REGISTRY[self.settings.project.stack].test_command(
+                self.settings.sandbox.python_bin
+            ),
             timeout_s=_VERIFY_TIMEOUT_S,
         )
         xml_path = worktree.path / VERIFY_XML

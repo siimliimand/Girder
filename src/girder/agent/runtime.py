@@ -35,6 +35,7 @@ from girder.guard.redact import Redactor, redact_and_log
 from girder.guard.scope import TaskScopes
 from girder.models.gateway import Message, ModelGateway, ModelToolCall
 from girder.sandbox.engine import SandboxEngine
+from girder.stacks import STACK_REGISTRY, StackPlugin
 
 # Recent tail preserved across compaction so the loop stays coherent (§8.5).
 _TAIL_AFTER_COMPACTION = 6
@@ -115,6 +116,7 @@ class AgentRuntime:
         run_id: str,
         attempt: Attempt,
         task: Task,
+        stack: StackPlugin | None = None,
         model_role: str = "tier2",
     ) -> None:
         self.gateway = gateway
@@ -137,6 +139,7 @@ class AgentRuntime:
             attempt_id=attempt.id,
             run_id=run_id,
             task=task,
+            stack=stack or STACK_REGISTRY["python-3.12"],
         )
 
     async def execute_attempt(

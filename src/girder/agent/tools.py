@@ -34,6 +34,7 @@ from girder.db.models import IntegrityKind, Task
 from girder.guard.redact import Redactor, redact_and_log
 from girder.guard.scope import TaskScopes, Verdict, check_tool_call
 from girder.sandbox.engine import SandboxEngine
+from girder.stacks import StackPlugin
 
 _TERMINAL_TOOLS = ("mark_task_complete", "request_spec_amendment")
 _WRITE_TOOLS = ("write_file", "apply_patch")
@@ -42,13 +43,6 @@ _READ_TOOLS = ("read_file", "ripgrep", "find_files", "view_symbol_outline")
 _B64_DECODE_SNIPPET = (
     "import base64,sys,pathlib; pathlib.Path(sys.argv[1]).write_bytes("
     "base64.b64decode(sys.argv[2]))"
-)
-_AST_OUTLINE_SNIPPET = (
-    "import ast,sys;"
-    "t=ast.parse(open(sys.argv[1]).read());"
-    "[print(f\"{n.lineno}: {'class' if isinstance(n,ast.ClassDef) else 'function'}:"
-    " {n.name}\") for n in ast.walk(t)"
-    " if isinstance(n,(ast.ClassDef,ast.FunctionDef,ast.AsyncFunctionDef))]"
 )
 
 _PATCH_PREFIX = "/tmp/.girder-patch"
@@ -308,6 +302,7 @@ class ToolRegistry:
         attempt_id: str,
         run_id: str,
         task: Task,
+        stack: StackPlugin,
     ) -> None:
         self.sandbox = sandbox
         self.container = container
@@ -318,6 +313,7 @@ class ToolRegistry:
         self.attempt_id = attempt_id
         self.run_id = run_id
         self.task = task
+        self.stack = stack
 
     async def execute(self, name: str, args: dict[str, Any]) -> ToolExecResult:
         """Gate, dispatch, truncate, redact, log. Never raises outward."""
@@ -469,7 +465,7 @@ class ToolRegistry:
     async def _symbol_outline(self, args: dict[str, Any]) -> tuple[bool, str]:
         path = str(args["path"])
         if path.endswith(".py"):
-            return await self._exec(["python3", "-c", _AST_OUTLINE_SNIPPET, path])
+            return await self._exec(self.stack.symbol_outline_command(path))
         return await self._exec(
             ["grep", "-nE", r"^\s*(def|class|function)\b", path]
         )

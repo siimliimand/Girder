@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import PydanticBaseSettingsSource
 
+from girder.stacks import STACK_REGISTRY
+
 log = logging.getLogger(__name__)
 
 
@@ -230,6 +232,11 @@ class Settings(BaseSettings):
                 errors.append(f"limits.{name} must be > 0 (got {value})")
         if not self.project.test_directories:
             errors.append("project.test_directories must be a non-empty list")
+        if self.project.stack not in STACK_REGISTRY:
+            errors.append(
+                f"project.stack {self.project.stack!r} is not a known stack"
+                f" (valid: {', '.join(sorted(STACK_REGISTRY))})"
+            )
         if errors:
             raise ValueError("; ".join(errors))
         return self

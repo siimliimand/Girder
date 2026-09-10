@@ -56,6 +56,7 @@ from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
 from girder.orchestrator.suites import run_suite_in_container
 from girder.sandbox.engine import ContainerSpec, SandboxEngine
+from girder.stacks import STACK_REGISTRY
 from girder.util import run_host_cmd, utcnow_iso
 
 log = logging.getLogger(__name__)
@@ -233,6 +234,7 @@ class ConflictResolver:
                 run_id=run.id,
                 attempt=attempt,
                 task=task,
+                stack=STACK_REGISTRY[self.settings.project.stack],
                 model_role="tier1",
             )
             try:

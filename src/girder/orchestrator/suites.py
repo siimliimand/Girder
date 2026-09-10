@@ -12,8 +12,9 @@ from pathlib import Path
 
 from girder.guard.redact import Redactor
 from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
-from girder.orchestrator.task_engine import _VERIFY_TIMEOUT_S, VERIFY_CMD, VERIFY_XML
+from girder.orchestrator.task_engine import _VERIFY_TIMEOUT_S, VERIFY_CMD
 from girder.sandbox.engine import SandboxEngine
+from girder.stacks import VERIFY_XML
 
 _TAIL_CHARS = 2000
 

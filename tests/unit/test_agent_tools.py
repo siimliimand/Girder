@@ -14,6 +14,7 @@ from girder.db.models import Task, TaskStatus, TaskType
 from girder.guard.redact import Redactor
 from girder.guard.scope import TaskScopes
 from girder.sandbox.engine import ContainerSpec, ExecResult, SandboxEngine
+from girder.stacks import STACK_REGISTRY
 
 
 class FakeSandbox(SandboxEngine):
@@ -84,6 +85,7 @@ def _registry(
         attempt_id=attempt_id,
         run_id=run_id,
         task=TASK,
+        stack=STACK_REGISTRY["python-3.12"],
     )
 
 
@@ -250,6 +252,7 @@ async def test_output_redacted_and_truncated(seeded: tuple[Database, str, str]) 
         attempt_id=attempt_id,
         run_id=run_id,
         task=TASK,
+        stack=STACK_REGISTRY["python-3.12"],
     )
     result = await registry.execute("read_file", {"path": "secrets.txt"})
     assert "AKIAIOSFODNN7EXAMPLE" not in result.output
@@ -369,3 +372,31 @@ def test_read_file_description_documents_funnel_and_clipping() -> None:
     assert "view_symbol_outline" in desc
     assert "line_start" in desc and "line_end" in desc
     assert "truncated" in desc
+
+
+async def test_symbol_outline_dispatches_stack_plugin_argv(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """WS-07B: the .py branch routes through the stack plugin's outline argv."""
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "1: function: foo\n", "")])
+    result = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "view_symbol_outline", {"path": "src/a.py"}
+    )
+    assert result.ok
+    expected = STACK_REGISTRY["python-3.12"].symbol_outline_command("src/a.py")
+    assert sandbox.execs == [("ctr", expected, 120.0)]
+
+
+async def test_symbol_outline_non_python_fallback_unchanged(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """WS-07B: non-.py paths keep the byte-identical grep fallback."""
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
+    await _registry(sandbox, db, run_id, attempt_id).execute(
+        "view_symbol_outline", {"path": "src/a.go"}
+    )
+    assert sandbox.execs == [
+        ("ctr", ["grep", "-nE", r"^\s*(def|class|function)\b", "src/a.go"], 120.0)
+    ]
