@@ -10,10 +10,23 @@ task 2).
 
 The generator is deliberately db-free: the API layer owns audit event writing
 around generate(); this module only raises.
+The model's output is further normalized before validation: inline
+reasoning blocks (<think>...</think>, emitted by reasoning models) and
+conversational preamble before the frontmatter (real-world failure:
+a reasoning model answered an audit-style intent with an essay instead of
+a document) are stripped, each rule logging when it fires — normalization
+must never be silent.
+
+Validation failures feed back into the prompt: generate() runs a bounded
+repair loop, appending the rejected raw output plus the aggregated validator
+errors as a follow-up user message until the document validates or attempts
+are exhausted.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 
 from girder.budget.guard import BudgetExceeded
@@ -21,6 +34,10 @@ from girder.config import Settings
 from girder.db.models import Project, Run
 from girder.models.gateway import Message, ModelError, ModelGateway
 from girder.specs.validator import OPENSPEC_TEMPLATE, SpecValidationError, parse_spec
+
+log = logging.getLogger(__name__)
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 _MAX_README_CHARS = 16_000
 _MAX_FILE_LISTING_LINES = 100
@@ -63,18 +80,23 @@ CONSTRAINTS:
 files that plausibly exist, judging by the provided file listing.
 - Declare depends_on edges between tasks whenever one task's work depends on \
 another task's output; keep depends_on empty for genuinely independent tasks.
-- Every success criterion must be objectively testable."""
+- Every success criterion must be objectively testable.
+- If the user intent reads as a question or audit rather than a change \
+request, resolve it into the concrete gaps/improvements you identify and \
+propose them as this document's tasks — never reply conversationally."""
 
 
 class SpecGenerationError(RuntimeError):
     """Generation or validation failure (impl-plan §6.9).
 
     .errors carries validator error strings, or a single gateway failure
-    message.
+    message. .raw_output carries the last rejected model output (None for
+    gateway failures and empty-content diagnosis), for diagnostics.
     """
 
-    def __init__(self, errors: list[str]) -> None:
+    def __init__(self, errors: list[str], raw_output: str | None = None) -> None:
         self.errors = errors
+        self.raw_output = raw_output
         super().__init__("spec generation failed: " + "; ".join(errors))
 
 
@@ -137,6 +159,34 @@ def _strip_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize(text: str) -> str:
+    """Rescue model output the fences-strip cannot reach.
+
+    Rules (each logs when it actually fires — normalization is never silent):
+    - think-block: reasoning models may emit <think>...</think> inline;
+      these blocks are dropped wherever they appear.
+    - leading-prose: a conversational preamble above the frontmatter (real
+      failure: an audit-style intent got an essay with finish_reason=stop)
+      is dropped by cutting everything above the first '---' line.
+    If no '---' line exists at all, the text is returned as-is — the
+    validator error is then the honest outcome.
+    """
+    text = _strip_fences(text)
+    stripped = _THINK_BLOCK_RE.sub("", text)
+    if stripped != text:
+        log.info("spec generator: normalized model output (%s)", "think-block")
+        text = stripped
+    lines = text.split("\n")
+    first = next((ln for ln in lines if ln.strip()), "")
+    if first != "---":
+        for i, ln in enumerate(lines):
+            if ln == "---":
+                log.info("spec generator: normalized model output (%s)", "leading-prose")
+                text = "\n".join(lines[i:])
+                break
+    return text
+
+
 class SpecGenerator:
     """Builds the Tier-1 prompt, dispatches it, validates the result (§6.9)."""
 
@@ -154,30 +204,64 @@ class SpecGenerator:
     ) -> str:
         """Return the validated proposal text (markdown + YAML frontmatter).
 
-        Raises SpecGenerationError on gateway failure or structural
-        invalidity.
+        Runs a bounded validation-feedback repair loop: a rejected attempt's
+        raw output and the aggregated validator errors are fed back as a
+        follow-up user message. Raises SpecGenerationError on gateway
+        failure, empty content, or exhaustion of all attempts.
         """
         messages = [
             Message(role="system", content=self._system_prompt()),
             Message(role="user", content=self._user_prompt(run.intent, repo_path, feedback)),
         ]
-        try:
-            response = await self.gateway.complete("tier1", messages, run_id=run.id)
-        except BudgetExceeded as exc:
-            # Uniform error contract: callers of generate() handle
-            # SpecGenerationError, never gateway internals directly. The API
-            # layer records it via spec_generation_failed; the budget guard
-            # has already done its own preflight bookkeeping.
-            raise SpecGenerationError([f"budget exceeded: {exc}"]) from exc
-        except ModelError as exc:
-            raise SpecGenerationError([str(exc)]) from exc
+        attempts = max(1, self.settings.specs.generation_attempts)
+        for attempt in range(attempts):
+            try:
+                response = await self.gateway.complete("tier1", messages, run_id=run.id)
+            except BudgetExceeded as exc:
+                # Uniform error contract: callers of generate() handle
+                # SpecGenerationError, never gateway internals directly. The
+                # API layer records it via spec_generation_failed; the budget
+                # guard has already done its own preflight bookkeeping.
+                raise SpecGenerationError([f"budget exceeded: {exc}"]) from exc
+            except ModelError as exc:
+                raise SpecGenerationError([str(exc)]) from exc
 
-        normalized = _strip_fences(response.content or "")
-        try:
-            parse_spec(normalized)
-        except SpecValidationError as exc:
-            raise SpecGenerationError(exc.errors) from exc
-        return normalized
+            content = response.content
+            if content is None or not content.strip():
+                # Actionable diagnosis, not a misleading validator message:
+                # reasoning models can burn the whole max_output_tokens on
+                # hidden reasoning and return content=None. Nothing to
+                # repair, so no retry.
+                raise SpecGenerationError([
+                    f"model produced no content (finish_reason="
+                    f"{response.finish_reason!r}) — reasoning models can "
+                    "exhaust max_output_tokens before emitting content; "
+                    "raise models.max_output_tokens"
+                ]) from None
+
+            raw = content
+            normalized = _normalize(raw)
+            try:
+                parse_spec(normalized)
+            except SpecValidationError as exc:
+                if attempt == attempts - 1:
+                    raise SpecGenerationError(exc.errors, raw_output=raw) from exc
+                # Feed the rejected output back as untrusted data plus the
+                # aggregated errors, mirroring the <user-feedback> framing.
+                messages.append(Message(
+                    role="user",
+                    content=(
+                        f"<previous-attempt>\n{raw}\n</previous-attempt>\n\n"
+                        "Your previous output failed structural validation:\n"
+                        + "\n".join(f"- {e}" for e in exc.errors)
+                        + "\n\nFix every listed violation. Output ONLY the "
+                        "corrected OpenSpec document — YAML frontmatter + "
+                        "markdown body, no code fences, no commentary."
+                    ),
+                ))
+                continue
+            return normalized
+        raise AssertionError("unreachable: repair loop must return or raise")
 
     def _system_prompt(self) -> str:
         return _SYSTEM_TEMPLATE.format(

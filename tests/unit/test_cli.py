@@ -266,3 +266,62 @@ async def test_daemon_starts_with_roles_configured(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(cli_module, "_open_db", refuse_to_proceed)
     with pytest.raises(RuntimeError, match="guard passed"):
         await cmd_daemon(Namespace(db=":memory:", migrations_dir=None, sandbox="podman"))
+
+
+# ------------------------------------------------------ bounded shutdown drain
+
+
+async def test_drain_cancels_background_tasks() -> None:
+    """Regression (real incident): the daemon's shutdown gathered the GC task
+    without ever cancelling it — run_forever() is an infinite loop, so every
+    graceful Ctrl+C parked the daemon permanently. _drain must cancel every
+    task it is given and return once they are done."""
+    from girder.cli import _drain
+
+    async def run_forever() -> None:
+        while True:  # noqa: ASYNC110 — deliberately immortal fixture
+            await asyncio.sleep(3600)
+
+    immortal = asyncio.create_task(run_forever(), name="gc")
+    done = asyncio.create_task(asyncio.sleep(0), name="pump")
+    # Bounded outer guard: if _drain ever hangs again, fail instead of hanging.
+    await asyncio.wait_for(_drain([immortal, done]), timeout=5)
+    assert immortal.cancelled()
+    assert done.done()
+
+
+async def test_drain_abandons_wedged_task_after_timeout() -> None:
+    """A task whose cleanup refuses cancellation must not hang shutdown:
+    _drain logs and returns after the timeout (second Ctrl+C then force-exits)."""
+    from girder.cli import _drain
+
+    refusals = 100  # outlast however many cancels the timeout machinery fans out
+
+    async def wedged() -> None:
+        nonlocal refusals
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                if refusals <= 0:
+                    raise
+                refusals -= 1  # swallow a few cancels, then die
+
+    task = asyncio.create_task(wedged(), name="wedged")
+    await asyncio.sleep(0)  # let it start and park inside its sleep
+    # Must RETURN (not raise, not hang) despite the task ignoring cancels.
+    await asyncio.wait_for(_drain([task], timeout=0.2), timeout=5)
+    assert not task.done()
+    # Cleanup: keep cancelling until it actually dies (must not leak into the
+    # loop teardown, where an un-cancellable task would hang the runner).
+    for _ in range(300):
+        if task.done():
+            break
+        task.cancel()
+        try:
+            # shield: wait_for's own timeout-cancel must not consume one of
+            # the task's refusals; each iteration delivers exactly one cancel.
+            await asyncio.wait_for(asyncio.shield(task), 0.05)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+    assert task.done()

@@ -224,6 +224,43 @@ async def _pump_one(
         logger.exception("pump failed for run %s", run_id)
 
 
+_DRAIN_TIMEOUT_S = 10.0
+
+
+async def _drain(
+    tasks: list[asyncio.Task[None]],
+    *,
+    # ASYNC109: asyncio.timeout cannot bound this wait — asyncio.wait must own the deadline.
+    timeout: float = _DRAIN_TIMEOUT_S,  # noqa: ASYNC109
+) -> None:
+    """Cancel background tasks and wait for them, bounded.
+
+    Shutdown must never hang: a task with a slow or wedged cleanup would
+    otherwise hold Ctrl+C forever. Two incident classes are covered:
+    the GC task was awaited in a gather without ever being cancelled
+    (``run_forever()`` is an infinite loop → SIGKILL was the only exit),
+    and ``wait_for(gather(...))`` cannot bound that wait at all — a gather
+    whose children ignore cancellation never completes, so the timeout
+    never fires. ``asyncio.wait`` returns (done, pending) at the deadline
+    unconditionally.
+    """
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    if pending:
+        log.error(
+            "shutdown drain exceeded %ss; abandoning %s — press Ctrl+C again"
+            " to force immediate exit",
+            timeout,
+            sorted(task.get_name() for task in pending),
+        )
+    for task in done:
+        if not task.cancelled() and task.exception() is not None:
+            log.error("task %s failed during shutdown: %r", task.get_name(), task.exception())
+
+
 async def cmd_daemon(args: argparse.Namespace) -> int:
     settings = load_settings()
     # §6.1: at least one model role per tier — config validation only warns,
@@ -242,6 +279,12 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
     stop = asyncio.Event()
 
     def _signal(sig: signal.Signals) -> None:
+        if stop.is_set():
+            # Second signal: the graceful drain is wedged (or the operator
+            # won't wait). Die immediately — os._exit skips db.close() by
+            # design; boot recovery reconciles any unclean exit.
+            log.warning("received %s again — forcing exit", sig.name)
+            os._exit(128 + int(sig))
         log.info("received %s — shutting down", sig.name)
         stop.set()
 
@@ -285,12 +328,10 @@ async def cmd_daemon(args: argparse.Namespace) -> int:
                 await asyncio.wait_for(stop.wait(), timeout=poll_s)
             except TimeoutError:
                 pass
-        for task in (*active_pumps.values(), telegram_task):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(gc_task, *active_pumps.values(), return_exceptions=True)
+        background: list[asyncio.Task[None]] = [gc_task, *active_pumps.values()]
         if telegram_task is not None:
-            await asyncio.gather(telegram_task, return_exceptions=True)
+            background.append(telegram_task)
+        await _drain(background)
     finally:
         await db.close()
     log.info("daemon stopped cleanly")

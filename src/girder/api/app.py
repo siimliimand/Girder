@@ -150,12 +150,16 @@ async def _generate(app: FastAPI, run_id: str, feedback: str | None) -> None:
         )
     except Exception as exc:
         log.exception("spec generation failed for run %s", run_id)
-        await repo.insert_event(
-            db,
-            "spec_generation_failed",
-            {"error": str(exc)[:2000]},
-            run_id=run_id,
-        )
+        payload: dict[str, Any] = {"error": str(exc)[:2000]}
+        # Keep the rejected model output for post-mortem (getattr: older
+        # SpecGenerationError versions may not carry it). The raw content
+        # already passed the gateway's redaction layer before returning.
+        raw = getattr(exc, "raw_output", None)
+        if raw:
+            if len(raw) > 20_000:
+                raw = raw[:20_000] + "\n[...truncated by girder at 20000 characters]"
+            payload["raw_output"] = raw
+        await repo.insert_event(db, "spec_generation_failed", payload, run_id=run_id)
 
 
 def templates() -> Jinja2Templates:

@@ -74,6 +74,16 @@ async def _run_context(
     project = await _require_project(db, run.project_id)
     usage = await repo.list_token_usage_for_run(db, run_id)
     failure = await repo.get_latest_event(db, run_id, "spec_generation_failed")
+    # Raw rejected model output from the latest failed generation, if the
+    # failure carried one (redacted upstream by the gateway; nothing new here).
+    failed_raw_output: dict[str, object] | None = None
+    if failure is not None:
+        raw = failure["payload"].get("raw_output")
+        if raw:
+            failed_raw_output = {
+                "text": raw,
+                "truncated": "[...truncated by girder at 20000 characters]" in raw,
+            }
     spend = {
         "cap": run.budget_cap_usd,
         "spend_usd": run.spend_usd,
@@ -99,6 +109,7 @@ async def _run_context(
         "roles": roles,
         "violations": violations,
         "generation_error": failure,
+        "failed_raw_output": failed_raw_output,
         "pending_amendment": pending_amendment,
         "proposal_tasks": _proposal_task_rows(run.proposal_md),
         "diffs_by_task": diffs_by_task,

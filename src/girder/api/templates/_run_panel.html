@@ -26,6 +26,14 @@ attribute disappears.
       {{ generation_error.payload.error }}</p>
   {% endif %}
 
+  {% if failed_raw_output %}
+    <details class="diff">
+      <summary>Last failed model output{% if failed_raw_output.truncated %}
+        <span class="muted">(truncated at 20000 characters)</span>{% endif %}</summary>
+      <pre>{{ failed_raw_output.text }}</pre>
+    </details>
+  {% endif %}
+
   {% if errors %}
     <ul class="error">
       {% for e in errors %}<li>{{ e }}</li>{% endfor %}
