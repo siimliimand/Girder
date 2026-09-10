@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 8 (WP 8.1 – WP 8.3) |
-| **Status** | Merged to main (c941db4) — pending dogfood validation of success rate / turns-per-success (operator task) |
+| **Status** | Merged to main (c941db4) + adversarial-review fixes (ec1f6b3) — pending dogfood validation of success rate / turns-per-success (operator task) |
 | **Wave** | **2** — starts after **WS-01 merges** (needs the WS-01 tool surface for planning-phase tool lists and scratchpad hooks) |
 | **Effort** | ~2 weeks · ~30 new tests |
 | **Owned files** | `src/girder/agent/prompts.py`, `src/girder/agent/runtime.py`, `src/girder/agent/context.py`, `src/girder/orchestrator/task_engine.py`, `src/girder/config.py` |
@@ -140,6 +140,7 @@ The brief is passed as the `guidance` parameter to `AgentRuntime.execute_attempt
 - **WS-01** must merge first: planning-phase tool lists reference `edit_file` / `run_tests`, and the scratchpad hooks the tool registry that WS-01 reshapes.
 - **WS-03** adds a one-line index-build hook in `task_engine.py` (attempt start). Land in separate waves; if rebasing, the hook and `_build_retry_brief` are in different regions of the file.
 - **WS-06** will later split `task_engine.py` (WP 10.2) — `_build_retry_brief` belongs in the retry-loop module after that split.
+- **2026-09-10 review pass (post-merge):** adversarial review of the landing found and fixed in `ec1f6b3` — (B1) a plan-only turn (PLAN text, no tool calls — the maximally compliant behavior) never armed the unlock latch; detection hoisted above the no-tool-call branch so the latch arms and `scratchpad.plan` is stored. (B2) the verify-fail retry path still built the old one-liner; both retry paths now build the structured brief, salvage wording is single-sourced, and `VerificationResult.failing_tests` threads through `retry_step`. (B3) model-authored plan text was re-injected under the `[TRUSTED]` scratchpad; the plan key is now labeled "untrusted model output, verbatim". Planning holds emit `planning_hold` events for dogfood instrumentation. Flagged, NOT fixed: `conflict.py` resolver inherits `planning_turns = 5` without PLAN instructions (up to 5 held turns per resolution attempt); `run_verification`'s suite-green logic ignores per-test statuses in the XML (exit 0 + red XML counts green); `run_command` remains a write-vector during planning (per spec, R-SP8-1 holds write tools only).
 
 ## Relevant resolution log decision
 
