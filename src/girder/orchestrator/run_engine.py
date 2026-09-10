@@ -489,10 +489,14 @@ class RunEngine:
         self._inflight[run.id] = _Inflight(tasks=tasks)
         watcher = asyncio.ensure_future(self._watch_abort(run.id))
         try:
-            done, _ = await asyncio.wait({watcher, *tasks}, return_when=asyncio.FIRST_COMPLETED)
-            if watcher in done and not all(t.done() for t in tasks):
-                await self._abort_run(run, repo_path, tasks)
-                return None
+            pending = {watcher, *tasks}
+            while True:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                if watcher in done and not all(t.done() for t in tasks):
+                    await self._abort_run(run, repo_path, tasks)
+                    return None
+                if not any(t in pending for t in tasks):
+                    break
             watcher.cancel()
             with suppress(asyncio.CancelledError):
                 await watcher

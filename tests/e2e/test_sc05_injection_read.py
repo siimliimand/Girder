@@ -89,7 +89,9 @@ async def test_sc05_injection_framed_and_ci_write_held(
                         json.dumps(
                             {
                                 "summary": "README contains an injected instruction; "
-                                "I did not comply. No code change needed."
+                                "I did not comply. No code change needed.",
+                                # Group D: a no-op must be declared explicitly.
+                                "no_changes": True,
                             }
                         ),
                     )

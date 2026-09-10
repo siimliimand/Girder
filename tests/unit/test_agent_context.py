@@ -11,6 +11,7 @@ from girder.agent.context import (
     should_compact,
 )
 from girder.agent.prompts import build_system_prompt, build_task_message, wrap_tool_result
+from girder.agent.runtime import _milestone_for_turn
 from girder.db.models import Task, TaskStatus, TaskType
 from girder.models.gateway import Message
 
@@ -116,6 +117,60 @@ def test_system_prompt_carries_invariants() -> None:
     assert "request_spec_amendment" in prompt
 
 
+def test_system_prompt_states_turn_budget_when_given() -> None:
+    prompt = build_system_prompt(task=_task(), spec_slice="slice", turn_budget=60)
+    assert "WORKING METHOD" in prompt
+    assert "turn budget for this attempt is 60" in prompt
+    assert "turn 30" in prompt  # half-budget writing deadline
+    assert "mark_task_complete MUST end your attempt" in prompt
+
+
+def test_system_prompt_without_budget_has_no_method_block() -> None:
+    prompt = build_system_prompt(task=_task(), spec_slice="slice")
+    assert "WORKING METHOD" not in prompt
+    assert "turn budget" not in prompt
+
+
+def test_system_prompt_lists_restricted_paths() -> None:
+    prompt = build_system_prompt(
+        task=_task(), spec_slice="s", turn_budget=40, read_restricted=(".git/**", ".env*")
+    )
+    assert ".git/**" in prompt
+    assert "read-forbidden" in prompt
+
+
+def test_milestone_fires_at_half_and_cap_minus_two_only() -> None:
+    cap = 60
+    fired = {t for t in range(1, cap + 1) if _milestone_for_turn(t, cap) is not None}
+    assert fired == {30, 58}
+    assert _milestone_for_turn(30, cap) == "Half your turns are spent — start writing now"
+    assert "mark_task_complete" in (_milestone_for_turn(58, cap) or "")
+
+
+def test_milestone_never_fires_twice_for_a_turn_number() -> None:
+    # Milestones are pure functions of (turn, cap): each turn maps to at most
+    # one message, so driving the loop twice yields identical firings.
+    first = [_milestone_for_turn(t, 20) for t in range(1, 21)]
+    second = [_milestone_for_turn(t, 20) for t in range(1, 21)]
+    assert first == second
+    assert [m for m in first if m is not None] == [
+        "Half your turns are spent — start writing now",
+        "Final turns: conclude and call `mark_task_complete`.",
+    ]
+
+
+def test_task_message_lists_read_restricted_globs() -> None:
+    msg = build_task_message(
+        task=_task(), spec_slice="# frozen spec", read_restricted=(".git/**", "openspec/**")
+    )
+    assert "Read-restricted: .git/**, openspec/**" in msg
+
+
+def test_task_message_omits_read_restricted_when_empty() -> None:
+    msg = build_task_message(task=_task(), spec_slice="# frozen spec")
+    assert "Read-restricted" not in msg
+
+
 def test_task_message_trust_labels_and_guidance() -> None:
     msg = build_task_message(task=_task(), spec_slice="# frozen spec", guidance="focus on foo")
     assert "[TRUSTED] Frozen specification slice:" in msg
@@ -128,3 +183,10 @@ def test_task_message_trust_labels_and_guidance() -> None:
 def test_wrap_tool_result_shape() -> None:
     wrapped = wrap_tool_result("read_file:src/a.py", "hello")
     assert wrapped == '<untrusted-data source="read_file:src/a.py">\nhello\n</untrusted-data>'
+
+
+def test_generator_prompt_carries_task_sizing_clause() -> None:
+    from girder.specs.generator import _SYSTEM_TEMPLATE
+
+    assert "within the orchestrator's turn budget" in _SYSTEM_TEMPLATE
+    assert "one task per section" in _SYSTEM_TEMPLATE

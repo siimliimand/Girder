@@ -201,8 +201,11 @@ def run_command_path_args(cmd: str) -> tuple[list[str], list[str]]:
             i = j
             continue
         i += 1
+    scripts = _script_token_indices(tokens)
     others = [
-        t for k, t in enumerate(tokens) if k not in consumed and _looks_like_path(t)
+        t
+        for k, t in enumerate(tokens)
+        if k not in consumed and k not in scripts and _looks_like_path(t)
     ]
     return writes, others
 
@@ -221,6 +224,57 @@ def _attached_redirect_target(tok: str) -> str | None:
 def _looks_like_path(tok: str) -> bool:
     """Path syntax heuristic: flags aren't paths; ``/`` or a dotted segment is."""
     return bool(tok) and not tok.startswith("-") and ("/" in tok or "." in tok)
+
+
+# Stream editors whose *script* operand starts with ``/`` (sed addresses like
+# ``/re/,/re2/p``, awk regex blocks) but is not a path argument.
+_STREAM_EDITORS = {"sed", "gsed", "ssed", "awk", "gawk", "mawk", "nawk"}
+# Bare expression flags that consume the script as their operand (attached
+# forms like ``--expression=...`` start with ``-`` and are never path-shaped).
+_EXPR_FLAGS = {"-e", "--expression"}
+
+
+def _script_token_indices(tokens: list[str]) -> set[int]:
+    """Indices of sed/awk script operands, found positionally.
+
+    The lexical shape of a sed address script (``/TODO/d``) is
+    indistinguishable from a real absolute path (``/bin/env``), so the
+    exemption is positional only: the first non-flag operand of a sed/awk
+    invocation (or the operand of a bare ``-e``/``--expression``) is the
+    script. Everything else — including file operands after the script —
+    keeps its normal classification, so this can only move a token OUT of
+    the path bucket in the script slot, never weaken operand verdicts.
+    Residual: a bare absolute path placed in the script slot itself is
+    treated as a script; the registry denylist and Layer 2/3 audits backstop.
+    Only the command position (start or after a shell break) is recognized,
+    so ``echo sed ...`` cannot smuggle the exemption in.
+    """
+    scripts: set[int] = set()
+    at_command = True  # start of a simple command
+    pending = False  # inside a sed/awk flag run, script operand not yet seen
+    expect_expr = False  # previous token was a bare -e/--expression
+    for i, tok in enumerate(tokens):
+        if tok in _SHELL_BREAKS:
+            at_command = True
+            pending = expect_expr = False
+            continue
+        if expect_expr:
+            scripts.add(i)
+            expect_expr = False
+            pending = False
+            continue
+        if pending:
+            if tok.startswith("-"):
+                if tok in _EXPR_FLAGS:
+                    expect_expr = True
+                continue
+            scripts.add(i)  # first non-flag operand is the script
+            pending = False
+            continue
+        if at_command and tok.rsplit("/", 1)[-1] in _STREAM_EDITORS:
+            pending = True
+        at_command = False
+    return scripts
 
 
 def _check_run_command(cmd: str, scopes: TaskScopes) -> Verdict:

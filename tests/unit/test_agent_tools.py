@@ -6,7 +6,7 @@ import base64
 
 import pytest
 
-from girder.agent.tools import CommandDenied, ToolRegistry, screen_command
+from girder.agent.tools import TOOL_SCHEMAS, CommandDenied, ToolRegistry, screen_command
 from girder.config import LimitsConfig
 from girder.db import repo
 from girder.db.engine import Database
@@ -345,3 +345,27 @@ async def test_verdict_column_reflects_scope_decision(
     assert verdicts["write_file:0"] == "allow"
     assert verdicts["read_file:0"] == "allow_logged"
     assert verdicts["write_file:1"] == "violation"
+
+
+def test_mark_task_complete_schema_declares_no_changes_and_terminal_contract() -> None:
+    """Group C: mark_task_complete must be schema-marked as the mandatory
+    terminal action, with the optional no_changes boolean passthrough."""
+    schema = next(t for t in TOOL_SCHEMAS if t["function"]["name"] == "mark_task_complete")
+    fn = schema["function"]
+    desc_lower = fn["description"].lower()
+    assert "only way to finish" in desc_lower
+    assert "uncommitted work is lost" in desc_lower
+    param = fn["parameters"]["properties"]["no_changes"]
+    assert param["type"] == "boolean"
+    assert param["default"] is False
+    assert "summary" in fn["parameters"]["required"]
+
+
+def test_read_file_description_documents_funnel_and_clipping() -> None:
+    """Group C: read_file steers the agent to outline-then-range reading and
+    warns that output is clipped to the configured line budget."""
+    schema = next(t for t in TOOL_SCHEMAS if t["function"]["name"] == "read_file")
+    desc = schema["function"]["description"]
+    assert "view_symbol_outline" in desc
+    assert "line_start" in desc and "line_end" in desc
+    assert "truncated" in desc

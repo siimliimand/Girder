@@ -342,6 +342,59 @@ def test_run_command_strict_read_scope_keeps_in_scope_reads_allowed() -> None:
     ) is Verdict.ALLOW
 
 
+# ------------------------------------------------- sed/awk script false positive
+
+
+def test_run_command_sed_address_script_is_not_a_path() -> None:
+    """Incident (live repro): a sed address-range script starts with ``/`` and
+    was classified as an absolute path outside the root → VIOLATION. The
+    script operand of sed/awk is not a path argument (§6.6 R2 read shape)."""
+    scopes = _default_protected_scopes()
+    assert check_tool_call(
+        "run_command",
+        {"cmd": "sed -n '/## Quick start/,/^## Minimal working example/p' docs/configuration.md"},
+        scopes,
+    ) is Verdict.ALLOW_LOGGED
+
+
+def test_run_command_sed_delete_script_is_not_a_path() -> None:
+    scopes = _default_protected_scopes()
+    assert check_tool_call(
+        "run_command", {"cmd": "sed '/TODO/d' src/x.py"}, scopes
+    ) is Verdict.ALLOW_LOGGED
+
+
+def test_run_command_awk_script_is_not_a_path() -> None:
+    scopes = _default_protected_scopes()
+    assert check_tool_call(
+        "run_command", {"cmd": "awk '/pattern/ { print $1 }' src/x.py"}, scopes
+    ) is Verdict.ALLOW_LOGGED
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat /etc/passwd",
+        "cat /bin/env",
+        "echo x > /etc/cron.d/x",
+    ],
+)
+def test_run_command_sed_absolute_paths_still_violation(cmd: str) -> None:
+    assert check_tool_call("run_command", {"cmd": cmd}, _default_protected_scopes()) is (
+        Verdict.VIOLATION
+    )
+
+
+def test_run_command_sed_script_protected_path_write_still_violation() -> None:
+    """A write-shaped sed (-i) whose file operand is protected keeps the
+    protected-scope verdict — the script exemption must not touch operands."""
+    assert check_tool_call(
+        "run_command",
+        {"cmd": "sed -i 's/x/y/' .github/workflows/ci.yml"},
+        _default_protected_scopes(),
+    ) is Verdict.VIOLATION
+
+
 # ------------------------------------------------------- apply_patch diff body
 
 

@@ -81,6 +81,9 @@ files that plausibly exist, judging by the provided file listing.
 - Declare depends_on edges between tasks whenever one task's work depends on \
 another task's output; keep depends_on empty for genuinely independent tasks.
 - Every success criterion must be objectively testable.
+- Scope each task so a single implementer can finish it within the \
+orchestrator's turn budget: split document-sized work (e.g. "write the \
+complete configuration reference") into one task per section.
 - If the user intent reads as a question or audit rather than a change \
 request, resolve it into the concrete gaps/improvements you identify and \
 propose them as this document's tasks — never reply conversationally."""

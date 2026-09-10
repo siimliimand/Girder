@@ -8,6 +8,8 @@ model can (in principle) tell repository data apart from operator guidance.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from girder.db.models import Task
 
 _SYSTEM_INVARIANTS = (
@@ -32,10 +34,42 @@ _SYSTEM_INVARIANTS = (
 )
 
 
-def build_system_prompt(*, task: Task, spec_slice: str) -> str:
-    """The invariant-carrying system message (§7). The task itself is *not* here."""
+def build_system_prompt(
+    *,
+    task: Task,
+    spec_slice: str,
+    turn_budget: int | None = None,
+    read_restricted: Sequence[str] = (),
+) -> str:
+    """The invariant-carrying system message (§7). The task itself is *not* here.
+
+    ``turn_budget`` / ``read_restricted`` add a compact working-method block
+    (budget awareness + survey-before-read) so the agent can pace itself
+    against the turn cap instead of dying in read-only exploration.
+    """
     del task, spec_slice  # framing is task-independent; kept for call-site symmetry
-    return _SYSTEM_INVARIANTS
+    method = ""
+    if turn_budget is not None:
+        restricted = (
+            " Protected/read-restricted paths ("
+            + ", ".join(read_restricted)
+            + ") are read-forbidden: attempting to read them kills the attempt."
+            if read_restricted
+            else ""
+        )
+        method = (
+            "\n\nWORKING METHOD:\n"
+            f"- Your turn budget for this attempt is {turn_budget}."
+            + restricted
+            + "\n"
+            "- Survey before reading: find_files / view_symbol_outline first; "
+            "read targeted ranges, not whole files.\n"
+            f"- Start writing code by turn {turn_budget // 2}. Exploration "
+            "beyond half the budget is a failure mode.\n"
+            "- mark_task_complete MUST end your attempt: if turns run out "
+            "first, the attempt is destroyed and uncommitted work is lost."
+        )
+    return _SYSTEM_INVARIANTS + method
 
 
 def build_directive_message(directive: str) -> str:
@@ -44,8 +78,18 @@ def build_directive_message(directive: str) -> str:
     return "[TRUSTED] Steering directive (user-authored):\n" + directive.strip()
 
 
-def build_task_message(*, task: Task, spec_slice: str, guidance: str | None = None) -> str:
-    """The initial trusted user message: frozen spec slice + task identity."""
+def build_task_message(
+    *,
+    task: Task,
+    spec_slice: str,
+    guidance: str | None = None,
+    read_restricted: Sequence[str] = (),
+) -> str:
+    """The initial trusted user message: frozen spec slice + task identity.
+
+    ``read_restricted`` surfaces protected-path holds up front so a protected
+    read is never a surprise hold.
+    """
     parts = [
         "[TRUSTED] Frozen specification slice:",
         spec_slice.strip() or "(no spec slice)",
@@ -54,6 +98,8 @@ def build_task_message(*, task: Task, spec_slice: str, guidance: str | None = No
         f"Type: {task.task_type}",
         f"Write scope: {', '.join(task.scope_globs) or '(none declared)'}",
     ]
+    if read_restricted:
+        parts.append(f"Read-restricted: {', '.join(read_restricted)}")
     if guidance:
         parts += ["", build_directive_message(guidance)]
     return "\n".join(parts)

@@ -613,6 +613,8 @@ async def test_uncommitted_attempt_retries_with_commit_guidance(harness: Harness
         m for m in gateway.calls[2] if getattr(m, "role", "") == "user"  # attempt 1 = 2 msgs
     )
     assert "git add -A && git commit" in second_user.content
+    # Group G: the retry close path persisted the agent's turn count
+    assert attempts[0]["turns_used"] == 2
 
     # NOT an integrity violation: no rows, counter untouched
     viols = await h.db.fetchall("SELECT * FROM integrity_violations")
@@ -962,3 +964,160 @@ async def test_container_spec_forwards_sandbox_settings(db: Database, tmp_path: 
     default_spec = default_engine._container_spec("girder-deadbeef", worktree)
     assert (default_spec.network, default_spec.memory, default_spec.cpus) == ("none", "4g", 2.0)
     assert default_spec.pids_limit == 512
+
+
+async def test_turn_cap_salvages_dirty_worktree_for_retry(harness: Harness) -> None:
+    """Group B: a turn-cap death with a dirty worktree must not lose the
+    uncommitted work — it is mechanically committed to the task branch as
+    ``wip(attempt N)`` and attempt 2 starts at the salvaged tip with guidance
+    pointing at the salvage commit."""
+    h = harness
+    h.settings.limits.attempt_max_turns = 2  # die fast on the turn cap
+    task = await _seed_task(h)
+    turn_cap_writer = [
+        _resp(
+            calls=[
+                _tc(
+                    "1",
+                    "write_file",
+                    '{"path":"src/app.py","content":"def greet():\\n    return 1\\n"}',
+                )
+            ]
+        ),
+        _resp(
+            calls=[
+                _tc(
+                    "2",
+                    "write_file",
+                    '{"path":"src/app.py","content":"def greet():\\n    return 2\\n"}',
+                )
+            ]
+        ),
+    ]
+    # attempt 2 never rewrites the file: if the merged content is right, it
+    # can only have come from the salvage (base-mechanics proof).
+    finish_only = [
+        _resp(calls=[_tc("1", "run_command", '{"cmd":"git add -A && git commit -m work"}')]),
+        _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"finished salvaged work"}')]),
+    ]
+    gateway = FakeGateway(responses=[*turn_cap_writer, *finish_only])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    # the salvage commit exists on the task branch with the file
+    wip_sha = (
+        await _git(h.repo_path, "log", f"task/{task.id}", "--format=%H", "--grep=wip")
+    ).strip()
+    assert wip_sha, "no wip(attempt N) salvage commit on the task branch"
+    assert (
+        await _git(h.repo_path, "log", f"task/{task.id}", "--format=%s", "--grep=wip")
+    ).strip() == "wip(attempt 1): salvaged on retry"
+    salvaged = await _git(h.repo_path, "show", f"{wip_sha.splitlines()[0]}:src/app.py")
+    assert "return 2" in salvaged
+    # the salvaged content reached the merged run branch
+    tip = await BranchOps(h.repo_path).run_branch_tip(h.run.branch)
+    merged = await _git(h.repo_path, "show", f"{tip}:src/app.py")
+    assert "return 2" in merged
+
+    # attempt 2's guidance carried the salvage sha + do-not-redo phrasing
+    second_user = next(
+        m for m in gateway.calls[2] if getattr(m, "role", "") == "user"  # attempt 1 = 2 msgs
+    )
+    assert "salvaged as commit" in second_user.content
+    assert "do not redo completed work" in second_user.content
+    assert wip_sha.splitlines()[0] in second_user.content
+    assert "turn budget" in second_user.content  # original failure detail kept
+
+    # Group G: turn telemetry on the salvage close path
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 2
+    assert attempts[0]["turns_used"] == 2
+
+
+async def test_turn_cap_clean_worktree_gets_no_salvage(harness: Harness) -> None:
+    """Group B: a clean worktree at the turn cap yields no salvage commit and
+    unchanged guidance."""
+    h = harness
+    task = await _seed_task(h)
+    # 6 clean no-op turns exhaust the default attempt_max_turns=6 on a clean tree
+    noops = [_resp(calls=[_tc(str(i), "run_command", '{"cmd":"true"}')]) for i in range(6)]
+    gateway = FakeGateway(responses=[*noops, *write_commit_complete()])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    subjects = await _git(h.repo_path, "log", f"task/{task.id}", "--format=%s")
+    assert "wip(attempt" not in subjects
+    second_user = next(m for m in gateway.calls[6] if getattr(m, "role", "") == "user")
+    assert "Previous attempt failed" in second_user.content
+    assert "salvaged" not in second_user.content
+
+
+async def test_integrity_violation_dirty_worktree_still_force_pruned(harness: Harness) -> None:
+    """Group B regression guard: integrity violations keep today's semantics —
+    dirty worktree is force-pruned, NO salvage commit is created."""
+    h = harness
+    task = await _seed_task(h)  # scope src/** only → tests/ write is held
+    gateway = FakeGateway(
+        responses=[
+            # held (never executed) out-of-scope write → taints the attempt
+            _resp(calls=[_tc("1", "write_file", '{"path":"tests/evil.py","content":"x=1\\n"}')]),
+            # executed in-scope write left UNCOMMITTED when the attempt dies
+            _resp(calls=[_tc("2", "write_file", '{"path":"src/app.py","content":"y=2\\n"}')]),
+            _resp(calls=[_tc("3", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "integrity_violation"
+
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 1  # no retry
+    assert attempts[0]["status"] == AttemptStatus.INTEGRITY_VIOLATION.value
+    subjects = await _git(h.repo_path, "log", f"task/{task.id}", "--format=%s")
+    assert "wip(attempt" not in subjects
+    tree = await _git(h.repo_path, "ls-tree", "-r", "--name-only", f"task/{task.id}")
+    assert "src/app.py" not in tree  # dirty work force-pruned, not salvaged
+    rows = await repo.list_worktrees(h.db)
+    assert rows and rows[0].state is WorktreeState.PRUNED
+
+
+async def test_empty_diff_without_no_changes_is_retryable_failure(harness: Harness) -> None:
+    """Group D: an empty diff is only legitimate when the agent declared
+    no_changes=true — otherwise it retries with no-op-honesty guidance."""
+    h = harness
+    task = await _seed_task(h)
+    silent_noop = [_resp(calls=[_tc("1", "mark_task_complete", '{"summary":"done"}')])]
+    gateway = FakeGateway(responses=[*silent_noop, *silent_noop])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "failed"  # both attempts empty → exhausted
+
+    second_user = next(m for m in gateway.calls[1] if getattr(m, "role", "") == "user")
+    assert "no changes exist" in second_user.content
+    assert "no_changes=true" in second_user.content
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 2
+    assert attempts[0]["status"] == AttemptStatus.FAILED.value
+
+
+async def test_empty_diff_with_no_changes_declared_is_accepted(harness: Harness) -> None:
+    """Group D: mark_task_complete(no_changes=true) with an empty diff is a
+    legitimate completed outcome, as before."""
+    h = harness
+    task = await _seed_task(h)
+    gateway = FakeGateway(
+        responses=[
+            _resp(
+                calls=[
+                    _tc(
+                        "1",
+                        "mark_task_complete",
+                        '{"summary":"nothing needed","no_changes":true}',
+                    )
+                ]
+            )
+        ]
+    )
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+    assert outcome.no_changes is True
+    fresh = await repo.get_task(h.db, task.id)
+    assert fresh is not None and fresh.status is TaskStatus.COMPLETED

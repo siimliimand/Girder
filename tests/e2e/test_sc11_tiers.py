@@ -104,7 +104,12 @@ async def test_t2_without_earned_streak_is_gated(make_delivery_ctx: MakeDelivery
     assert ctx.api.merge_calls == 0
 
     # a fresh project that HAS earned the streak (>= t2_required_streak) merges
-    ctx2 = await make_delivery_ctx(PROPOSAL, autonomy_tier=2, clean_merge_streak=10)
+    # (own run branch: on the shared e2e repo the default name would inherit
+    # ctx1's merged work as ctx2's base, making every scripted task an
+    # undeclared no-op — rejected by the Group D empty-diff gate)
+    ctx2 = await make_delivery_ctx(
+        PROPOSAL, autonomy_tier=2, clean_merge_streak=10, branch="run/e2e2"
+    )
     descriptor = await ctx2.delivery_engine(_gateway()).run_to_completion(ctx2.run.id)
     assert descriptor == "merged"
     assert ctx2.api.merge_calls == 1

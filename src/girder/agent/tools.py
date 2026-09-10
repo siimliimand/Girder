@@ -66,7 +66,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the worktree (optionally a line range).",
+            "description": (
+                "Read a file from the worktree (optionally a line range)."
+                " For large files, call view_symbol_outline first, then read"
+                " targeted ranges via line_start/line_end."
+                " Output is clipped to the configured line budget — you will"
+                " see a '[truncated: N more lines]' marker instead of the rest."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -167,10 +173,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "mark_task_complete",
-            "description": "Declare the task done. Provide a short summary of what changed.",
+            "description": (
+                "The ONLY way to finish your attempt. If the turn budget runs"
+                " out before you call this, the attempt is destroyed and all"
+                " uncommitted work is lost. Provide a short summary of what"
+                " changed; set no_changes=true only when you genuinely made"
+                " no changes and none were needed."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"summary": {"type": "string"}},
+                "properties": {
+                    "summary": {"type": "string"},
+                    "no_changes": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only when you genuinely made no changes"
+                            " and none were needed."
+                        ),
+                        "default": False,
+                    },
+                },
                 "required": ["summary"],
             },
         },

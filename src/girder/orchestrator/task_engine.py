@@ -93,6 +93,9 @@ class TaskOutcome:
     # integrity_violation | amendment_pending | budget_exhausted
     kind: str
     detail: str | None = None
+    # True when the agent declared mark_task_complete(no_changes=true) and the
+    # empty diff was accepted as a legitimate no-op (Group D).
+    no_changes: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,11 @@ class _VerifyStep:
 
     kind: str
     detail: str | None
+    # no_changes=true declared by the agent (Group D — empty-diff honesty).
+    no_changes: bool = False
+    # (salvage sha, changed files) when the failed attempt's dirty worktree
+    # was committed to the task branch before teardown (Group B).
+    salvage: tuple[str, list[str]] | None = None
 
 
 def _kind_of(status: TaskStatus) -> str:
@@ -141,6 +149,10 @@ class TaskEngine:
             protected_read_paths=settings.project.protected_read_paths,
         )
         self._snapshot_dirs: dict[str, list[Path]] = {}
+        # Group B: task_id → salvage commit sha from the most recent failed
+        # attempt; consumed once by _start_attempt so the retry worktree is
+        # created at the salvaged task-branch tip instead of the run tip.
+        self._salvage_tips: dict[str, str] = {}
 
     def _container_spec(self, name: str, worktree: Path) -> ContainerSpec:
         """Build the attempt ContainerSpec (impl-plan §6.4, R11).
@@ -279,10 +291,23 @@ class TaskEngine:
                             base_commit,
                             container,
                             integrate=integrate,
+                            agent_no_changes=outcome.no_changes,
+                            turns_used=outcome.turns_used,
                         )
                         if outcome.status == "succeeded"
                         else None
                     )
+                    salvage: tuple[str, list[str]] | None = None
+                    if outcome.status in ("failed", "timeout"):
+                        # Group B: ordinary retryable death (turn cap /
+                        # wall-clock) — preserve uncommitted work BEFORE the
+                        # finally below force-prunes the worktree. Integrity
+                        # violations and amendment parks never reach this.
+                        # A salvage failure must not mask the real outcome.
+                        with suppress(Exception):
+                            salvage = await self._salvage_worktree(fresh, attempt)
+                        if salvage is not None:
+                            self._salvage_tips[fresh.id] = salvage[0]
                 except BudgetExceeded:
                     # The gateway already froze the attempt (budget_frozen) and
                     # routed the run to budget_exhausted; report upward.
@@ -339,18 +364,34 @@ class TaskEngine:
                     raise RuntimeError("succeeded outcome without a verify step")
                 if step.kind == "retry":
                     guidance = f"Previous attempt failed verification: {step.detail}"
+                    if step.salvage is not None:
+                        guidance = self._salvage_guidance(
+                            attempt.attempt_num,
+                            "failed verification with uncommitted work",
+                            step.salvage,
+                            guidance,
+                        )
                     continue
-                return TaskOutcome(step.kind, step.detail)
+                return TaskOutcome(step.kind, step.detail, no_changes=step.no_changes)
 
             # timeout | failed (turn budget) — retry with feedback, or fail.
             tail = self._redact_tail(outcome.failure_reason or outcome.summary or "")
-            await self._close_attempt(attempt.id, outcome.status, tail)
+            await self._close_attempt(
+                attempt.id, outcome.status, tail, turns_used=outcome.turns_used
+            )
             next_guidance = await self._retry_or_fail(
                 run, fresh, tail, event="attempt_retry_scheduled", note=f"attempt {outcome.status}"
             )
             if next_guidance is None:
                 return TaskOutcome("failed", tail)
             guidance = f"Previous attempt {outcome.status}: {tail}"
+            if salvage is not None:
+                guidance = self._salvage_guidance(
+                    attempt.attempt_num,
+                    "ran out of turns after writing work",
+                    salvage,
+                    guidance,
+                )
 
     # ------------------------------------------------------- attempt plumbing
 
@@ -359,7 +400,14 @@ class TaskEngine:
     ) -> tuple[Attempt, WorktreeRef, TestManifest, str]:
         attempt = await repo.create_attempt(self.db, task.id, base_commit)
         manager = WorktreeManager(self.repo_path, self.worktree_base or DEFAULT_BASE)
-        ref = await manager.create(run.id, task.id, base_commit)
+        # Group B: a retry worktree must be created at the salvaged task-branch
+        # tip — the default base (run-branch tip) does not contain the salvage
+        # commit, and the retry would redo (or clobber) completed work. The
+        # task branch persists across attempts (only the worktree is pruned),
+        # and `worktree add -b` falls back to a detached checkout at this base
+        # when the branch already exists.
+        wt_base_commit = self._salvage_tips.pop(task.id, base_commit)
+        ref = await manager.create(run.id, task.id, wt_base_commit)
         await repo.create_worktree(self.db, attempt.id, str(ref.path), ref.branch)
         attempt.worktree_path = str(ref.path)  # keep the local object in sync for teardown
         await repo.update_attempt_fields(
@@ -481,6 +529,8 @@ class TaskEngine:
         container: str,
         *,
         integrate: bool = True,
+        agent_no_changes: bool = False,
+        turns_used: int | None = None,
     ) -> _VerifyStep:
         await transition_task(self.db, task.id, TaskStatus.VERIFYING)
         # §8 (impl-plan): integrity violations block the merge at every tier —
@@ -516,7 +566,13 @@ class TaskEngine:
         if not suite_green:
             tail = self._redact_tail(exec_res.stdout + "\n" + exec_res.stderr)
             return await self._retry_step(
-                run, task, attempt, tail, event="verify_failed", note="verification suite failed"
+                run,
+                task,
+                attempt,
+                tail,
+                event="verify_failed",
+                note="verification suite failed",
+                turns_used=turns_used,
             )
 
         # Suite green — kill the container BEFORE any orchestrator-side audit
@@ -551,22 +607,44 @@ class TaskEngine:
                 "the task branch must be clean before completion."
             )
             return await self._retry_step(
-                run, task, attempt, detail, event="verify_failed", note="uncommitted leftovers"
+                run,
+                task,
+                attempt,
+                detail,
+                event="verify_failed",
+                note="uncommitted leftovers",
+                turns_used=turns_used,
             )
         if not audit.passed:
             return await self._integrity_violation(run, task, attempt, audit)
 
         # A clean tree with an empty commit range is a legitimate "no change
-        # needed" outcome (e.g. documentation-only intents): the ff proof in
-        # audit_gated_merge passes for equal tips and the merge is a no-op.
-        # "Forgot to commit" is caught above via the uncommitted-leftovers
-        # audit finding, not here.
+        # needed" outcome (e.g. documentation-only intents) — but only when
+        # the agent declared it via mark_task_complete(no_changes=true)
+        # (Group D no-op honesty): otherwise a silent no-op is an ordinary
+        # retryable failure. "Forgot to commit" is caught above via the
+        # uncommitted-leftovers audit finding, not here.
 
         # Record where this attempt's work ended on the task branch (the
         # worktree may be detached after a retry), then merge ff-only.
         head = await run_host_cmd(
             ["git", "-C", str(worktree.path), "rev-parse", "HEAD"], timeout_s=30
         )
+        if head.stdout.strip() == base_commit and not agent_no_changes:
+            detail = (
+                "you declared the task complete but no changes exist; if genuinely "
+                "nothing is needed, call mark_task_complete(no_changes=true); "
+                "otherwise write the change."
+            )
+            return await self._retry_step(
+                run,
+                task,
+                attempt,
+                detail,
+                event="verify_failed",
+                note="empty diff without no_changes",
+                turns_used=turns_used,
+            )
         await run_host_cmd(
             [
                 "git",
@@ -605,6 +683,8 @@ class TaskEngine:
             # recorded; the wave integrator merges verified branches one by
             # one, so concurrent agents never share a merge target.
             await transition_attempt(self.db, attempt.id, AttemptStatus.SUCCEEDED)
+            if turns_used is not None:
+                await repo.update_attempt_fields(self.db, attempt.id, turns_used=turns_used)
             await repo.insert_event(
                 self.db,
                 "task_verified",
@@ -618,7 +698,7 @@ class TaskEngine:
                 attempt_id=attempt.id,
             )
             await transition_task(self.db, task.id, TaskStatus.VERIFY_PASSED)
-            return _VerifyStep("verified", head.stdout.strip())
+            return _VerifyStep("verified", head.stdout.strip(), no_changes=agent_no_changes)
         merge = await BranchOps(self.repo_path).audit_gated_merge(
             source_branch=worktree.branch,
             target_branch=run.branch,
@@ -632,10 +712,18 @@ class TaskEngine:
             reason = merge.reason or "merge refused"
             detail = f"merge refused after a passed audit: {reason}"
             return await self._retry_step(
-                run, task, attempt, detail, event="merge_refused", note=detail
+                run,
+                task,
+                attempt,
+                detail,
+                event="merge_refused",
+                note=detail,
+                turns_used=turns_used,
             )
 
         await transition_attempt(self.db, attempt.id, AttemptStatus.SUCCEEDED)
+        if turns_used is not None:
+            await repo.update_attempt_fields(self.db, attempt.id, turns_used=turns_used)
         await repo.insert_event(
             self.db,
             "task_completed",
@@ -650,7 +738,7 @@ class TaskEngine:
         )
         await transition_task(self.db, task.id, TaskStatus.VERIFY_PASSED)
         await transition_task(self.db, task.id, TaskStatus.COMPLETED)
-        return _VerifyStep("completed", merge.merged_commit)
+        return _VerifyStep("completed", merge.merged_commit, no_changes=agent_no_changes)
 
     async def _integrity_violation(
         self, run: Run, task: Task, attempt: Attempt, audit: AuditResult
@@ -712,17 +800,108 @@ class TaskEngine:
         *,
         event: str,
         note: str,
+        turns_used: int | None = None,
     ) -> _VerifyStep:
         """Close the attempt FAILED and retry with feedback, or fail the task."""
+        # Group B: salvage any uncommitted work before the engine-level
+        # finally prunes the worktree — verify-fail retries are ordinary
+        # retries, so the same salvage semantics apply.
+        salvage: tuple[str, list[str]] | None = None
+        with suppress(Exception):
+            salvage = await self._salvage_worktree(task, attempt)
+        if salvage is not None:
+            self._salvage_tips[task.id] = salvage[0]
         tail = self._redact_tail(detail)
-        await self._close_attempt(attempt.id, AttemptStatus.FAILED.value, tail)
+        await self._close_attempt(
+            attempt.id, AttemptStatus.FAILED.value, tail, turns_used=turns_used
+        )
         next_guidance = await self._retry_or_fail(run, task, tail, event=event, note=note)
         if next_guidance is None:
             return _VerifyStep("failed", tail)
         # Feedback to the next attempt must be the redacted tail (Phase 2
         # task 5): the raw detail can carry git stderr with secret-shaped
         # content (e.g. a merge-refusal echoing a token).
-        return _VerifyStep("retry", tail)
+        return _VerifyStep("retry", tail, salvage=salvage)
+
+    async def _salvage_worktree(self, task: Task, attempt: Attempt) -> tuple[str, list[str]] | None:
+        """Commit a dead attempt's dirty worktree onto its task branch (Group B).
+
+        Live dogfood runs lost every retry: the dead attempt's uncommitted
+        worktree was force-pruned, so attempt N+1 re-explored from scratch and
+        died identically. Committing the leftovers (mechanically, with a
+        pinned identity so a missing host git config can't fail) keeps that
+        work; `_start_attempt` then bases the retry worktree on the salvaged
+        tip. Integrity violations and amendment parks keep force-prune
+        semantics — their callers never invoke this.
+        """
+        wt = attempt.worktree_path
+        if wt is None:
+            return None
+        status = await run_host_cmd(
+            ["git", "-C", wt, "status", "--porcelain"], check=False, timeout_s=30
+        )
+        if status.returncode != 0 or not status.stdout.strip():
+            return None
+        await run_host_cmd(["git", "-C", wt, "add", "-A"], check=False, timeout_s=60)
+        commit = await run_host_cmd(
+            [
+                "git",
+                "-C",
+                wt,
+                "-c",
+                "user.name=girder",
+                "-c",
+                "user.email=girder@local",
+                "commit",
+                "-m",
+                f"wip(attempt {attempt.attempt_num}): salvaged on retry",
+            ],
+            check=False,
+            timeout_s=60,
+        )
+        if commit.returncode != 0:
+            log.warning(
+                "attempt %s: salvage commit failed: %s", attempt.id, commit.stderr[-200:]
+            )
+            return None
+        head = await run_host_cmd(["git", "-C", wt, "rev-parse", "HEAD"], timeout_s=30)
+        sha = head.stdout.strip()
+        files = await run_host_cmd(
+            ["git", "-C", wt, "diff", "--name-only", "HEAD~1"], check=False, timeout_s=30
+        )
+        # Advance the task branch even when the worktree HEAD is detached
+        # (retry worktrees are created detached once the branch exists), so
+        # the salvage is reachable for the retry base and post-mortems.
+        await run_host_cmd(
+            [
+                "git",
+                "-C",
+                str(self.repo_path),
+                "update-ref",
+                f"refs/heads/task/{task.id}",
+                sha,
+            ],
+            timeout_s=30,
+        )
+        changed = [ln for ln in files.stdout.splitlines() if ln.strip()]
+        log.info(
+            "attempt %s: salvaged uncommitted work as %s (%d file(s))",
+            attempt.id,
+            sha[:12],
+            len(changed),
+        )
+        return sha, changed
+
+    def _salvage_guidance(
+        self, attempt_num: int, fate: str, salvage: tuple[str, list[str]], base: str
+    ) -> str:
+        """Trusted retry guidance pointing attempt N+1 at the salvaged commit."""
+        sha, files = salvage
+        return (
+            f"{base}\nPrevious attempt {attempt_num} {fate}; its uncommitted work was "
+            f"salvaged as commit {sha} (files: {', '.join(files)}). Continue from "
+            "there — do not redo completed work; finish and call mark_task_complete."
+        )
 
     async def _retry_or_fail(
         self, run: Run, task: Task, tail: str, *, event: str, note: str
@@ -755,12 +934,16 @@ class TaskEngine:
                 f"task {task.id} ({task.title}): {reason}",
             )
 
-    async def _close_attempt(self, attempt_id: str, status: str, reason: str) -> None:
+    async def _close_attempt(
+        self, attempt_id: str, status: str, reason: str, *, turns_used: int | None = None
+    ) -> None:
         with suppress(InvalidTransition):
             await transition_attempt(self.db, attempt_id, status)
-        await repo.update_attempt_fields(
-            self.db, attempt_id, failure_reason=reason, ended_at=utcnow_iso()
-        )
+        fields: dict[str, str | int | None] = {"failure_reason": reason, "ended_at": utcnow_iso()}
+        if turns_used is not None:
+            # Group G: every close path persists the agent turn count.
+            fields["turns_used"] = turns_used
+        await repo.update_attempt_fields(self.db, attempt_id, **fields)
 
     def _redact_tail(self, text: str) -> str:
         redacted, _ = self.redactor.redact(text[-_TAIL_CHARS:])

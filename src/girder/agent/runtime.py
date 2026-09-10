@@ -44,6 +44,23 @@ _NO_TOOL_NUDGE = (
     "(or request_spec_amendment if the frozen spec cannot be satisfied)."
 )
 
+# Variant for the last allowed turn: remind the agent the budget was announced.
+_NO_TOOL_NUDGE_FINAL = _NO_TOOL_NUDGE + (
+    " This was your final turn: you were told the turn budget up front — "
+    "the attempt now ends without a terminal call."
+)
+
+
+def _milestone_for_turn(turn: int, cap: int) -> str | None:
+    """Deterministic budget milestones (Group A): one directive at the half,
+    one at cap-2. Each fires on exactly one turn number; None otherwise."""
+    if turn == cap - 2:
+        return "Final turns: conclude and call `mark_task_complete`."
+    if turn == max(1, cap // 2):
+        return "Half your turns are spent — start writing now"
+    return None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +76,10 @@ class AttemptOutcome:
     failure_reason: str | None
     turns_used: int
     amendment: tuple[str, str] | None  # (reason, suggested_change)
+    # True when the terminal call was mark_task_complete(no_changes=true):
+    # the attempt "succeeded" without producing any diff (consumed by
+    # task_engine for no-op honesty accounting; set here, never acted on).
+    no_changes: bool = False
 
 
 def _render_tool_calls(
@@ -103,6 +124,7 @@ class AgentRuntime:
         self.attempt = attempt
         self.task = task
         self.model_role = model_role
+        self._scopes = scopes  # kept for budget-aware prompts (protected globs)
         self._redactor = redactor
         self._context_window = gateway.role_config(model_role).context_window
         self._registry = ToolRegistry(
@@ -135,17 +157,26 @@ class AgentRuntime:
         messages = [
             Message(
                 role="system",
-                content=prompts.build_system_prompt(task=self.task, spec_slice=spec_slice),
+                content=prompts.build_system_prompt(
+                    task=self.task,
+                    spec_slice=spec_slice,
+                    turn_budget=self.limits.attempt_max_turns,
+                    read_restricted=self._scopes.protected_globs,
+                ),
             ),
             Message(
                 role="user",
                 content=prompts.build_task_message(
-                    task=self.task, spec_slice=spec_slice, guidance=guidance
+                    task=self.task,
+                    spec_slice=spec_slice,
+                    guidance=guidance,
+                    read_restricted=self._scopes.protected_globs,
                 ),
             ),
         ]
         loop = asyncio.get_running_loop()
         turns_used = 0
+        fired_milestones: set[str] = set()
         while turns_used < self.limits.attempt_max_turns:
             messages = await self._absorb_steering(messages)
             remaining = self._remaining_s(deadline_s, loop)
@@ -154,6 +185,14 @@ class AgentRuntime:
                     "timeout", None, "wall-clock deadline exhausted", turns_used
                 )
             turns_used += 1
+            # Budget milestones ride the same trusted-directive framing as
+            # operator steering (build_directive_message); each fires once.
+            milestone = _milestone_for_turn(turns_used, self.limits.attempt_max_turns)
+            if milestone is not None and milestone not in fired_milestones:
+                fired_milestones.add(milestone)
+                messages.append(
+                    Message(role="user", content=prompts.build_directive_message(milestone))
+                )
             await repo.insert_event(
                 self.db,
                 "turn_start",
@@ -185,8 +224,14 @@ class AgentRuntime:
 
             if not response.tool_calls:
                 # No action: nudge and count the turn; cap handled by the loop.
+                # Final-turn nudge reminds the agent the budget was announced.
+                nudge = (
+                    _NO_TOOL_NUDGE_FINAL
+                    if turns_used >= self.limits.attempt_max_turns
+                    else _NO_TOOL_NUDGE
+                )
                 messages.append(Message(role="assistant", content=response.content or ""))
-                messages.append(Message(role="user", content=_NO_TOOL_NUDGE))
+                messages.append(Message(role="user", content=nudge))
                 messages = self._maybe_compact(messages)
                 continue
 
@@ -236,7 +281,11 @@ class AgentRuntime:
                     )
                 if name == "mark_task_complete":
                     return await self._finish(
-                        "succeeded", str(args.get("summary", "")), None, turns_used
+                        "succeeded",
+                        str(args.get("summary", "")),
+                        None,
+                        turns_used,
+                        no_changes=bool(args.get("no_changes", False)),
                     )
                 amendment = (str(args.get("reason", "")), str(args.get("suggested_change", "")))
                 return await self._finish(
@@ -244,7 +293,11 @@ class AgentRuntime:
                 )
 
         return await self._finish(
-            "failed", None, "turn budget exhausted (no terminal tool call)", turns_used
+            "failed",
+            None,
+            "turn budget exhausted (no terminal tool call) — you were told "
+            "the budget up front: explore less, write sooner",
+            turns_used,
         )
 
     # ------------------------------------------------------------ internals
@@ -393,6 +446,7 @@ class AgentRuntime:
         failure_reason: str | None,
         turns_used: int,
         amendment: tuple[str, str] | None = None,
+        no_changes: bool = False,
     ) -> AttemptOutcome:
         await repo.insert_event(
             self.db,
@@ -407,4 +461,5 @@ class AgentRuntime:
             failure_reason=failure_reason,
             turns_used=turns_used,
             amendment=amendment,
+            no_changes=no_changes,
         )
