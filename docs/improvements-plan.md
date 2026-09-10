@@ -4,6 +4,12 @@
 **Prerequisite:** Sprints 1–6 complete, 546 tests green, dogfood runs 1–2 completed  
 **Companion docs:** `docs/plan.md` v2.2 (spec), `docs/implementation-plan.md` (engineering blueprint), `docs/agent-effectiveness-plan.md` (Group A–H fix pass)
 
+> **➡ Split into parallel workstreams (2026-09-10):** this plan is now implemented via
+> [`docs/improvements/README.md`](improvements/README.md), which breaks Sprints 7–13 into
+> eleven self-contained workstream docs (`ws01`–`ws11`) with wave ordering, file-conflict
+> matrix, and pre-allocated migration numbers. WP numbering below is stable and maps 1:1 —
+> this document remains the historical source spec.
+
 This document describes the next phase of Girder development. It covers every identified gap between the current implementation and a production-grade, Jules/Devin-class autonomous delivery system. Improvements are grouped into seven sprints ordered by ROI: agent effectiveness first, infrastructure last.
 
 ---

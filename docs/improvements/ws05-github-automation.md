@@ -1,0 +1,146 @@
+# WS-05 — GitHub Automation Pipeline
+
+| | |
+|---|---|
+| **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 9 (WP 9.1 – WP 9.4) |
+| **Status** | Not started |
+| **Wave** | **1** — can run in parallel with WS-01, WS-03, WS-04, WS-07A, WS-08, WS-09 |
+| **Effort** | ~2 weeks · ~15 new tests |
+| **Owned files** | `src/girder/github/webhook.py` (new), `src/girder/notify/slack.py` (new), `src/girder/github/client.py` (PR body), `.github/workflows/ci.yml` (parity schedule) |
+| **Shared files** | `src/girder/api/routes.py` (registers webhook routes — additive; coordinate with WS-04), `Secrets` model + `secrets.toml` (new keys), `src/girder/config.py` (`[github]` / `notify` keys) |
+
+---
+
+## Goal
+
+Close the gap with Jules's killer feature — automated PR creation from GitHub issues. Move from "manually type intent in web UI" to "assign a GitHub issue to Girder and get a PR."
+
+## Current state (verified 2026-09-10)
+
+- `src/girder/github/` exists: `client.py` (has `create_pull_request()`), `ci.py`, `delivery.py`, `parity.py`, `flaky.py`, `conformance.py`, `diagnostic.py`. **No `webhook.py` yet.**
+- `src/girder/notify/` exists: `notifier.py`, `telegram_inbound.py`. **No `slack.py` yet.**
+- `GithubConfig` already has `pr_template: str | None` (`config.py:117`) — WP 9.3 just needs to consume it.
+- No webhook route, no Slack secrets, no nightly parity trigger.
+
+## Definition of Done
+
+- Assigning a GitHub issue to the configured bot account creates a run; PR creation posts a comment linking to the Girder console.
+- New e2e scenario **SC-19** passes (issue assignment → run → PR).
+- Webhook rejects invalid HMAC signatures with 403 before any processing.
+- New tests green; `mypy --strict` clean.
+
+---
+
+## WP 9.1 — GitHub App / Webhook Receiver
+
+**Why:** Jules's number one differentiator. Any team using GitHub can integrate Girder with zero friction if it responds to issue assignments.
+
+**New module:** `src/girder/github/webhook.py`
+
+**Supported events:**
+
+1. **`issues.assigned`** — issue assigned to the bot account: extract title + body → create a run with intent = `f"{issue.title}\n\n{issue.body}"`.
+2. **`issue_comment.created`** — comment contains `/girder <intent>` → create a run with the inline intent.
+3. **`pull_request_review_comment.created`** — review comment contains `/girder fix this` → create a run scoped to the file in the review.
+
+**Implementation:**
+
+1. New FastAPI route: `POST /api/webhooks/github` — verifies HMAC-SHA256 signature against `secrets.github_webhook_secret`.
+2. New `WebhookProcessor` class dispatching to per-event handlers.
+3. Each handler creates a project run via the existing `repo.create_run` → `dispatch_generation` pipeline, then posts a comment on the issue: `"Girder is working on this — [view run](http://localhost:8787/runs/{run_id})"`.
+4. Secrets: add `github_webhook_secret` to the `Secrets` model and `secrets.toml`.
+5. Config: `[github] webhook_enabled = false` and `github.bot_account = ""` (GitHub username watched for assignments).
+
+**Security:** the endpoint checks the `X-Hub-Signature-256` header **before processing any payload**. Invalid signatures return 403 immediately. Validate the event type against the allowlist above; ignore everything else with 200 (GitHub treats non-2xx as webhook failure).
+
+---
+
+## WP 9.2 — Slack Integration
+
+**Why:** Telegram has a small user base; most development teams use Slack.
+
+**New module:** `src/girder/notify/slack.py`
+
+**Features:**
+
+- Incoming webhooks for notifications (supplements Discord)
+- Slash command `/girder run "intent"` → creates a run
+- Slash command `/girder status` → lists active runs
+- Interactive messages: Approve/Reject spec from Slack (Block Kit interactive components)
+
+**Implementation:**
+
+1. `SlackNotifier` class implementing the same interface as `TelegramNotifier` (see `notify/notifier.py`).
+2. New FastAPI route: `POST /api/webhooks/slack` for slash commands and interactive payloads.
+3. Secrets: `notify_slack_bot_token`, `notify_slack_signing_secret`.
+4. Config: add `"slack"` to the valid `notify.channels` set.
+
+---
+
+## WP 9.3 — PR Template Integration
+
+**Why:** Merged PRs should have rich descriptions automatically — what the spec said, what tasks ran, what the cost was, which tests passed.
+
+**Implementation in `src/girder/github/client.py`:**
+
+`create_pull_request()` already exists. Enhance it to:
+
+1. Read `[github] pr_template` from config (`GithubConfig.pr_template` — already present).
+2. If set, use it as a Jinja2 template rendered with: `run.id`, `run.intent`, spec tasks summary, total cost, run link.
+3. If not set, use the built-in template:
+
+```markdown
+## Summary
+
+{{ intent }}
+
+## Tasks completed
+
+{% for task in tasks %}
+- **{{ task.title }}** (`{{ task.task_type }}`) — {{ task.status }}
+{% endfor %}
+
+## Metrics
+
+- Total cost: ${{ "%.4f"|format(total_cost_usd) }}
+- Attempts: {{ total_attempts }}
+- Run: [girder/{{ run_id[:8] }}]({{ console_url }}/runs/{{ run_id }})
+
+---
+*Generated by [Girder](https://github.com/siimliimand/Girder)*
+```
+
+---
+
+## WP 9.4 — CI Parity Nightly Check
+
+**Why:** The sandbox image diverges from CI over time. The current parity check (`parity` workflow) is manual/dispatch-only.
+
+**Change to `.github/workflows/ci.yml`:**
+
+```yaml
+schedule:
+  - cron: "0 3 * * *"
+```
+
+added to the `parity` job so it runs nightly. Alert via Girder's own notification system if the parity check fails (the daemon polling workflow-run status is already in the CI poller infrastructure — see `github/ci.py`).
+
+---
+
+## Tests
+
+- HMAC: valid signature processed; invalid/tampered signature → 403, nothing persisted.
+- Each event handler: `issues.assigned` to bot → run created with composed intent; `/girder <intent>` comment → run created; non-bot assignment and non-matching comments → ignored.
+- Slack: slash command parsing, status listing, signature verification.
+- PR template: built-in template renders with real run data; custom template path overrides it.
+- e2e **SC-19** (new): issue assignment → run → PR, against a fixture repo.
+
+## Coordination
+
+- **routes.py:** WS-04 adds clarify routes in wave 1 as well — additive, different sections; coordinate merge order.
+- **WS-11** (self-hosting, wave 4) depends on this workstream being deployed and operational — its `webhook_enabled` flip happens there.
+- **WS-10** (ops-hardening, wave 3) puts API-key auth middleware in front of routes — decide whether webhook endpoints are exempted (they authenticate via HMAC instead). Note this in the WS-10 review.
+
+## Relevant resolution log decision
+
+- **R-SP9-1:** GitHub App over OAuth App — App tokens are repo-scoped; OAuth tokens are user-scoped. App is safer.
