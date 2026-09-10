@@ -88,6 +88,7 @@ class FakeGitHub(httpx.MockTransport):
         self.pr_number = pr_number
         self.pr_merged = pr_merged
         self.api_calls: list[tuple[str, str]] = []
+        self.pr_bodies: list[str] = []
         self.comments: list[dict[str, Any]] = []
         self.merge_calls = 0
         self.merge_refused = False
@@ -105,6 +106,7 @@ class FakeGitHub(httpx.MockTransport):
         if method == "GET" and path == f"{base}/pulls":
             return httpx.Response(200, json=[])
         if method == "POST" and path == f"{base}/pulls":
+            self.pr_bodies.append(json.loads(request.content)["body"])
             return httpx.Response(201, json={"number": self.pr_number})
         if method == "GET" and path == f"{base}/pulls/{self.pr_number}":
             return httpx.Response(
@@ -882,3 +884,50 @@ async def test_zero_testcase_delivery_suite_fails_without_flag(dh: DHarness) -> 
     assert fresh is not None and fresh.status is RunStatus.FAILED
     event = await repo.get_latest_event(dh.db, dh.run.id, "delivery_suite")
     assert event is not None and event["payload"]["green"] is False
+
+# ------------------------------------------------------- PR body (WP 9.3)
+
+
+@pytest.mark.parametrize("dh", [0], indirect=True)
+async def test_pr_body_uses_run_template_on_delivery(dh: DHarness) -> None:
+    """A real delivery renders the WP 9.3 template (not the legacy plain text):
+    metrics section, the console run link, and the run-id prefix all present."""
+    wave = await repo.get_or_create_wave0(dh.db, dh.run.id)
+    task = await repo.create_task(
+        dh.db, wave.id, 1, "Do a", TaskType.CODE_CHANGE, scope_globs=["src/**"]
+    )
+    # test-seed only: skip the FSM walk (pending → … → completed) to reach the
+    # completed state enter_delivery expects to find the tasks in
+    async with dh.db.tx() as conn:
+        await conn.execute(
+            "UPDATE tasks SET status = 'completed', attempts_used = 3 WHERE id = ?",
+            (task.id,),
+        )
+    d = dh.delivery(FakeGateway(responses=[_resp(content=GOOD_VERDICT)]))
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+
+    assert len(dh.api.pr_bodies) == 1
+    body = dh.api.pr_bodies[0]
+    assert "## Summary" in body  # builtin template, not legacy plain text
+    assert "## Metrics" in body
+    assert "## Intent" not in body  # legacy format is gone from the real path
+    assert f"(http://127.0.0.1:8787/runs/{dh.run.id})" in body
+    assert f"girder/{dh.run.id[:8]}" in body
+    assert "- **Do a** (`code_change`) — completed" in body
+    assert "Attempts: 3" in body
+
+
+@pytest.mark.parametrize("dh", [0], indirect=True)
+async def test_custom_pr_template_flows_through_delivery(dh: DHarness) -> None:
+    """``[github] pr_template`` configured in Settings overrides the builtin
+    through the delivery path (the PR body is the rendered custom template)."""
+    dh.settings.github.pr_template = (
+        "# Run {{ run_id[:8] }}\n\n{{ intent }}\n\nTasks: {{ tasks | length }}\n"
+    )
+    d = dh.delivery(FakeGateway(responses=[_resp(content=GOOD_VERDICT)]))
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+
+    body = dh.api.pr_bodies[0]
+    assert body.startswith(f"# Run {dh.run.id[:8]}")
+    assert "Tasks: 0" in body
+    assert "## Summary" not in body  # builtin not used
