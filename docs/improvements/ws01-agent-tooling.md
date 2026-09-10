@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 7 (WP 7.1 – WP 7.6) |
-| **Status** | Implemented on `wave1/ws01-agent-tooling` — merge deferred (owns `tools.py`, which in-flight parallel work also edits; rebase onto the stacks-aware `tools.py` before merging) |
+| **Status** | Merged to main (2067e7b) |
 | **Wave** | **1** — can run in parallel with WS-03, WS-04, WS-05, WS-07A, WS-08, WS-09 |
 | **Effort** | ~1 week · ~20 new unit tests |
 | **Owned files** | `src/girder/agent/tools.py`, `tests/unit/test_agent_tools.py` |
