@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from girder.budget.guard import BudgetExceeded
-from girder.config import Secrets, Settings
+from girder.config import Secrets, Settings, project_allows_empty_baseline
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Project, Run, RunStatus, WorktreeState
@@ -47,7 +47,7 @@ from girder.gitops.worktree import WorktreeManager
 from girder.guard.redact import Redactor
 from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
-from girder.orchestrator.baseline import parse_junit_xml
+from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
 from girder.sandbox.engine import ContainerSpec, SandboxEngine, SandboxTimeout
 from girder.specs.validator import SpecValidationError, parse_spec
 from girder.util import run_host_cmd, utcnow_iso
@@ -573,7 +573,9 @@ class DeliveryEngine:
             if not xml.exists():
                 return False, "junit report missing after delivery suite", []
             results = parse_junit_xml(xml.read_text(errors="replace"))
-            if not results:
+            if not results and not empty_suite_accepted(
+                exec_res.exit_code, project_allows_empty_baseline(repo_path)
+            ):
                 return False, "delivery junit report contained zero testcases", []
             red = sorted(
                 t for t, r in results.items() if r.status not in ("passed", "skipped")

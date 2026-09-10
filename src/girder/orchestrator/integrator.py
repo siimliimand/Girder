@@ -30,7 +30,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from girder.config import Settings
+from girder.config import Settings, project_allows_empty_baseline
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import (
@@ -357,7 +357,13 @@ class WaveIntegrator:
         )
         await self.sandbox.start(spec)
         try:
-            return await run_suite_in_container(self.sandbox, spec.name, path, self.redactor)
+            return await run_suite_in_container(
+                self.sandbox,
+                spec.name,
+                path,
+                self.redactor,
+                allow_empty_baseline=project_allows_empty_baseline(self.repo_path),
+            )
         finally:
             with suppress(Exception):
                 await self.sandbox.kill(spec.name)

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from girder.guard.redact import Redactor
-from girder.orchestrator.baseline import parse_junit_xml
+from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
 from girder.orchestrator.task_engine import _VERIFY_TIMEOUT_S, VERIFY_CMD, VERIFY_XML
 from girder.sandbox.engine import SandboxEngine
 
@@ -31,16 +31,24 @@ async def run_suite_in_container(
     container: str,
     worktree_path: Path,
     redactor: Redactor,
+    *,
+    allow_empty_baseline: bool = False,
 ) -> SuiteResult:
-    """Run the full project suite inside *container* and parse its junit report."""
+    """Run the full project suite inside *container* and parse its junit report.
+
+    ``allow_empty_baseline`` (the target repo's ``girder.toml`` flag) lets a
+    valid "no tests collected" report count as green — same exit-code gate as
+    the baseline engine (:func:`empty_suite_accepted`)."""
     exec_res = await sandbox.exec(container, VERIFY_CMD, timeout_s=_VERIFY_TIMEOUT_S)
     xml_path = worktree_path / VERIFY_XML
-    green = exec_res.exit_code == 0 and xml_path.is_file()
+    green = (
+        exec_res.exit_code == 0 or empty_suite_accepted(exec_res.exit_code, allow_empty_baseline)
+    ) and xml_path.is_file()
     test_count = 0
     if xml_path.is_file():
         try:
             test_count = len(parse_junit_xml(xml_path.read_text()))
-            green = green and test_count > 0
+            green = green and (test_count > 0 or allow_empty_baseline)
         except Exception:
             green = False
         # Orchestrator plumbing, not task output: remove so later audits see

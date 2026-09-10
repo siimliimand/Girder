@@ -68,6 +68,7 @@ RED_XML = (
     "<failure>assert 1 == 2</failure></testcase>"
     "</testsuite>"
 )
+EMPTY_XML = '<?xml version="1.0" encoding="utf-8"?><testsuite name="pytest" tests="0"></testsuite>'
 
 
 class ScriptSandbox(LocalExecSandbox):
@@ -1121,3 +1122,42 @@ async def test_empty_diff_with_no_changes_declared_is_accepted(harness: Harness)
     assert outcome.no_changes is True
     fresh = await repo.get_task(h.db, task.id)
     assert fresh is not None and fresh.status is TaskStatus.COMPLETED
+
+
+# ------------------------------------------------------------ empty verify suite
+
+
+async def test_empty_verify_suite_is_verify_failed_by_default(harness: Harness) -> None:
+    """A test-less repo produces pytest exit 5 + a zero-testcase verify report;
+    without the repo's opt-in flag that is a verify failure (retryable)."""
+    h = harness
+    h.sandbox = ScriptSandbox(suite_results=[ExecResult(5, "", "")], suite_xml=EMPTY_XML)
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete() * 3)
+
+    await h.engine(gateway).execute_task(h.run, task)
+
+    events = await h.db.fetchall(
+        "SELECT event_type FROM agent_events WHERE run_id = ?", (h.run.id,)
+    )
+    assert any(e["event_type"] == "verify_failed" for e in events)
+
+
+async def test_allow_empty_baseline_flag_lets_empty_verify_suite_pass(harness: Harness) -> None:
+    """With allow_empty_baseline in the repo's girder.toml, the same exit-5
+    empty verify report is green and the attempt completes normally."""
+    h = harness
+    (h.repo_path / "girder.toml").write_text("[project]\nname = 'p'\nallow_empty_baseline = true\n")
+    h.sandbox = ScriptSandbox(suite_results=[ExecResult(5, "", "")], suite_xml=EMPTY_XML)
+    task = await _seed_task(h)
+    gateway = FakeGateway(responses=write_commit_complete())
+
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+
+    assert outcome.kind == "completed"
+    fresh = await repo.get_task(h.db, task.id)
+    assert fresh is not None and fresh.status is TaskStatus.COMPLETED
+    events = await h.db.fetchall(
+        "SELECT event_type FROM agent_events WHERE run_id = ?", (h.run.id,)
+    )
+    assert not any(e["event_type"] == "verify_failed" for e in events)

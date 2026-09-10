@@ -33,7 +33,7 @@ from pathlib import Path
 
 from girder.agent.runtime import AgentRuntime
 from girder.budget.guard import BudgetExceeded
-from girder.config import Settings
+from girder.config import Settings, project_allows_empty_baseline
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import (
@@ -57,7 +57,7 @@ from girder.guard.redact import Redactor, redact_and_log
 from girder.guard.scope import TaskScopes
 from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
-from girder.orchestrator.baseline import parse_junit_xml
+from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
 from girder.sandbox.engine import ContainerSpec, SandboxEngine
 from girder.specs import amendment as spec_amendment
 from girder.util import run_host_cmd, utcnow_iso
@@ -549,14 +549,17 @@ class TaskEngine:
             timeout_s=_VERIFY_TIMEOUT_S,
         )
         xml_path = worktree.path / VERIFY_XML
-        suite_green = exec_res.exit_code == 0 and xml_path.is_file()
+        allow_empty = project_allows_empty_baseline(self.repo_path)
+        suite_green = (
+            exec_res.exit_code == 0 or empty_suite_accepted(exec_res.exit_code, allow_empty)
+        ) and xml_path.is_file()
         test_results: dict[str, str] = {}
         if xml_path.is_file():
             try:
                 test_results = {
                     tid: r.status for tid, r in parse_junit_xml(xml_path.read_text()).items()
                 }
-                suite_green = suite_green and bool(test_results)
+                suite_green = suite_green and (bool(test_results) or allow_empty)
             except Exception:
                 suite_green = False
             # The report is orchestrator plumbing, not task output: remove it

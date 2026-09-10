@@ -200,6 +200,9 @@ Girder finds it by walking up from the working directory. Every key is optional;
 name = "myapp"
 stack = "python-3.12"                      # selects the girder-runner:<stack> image
 test_directories = ["tests"]
+allow_empty_baseline = false               # true ⇒ pytest "no tests collected" (exit 5)
+                                           # is a green baseline — for test-less repos;
+                                           # a crashed conftest still escalates
 test_signal_patterns = [                   # Layer-2 hash manifest coverage
   "tests/**", "**/test_*.py", "**/*_test.py", "**/conftest.py",
 ]

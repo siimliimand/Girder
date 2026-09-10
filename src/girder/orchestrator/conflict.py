@@ -35,7 +35,7 @@ from pathlib import Path
 
 from girder.agent.runtime import AgentRuntime
 from girder.budget.guard import BudgetExceeded
-from girder.config import Settings
+from girder.config import Settings, project_allows_empty_baseline
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import (
@@ -267,7 +267,11 @@ class ConflictResolver:
 
             # Mandatory gate 1: FULL suite re-test (plan.md Phase 4 task 5).
             suite = await run_suite_in_container(
-                self.sandbox, spec.name, path, self.redactor
+                self.sandbox,
+                spec.name,
+                path,
+                self.redactor,
+                allow_empty_baseline=project_allows_empty_baseline(self.repo_path),
             )
             if not suite.green:
                 await self._close_failed(attempt, f"suite red after resolution: {suite.tail}")

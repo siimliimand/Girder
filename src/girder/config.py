@@ -52,6 +52,28 @@ class ProjectConfig(BaseModel):
     strict_read_scope: bool = False
 
 
+def project_allows_empty_baseline(repo_path: Path | str) -> bool:
+    """Per-project ``allow_empty_baseline`` from the *target repo's* girder.toml.
+
+    The daemon's global :class:`Settings` describe the deployment; whether a
+    repo has a test suite at all is a property of that repo, so the flag is
+    read from the registered repo root (README: "girder.toml — per project, at
+    the repo root"). Strict by §9 rails: a malformed file or a non-boolean
+    value is a hard error — config problems escalate, they never silently
+    default.
+    """
+    path = Path(repo_path) / "girder.toml"
+    if not path.is_file():
+        return False
+    data = tomllib.loads(path.read_text())
+    value = data.get("project", {}).get("allow_empty_baseline", False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{path}: [project] allow_empty_baseline must be a boolean (got {value!r})"
+        )
+    return value
+
+
 class AutonomyConfig(BaseModel):
     """Autonomy tiers per plan.md §2.3 — every project starts at T0."""
 

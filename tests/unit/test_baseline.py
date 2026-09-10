@@ -500,3 +500,104 @@ async def test_output_tail_redacted(
     tail = outcome.output_tail_redacted or ""
     assert "AKIAIOSFODNN7EXAMPLE" not in tail
     assert "REDACTED" in tail
+
+
+# ---------------------------------------------------- allow_empty_baseline flag
+
+
+def set_flag(repo_dir: Path, body: str = "allow_empty_baseline = true\n") -> None:
+    """Write the per-project opt-in into the registered repo's girder.toml."""
+    (Path(repo_dir) / "girder.toml").write_text(f"[project]\nname = 'proj'\n{body}")
+
+
+async def test_zero_testcase_suite_is_infra_error_by_default(
+    db: Database,
+    seeded: tuple[Project, Run, str],
+    spy_worktree: None,
+    worktree_holder: list[Path],
+) -> None:
+    """pytest 'no tests collected' (exit 5, empty junit) without the opt-in
+    stays an infra error — the pre-flag behavior is pinned."""
+    project, run, sha = seeded
+    sandbox = FakeSandbox([suite_effect(worktree_holder, junit([]), exit_code=5)])
+    runner = make_runner(db, sandbox)
+
+    outcome = await run_baseline(runner, project, run, sha)
+
+    assert outcome.infra_error is not None
+    assert "zero testcases" in outcome.infra_error
+    assert outcome.baseline_run_id == ""
+
+
+async def test_allow_empty_baseline_accepts_exit_5(
+    db: Database,
+    seeded: tuple[Project, Run, str],
+    spy_worktree: None,
+    worktree_holder: list[Path],
+) -> None:
+    """Flag set + clean empty collection ⇒ a green zero-test baseline."""
+    project, run, sha = seeded
+    set_flag(project.repo_path)
+    sandbox = FakeSandbox([suite_effect(worktree_holder, junit([]), exit_code=5)])
+    runner = make_runner(db, sandbox)
+
+    outcome = await run_baseline(runner, project, run, sha)
+
+    assert outcome.infra_error is None
+    assert outcome.broken is False
+    assert outcome.baseline_run_id != ""
+    assert outcome.total == 0 and outcome.passed == 0 and outcome.failed == 0
+
+
+async def test_allow_empty_baseline_still_rejects_broken_collection(
+    db: Database,
+    seeded: tuple[Project, Run, str],
+    spy_worktree: None,
+    worktree_holder: list[Path],
+) -> None:
+    """Flag set but pytest exits 2 (collection crashed) ⇒ infra error — the
+    exit-code gate catches genuinely broken setups even with the opt-in."""
+    project, run, sha = seeded
+    set_flag(project.repo_path)
+    sandbox = FakeSandbox([suite_effect(worktree_holder, junit([]), exit_code=2)])
+    runner = make_runner(db, sandbox)
+
+    outcome = await run_baseline(runner, project, run, sha)
+
+    assert outcome.infra_error is not None
+    assert "zero testcases" in outcome.infra_error
+
+
+async def test_allow_empty_baseline_non_bool_is_infra_error(
+    db: Database,
+    seeded: tuple[Project, Run, str],
+    spy_worktree: None,
+    worktree_holder: list[Path],
+) -> None:
+    project, run, sha = seeded
+    set_flag(project.repo_path, body="allow_empty_baseline = 'yes'\n")
+    sandbox = FakeSandbox([suite_effect(worktree_holder, junit([]), exit_code=5)])
+    runner = make_runner(db, sandbox)
+
+    outcome = await run_baseline(runner, project, run, sha)
+
+    assert outcome.infra_error is not None
+    assert "boolean" in outcome.infra_error
+
+
+async def test_malformed_repo_toml_is_infra_error(
+    db: Database,
+    seeded: tuple[Project, Run, str],
+    spy_worktree: None,
+    worktree_holder: list[Path],
+) -> None:
+    """A girder.toml that exists but doesn't parse escalates loudly instead of
+    silently defaulting the flag (§9: config errors are never tolerated)."""
+    project, run, sha = seeded
+    (Path(project.repo_path) / "girder.toml").write_text("[project\nbroken")
+    sandbox = FakeSandbox([suite_effect(worktree_holder, junit([]), exit_code=5)])
+    runner = make_runner(db, sandbox)
+
+    outcome = await run_baseline(runner, project, run, sha)
+
+    assert outcome.infra_error is not None

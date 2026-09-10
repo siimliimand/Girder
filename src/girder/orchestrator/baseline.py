@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from girder.config import Settings
+from girder.config import Settings, project_allows_empty_baseline
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import Project, Run
@@ -31,6 +31,19 @@ log = logging.getLogger(__name__)
 SUITE_XML = ".girder-baseline.xml"
 RERUN_XML = ".girder-rerun.xml"
 _TAIL_CHARS = 2000
+
+# pytest ExitCode.NO_TESTS_COLLECTED — "no tests ran", with a valid (empty)
+# junit report. Distinguishes a legitimately test-less repo from a broken one.
+PYTEST_NO_TESTS_COLLECTED = 5
+
+
+def empty_suite_accepted(exit_code: int, allow_empty: bool) -> bool:
+    """A zero-testcase junit report counts as green only when the repo opts in
+    via ``allow_empty_baseline`` *and* pytest itself reports a clean run with
+    nothing collected (exit 0/5). A crashed conftest or a collection error
+    exits differently and stays an infra error even with the flag set."""
+    return allow_empty and exit_code in (0, PYTEST_NO_TESTS_COLLECTED)
+
 
 # JUnit failure/child element -> normalized status.
 _CHILD_STATUS = {"failure": "failed", "error": "error", "skipped": "skipped"}
@@ -191,7 +204,7 @@ class BaselineRunner:
                     pids_limit=self.settings.sandbox.pids_limit,
                 )
             )
-            return await self._run_suite(project, run, base_commit, container, worktree)
+            return await self._run_suite(project, run, base_commit, container, worktree, repo_path)
         except SandboxTimeout as exc:
             return await self._infra(project, run, base_commit, f"sandbox timeout: {exc}")
         except Exception as exc:  # any failure ⇒ baseline unavailable, caller escalates
@@ -206,7 +219,13 @@ class BaselineRunner:
     # ------------------------------------------------------------------ phases
 
     async def _run_suite(
-        self, project: Project, run: Run, base_commit: str, container: str, worktree: Path
+        self,
+        project: Project,
+        run: Run,
+        base_commit: str,
+        container: str,
+        worktree: Path,
+        repo_path: Path,
     ) -> BaselineOutcome:
         exec_res = await self.sandbox.exec(
             container, self.suite_cmd, timeout_s=float(self.settings.limits.attempt_wallclock_s)
@@ -230,7 +249,9 @@ class BaselineRunner:
                 project, run, base_commit, "junit report missing after successful suite"
             )
         results = parse_junit_xml(suite_xml.read_text(errors="replace"))
-        if not results:
+        if not results and not empty_suite_accepted(
+            exec_res.exit_code, project_allows_empty_baseline(repo_path)
+        ):
             return await self._infra(
                 project, run, base_commit, "junit report contained zero testcases", exec_res.stderr
             )

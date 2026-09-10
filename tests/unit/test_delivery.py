@@ -32,9 +32,11 @@ from girder.fsm import transition_run
 from girder.github.client import GitHubClient
 from girder.github.delivery import DeliveryEngine
 from girder.guard.redact import Redactor
+from girder.sandbox.engine import ExecResult
 from girder.util import run_host_cmd
 from tests.conftest import seed_run_status
 from tests.unit.test_task_engine import (
+    EMPTY_XML,
     GREEN_XML,
     RED_XML,
     FakeGateway,
@@ -846,3 +848,37 @@ async def test_t0_merge_pending_poll_is_throttled(dh: DHarness) -> None:
     d._last_merge_poll[run.id] -= 31.0
     await d.pump(run)
     assert get_pr_calls() == first + 1
+
+
+# ---------------------------------------------------- allow_empty_baseline flag
+
+
+@pytest.mark.parametrize("dh", [0], indirect=True)
+async def test_allow_empty_baseline_lets_test_less_delivery_go_green(dh: DHarness) -> None:
+    """allow_empty_baseline: pytest exit 5 + a zero-testcase delivery report is
+    green — a test-less repo proceeds on conformance review alone."""
+    (dh.repo_path / "girder.toml").write_text(
+        "[project]\nname = 'p'\nallow_empty_baseline = true\n"
+    )
+    dh.sandbox = ScriptSandbox(suite_results=[ExecResult(5, "", "")], suite_xml=EMPTY_XML)
+    gateway = FakeGateway(responses=[_resp(content=GOOD_VERDICT)])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+
+    status = await _drive(d, dh.run.id)
+
+    assert status == "merge_pending_human"
+
+
+@pytest.mark.parametrize("dh", [0], indirect=True)
+async def test_zero_testcase_delivery_suite_fails_without_flag(dh: DHarness) -> None:
+    """Without the repo opt-in the zero-testcase delivery report stays a
+    delivery failure (pre-flag behavior, pinned)."""
+    dh.sandbox = ScriptSandbox(suite_results=[ExecResult(5, "", "")], suite_xml=EMPTY_XML)
+    d = dh.delivery(FakeGateway(responses=[]))
+    descriptor = await d.enter_delivery(dh.run)
+    assert descriptor == "failed"
+    fresh = await repo.get_run(dh.db, dh.run.id)
+    assert fresh is not None and fresh.status is RunStatus.FAILED
+    event = await repo.get_latest_event(dh.db, dh.run.id, "delivery_suite")
+    assert event is not None and event["payload"]["green"] is False
