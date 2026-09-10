@@ -230,7 +230,12 @@ async def harness(db: Database, tmp_path: Path) -> AsyncIterator[Harness]:
     settings = Settings(
         project=ProjectConfig(test_directories=["tests"]),
         limits=LimitsConfig(
-            task_max_attempts=2, attempt_max_turns=6, attempt_wallclock_s=60
+            task_max_attempts=2,
+            attempt_max_turns=6,
+            attempt_wallclock_s=60,
+            # WP 8.1 planning phase is exercised in its own tests; the
+            # pre-existing engine tests script write-tool turns.
+            planning_turns=0,
         ),
         sandbox=SandboxNetwork(cache_dir=str(tmp_path / "pkg-cache")),
     )
@@ -1044,6 +1049,45 @@ async def test_turn_cap_salvages_dirty_worktree_for_retry(harness: Harness) -> N
     assert attempts[0]["turns_used"] == 2
 
 
+async def test_turn_cap_retry_carries_structured_brief(harness: Harness) -> None:
+    """WP 8.3: a turn-cap death schedules the retry with the structured
+    [TRUSTED] retry brief alongside the existing feedback line — failure
+    reason, turn spend, salvage reference, closing directive — and the brief
+    doubles as the retry's scratchpad prior_attempt_summary."""
+    h = harness
+    h.settings.limits.attempt_max_turns = 2
+    task = await _seed_task(h)
+    gateway = FakeGateway(
+        responses=[
+            _resp(
+                calls=[
+                    _tc(
+                        "1",
+                        "write_file",
+                        '{"path":"src/app.py","content":"def greet():\\n    return 1\\n"}',
+                    )
+                ]
+            ),
+            _resp(calls=[_tc("2", "read_file", '{"path":"src/app.py"}')]),
+            # attempt 2: finish immediately
+            _resp(
+                calls=[_tc("1", "run_command", '{"cmd":"git add -A && git commit -m work"}')]
+            ),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+    second_user = next(
+        m for m in gateway.calls[2] if getattr(m, "role", "") == "user"
+    )
+    assert "[TRUSTED] Retry brief (attempt 1 failed):" in second_user.content
+    assert "turn budget exhausted" in second_user.content  # failure reason
+    assert "Turns used: 2 of 2" in second_user.content
+    assert "Continue from the salvaged state." in second_user.content
+    assert "Previous attempt failed:" in second_user.content  # old line kept
+
+
 async def test_turn_cap_clean_worktree_gets_no_salvage(harness: Harness) -> None:
     """Group B: a clean worktree at the turn cap yields no salvage commit and
     unchanged guidance."""
@@ -1059,7 +1103,11 @@ async def test_turn_cap_clean_worktree_gets_no_salvage(harness: Harness) -> None
     assert "wip(attempt" not in subjects
     second_user = next(m for m in gateway.calls[6] if getattr(m, "role", "") == "user")
     assert "Previous attempt failed" in second_user.content
-    assert "salvaged" not in second_user.content
+    # no salvage commit reference (the WP 8.3 brief's generic closing line may
+    # still mention the salvaged state even when nothing was saved)
+    assert "salvaged as commit" not in second_user.content
+    assert "Files with changes" not in second_user.content
+    assert "No changes were saved from the previous attempt." in second_user.content
 
 
 async def test_integrity_violation_dirty_worktree_still_force_pruned(harness: Harness) -> None:

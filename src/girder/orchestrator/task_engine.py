@@ -18,15 +18,18 @@ here, so this module remains the only import surface.
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from girder.budget.guard import BudgetExceeded
 from girder.config import Settings
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.models import (
+    Attempt,
     Project,
     Run,
     Task,
@@ -103,6 +106,62 @@ def _kind_of(status: TaskStatus) -> str:
     }.get(status, "failed")
 
 
+def _build_retry_brief(
+    prev_attempt: Attempt,
+    prev_failure_reason: str | None,
+    prev_violations: list[dict[str, Any]],
+    turns_used: int,
+    turn_budget: int,
+    salvage: tuple[str, list[str]] | None,
+) -> str:
+    """WP 8.3: a structured, trusted retry brief for attempt N+1.
+
+    Surfaces what the orchestrator already knows about the dead attempt —
+    failure reason, turns spent, what was salvaged (Group B), scope
+    violations — instead of the old one-liner. The salvage machinery itself
+    lives in ``work_salvage``; this only *reports* it.
+    """
+    lines = [f"[TRUSTED] Retry brief (attempt {prev_attempt.attempt_num} failed):"]
+    lines.append(f"- Failure reason: {prev_failure_reason or 'turn budget exhausted'}")
+    lines.append(f"- Turns used: {turns_used} of {turn_budget}")
+    if salvage is not None:
+        sha, files = salvage
+        lines.append(f"- Files with changes: {', '.join(files) or 'none'}")
+        lines.append(f"- Salvaged work is committed to the task branch as {sha} — do not redo it.")
+    else:
+        lines.append("- No changes were saved from the previous attempt.")
+    if prev_violations:
+        lines.append("- Scope violations (tool calls that were blocked):")
+        for v in prev_violations[:3]:
+            raw_detail = v.get("detail")
+            detail: dict[Any, Any] = raw_detail if isinstance(raw_detail, dict) else {}
+            tool = detail.get("tool", "?")
+            path = "?"
+            args = detail.get("args")
+            if isinstance(args, dict):
+                path = str(args.get("path") or args.get("glob") or "?")
+            lines.append(f"    {v.get('kind', '?')}: {tool} on {path}")
+    lines.append("")
+    lines.append("Continue from the salvaged state. Do not re-explore already-read files.")
+    return "\n".join(lines)
+
+
+async def _violations_for_attempt(db: Database, attempt_id: str) -> list[dict[str, Any]]:
+    """The integrity ledger rows for one attempt, shaped for the retry brief."""
+    rows = await db.fetchall(
+        "SELECT kind, detail_json FROM integrity_violations WHERE attempt_id = ? ORDER BY id",
+        (attempt_id,),
+    )
+    violations: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            detail = json.loads(r["detail_json"])
+        except (TypeError, ValueError):
+            detail = {}
+        violations.append({"kind": r["kind"], "detail": detail})
+    return violations
+
+
 class TaskEngine:
     def __init__(
         self,
@@ -166,6 +225,7 @@ class TaskEngine:
         max_attempts = self.settings.limits.task_max_attempts
         steering_guidance = await standing_guidance(self, run, task)
         guidance: str | None = None
+        retry_brief: str | None = None
         branch_ops = BranchOps(self.repo_path)
 
         def _effective_guidance() -> str | None:
@@ -228,6 +288,7 @@ class TaskEngine:
                             self.settings.limits,
                         ),
                         deadline_s=deadline,
+                        prior_attempt_summary=retry_brief,
                     )
                     # Verify (+ merge unless deferred) while the container
                     # is still alive (the finally below tears it down).
@@ -298,6 +359,7 @@ class TaskEngine:
                     raise RuntimeError("succeeded outcome without a verify step")
                 if step.kind == "retry":
                     guidance = f"Previous attempt failed verification: {step.detail}"
+                    retry_brief = guidance
                     if step.salvage is not None:
                         guidance = salvage_guidance(
                             attempt.attempt_num,
@@ -324,6 +386,18 @@ class TaskEngine:
             if next_guidance is None:
                 return TaskOutcome("failed", tail)
             guidance = f"Previous attempt {outcome.status}: {tail}"
+            # WP 8.3: the structured retry brief rides alongside the existing
+            # one-liner (nothing dropped) and doubles as the new attempt's
+            # scratchpad prior_attempt_summary.
+            retry_brief = _build_retry_brief(
+                prev_attempt=attempt,
+                prev_failure_reason=tail,
+                prev_violations=await _violations_for_attempt(self.db, attempt.id),
+                turns_used=outcome.turns_used,
+                turn_budget=self.settings.limits.attempt_max_turns,
+                salvage=salvage,
+            )
+            guidance = f"{guidance}\n\n{retry_brief}"
             if salvage is not None:
                 guidance = salvage_guidance(
                     attempt.attempt_num,
