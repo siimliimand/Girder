@@ -194,9 +194,17 @@ def _ctx(tmp_path: Path, settings: Settings | None, **kw: object) -> SimpleNames
 
 
 def test_validate_bad_stack(tmp_path: Path) -> None:
+    # Settings itself now rejects unknown stacks (STACK_REGISTRY validation in
+    # load_settings), so build the shape validate must diagnose directly.
+    settings = SimpleNamespace(
+        models=SimpleNamespace(roles=[
+            SimpleNamespace(role="tier1", model="m1", provider="anthropic",
+                            price_in_per_mtok=1.0, price_out_per_mtok=2.0),
+        ]),
+        project=SimpleNamespace(stack="ruby-3.4", test_directories=["tests"]),
+    )
     failures = collect_validation_failures(
-        _ctx(tmp_path, _settings(project={"stack": "ruby-3.4", "test_directories": ["tests"]}),
-             stack="ruby-3.4"),
+        _ctx(tmp_path, settings, stack="ruby-3.4"),  # type: ignore[arg-type]
         check_sandbox=False,
     )
     assert any("project.stack" in f and "ruby-3.4" in f for f in failures)
@@ -282,20 +290,43 @@ def test_validate_missing_test_directory(tmp_path: Path) -> None:
 
 
 def test_validate_collects_all_failures_not_just_first(tmp_path: Path) -> None:
-    settings = Settings.model_validate(
-        {
-            "project": {"stack": "ruby-3.4", "test_directories": ["tests"]},
-            "models": {"roles": []},
-        }
+    # Settings' own STACK_REGISTRY validator refuses a bad stack (and its role
+    # validator refuses an empty registry), so build the shape validate must
+    # diagnose directly.
+    settings = SimpleNamespace(
+        models=SimpleNamespace(roles=[]),
+        project=SimpleNamespace(stack="ruby-3.4", test_directories=["tests"]),
     )
     failures = collect_validation_failures(
-        _ctx(tmp_path, settings, stack="ruby-3.4", secrets_error="bad toml"),
+        _ctx(tmp_path, settings, stack="ruby-3.4", secrets_error="bad toml"),  # type: ignore[arg-type]
         check_sandbox=False,
     )
     assert len(failures) >= 3  # empty roles + bad stack + secrets error + more
     assert any("tier" in f for f in failures)
     assert any("project.stack" in f for f in failures)
     assert any("bad toml" in f for f in failures)
+
+
+def test_validate_config_load_failure_still_collects_other_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # load_settings() rejects an unknown stack up front; validate must report
+    # that as one failure AND keep running the settings-independent checks.
+    config = tmp_path / "girder.toml"
+    config.write_text('project.stack = "ruby-3.4"\n')
+    monkeypatch.setattr("girder.cli.load_settings", lambda _p=None: (_ for _ in ()).throw(
+        ValueError("project.stack 'ruby-3.4' is not a known stack")))
+    secrets_file = tmp_path / "secrets.toml"
+    secrets_file.write_text("[models]\n")
+    os.chmod(secrets_file, 0o644)
+    monkeypatch.setattr("girder.cli.DEFAULT_SECRETS_PATH", secrets_file)
+
+    from girder.cli import _gather_validation_context
+
+    ctx = _gather_validation_context(config)
+    failures = collect_validation_failures(ctx, check_sandbox=False)
+    assert any("ruby-3.4" in f for f in failures)  # config error names the stack
+    assert any("chmod 600" in f for f in failures)  # secrets mode still checked
 
 
 async def test_cmd_validate_exit_codes(
