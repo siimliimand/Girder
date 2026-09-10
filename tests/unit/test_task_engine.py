@@ -507,6 +507,9 @@ async def test_amendment_reject_guidance_reaches_resumed_attempt(harness: Harnes
 
 async def test_no_rejected_amendment_means_no_synthetic_guidance(harness: Harness) -> None:
     h = harness
+    # WP 8.4 codebase index also rides the guidance channel; off here so this
+    # test keeps asserting purely about synthetic steering directives.
+    h.settings.limits.inject_index = False
     task = await _seed_task(h)
     gateway = FakeGateway(responses=write_commit_complete())
     h.sandbox = ScriptSandbox(suite_results=[ExecResult(0, "", "")], suite_xml=GREEN_XML)
