@@ -15,6 +15,30 @@
 <div id="run-panel">
   {% include "_run_panel.html" %}
 </div>
+<script>
+{# Panel freshness: while the fragment carries data-poll="true" (spec_pending,
+   no proposal, no generation failure — routes._panel_context), re-fetch it
+   every 2s so the proposal appears without a manual reload. Stops on the
+   first swap that no longer carries the attribute. #}
+(function () {
+  var el = document.getElementById("run-panel");
+  var timer = null;
+  function tick() {
+    fetch("/runs/{{ run.id }}/panel")
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        el.innerHTML = html;
+        if (html.indexOf('data-poll="true"') === -1 && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      });
+  }
+  if (document.querySelector('[data-poll="true"]') && !timer) {
+    timer = setInterval(tick, 2000);
+  }
+})();
+</script>
 
 <h2>Spend (WP 6.3)</h2>
 <div class="spend">

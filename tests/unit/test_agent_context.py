@@ -117,6 +117,18 @@ def test_system_prompt_carries_invariants() -> None:
     assert "request_spec_amendment" in prompt
 
 
+def test_system_prompt_carries_orientation() -> None:
+    """The agent must know where it is: without this block a model that never
+    saw the container layout burns held calls probing for the host repo
+    (dogfood run 7725f897, 7 scope violations in one attempt)."""
+    prompt = build_system_prompt(task=_task(), spec_slice="slice")
+    assert "ORIENTATION" in prompt
+    assert "/workspace" in prompt
+    assert "host filesystem does not exist" in prompt
+    assert "path escape" in prompt
+    assert ".git is protected" in prompt
+
+
 def test_system_prompt_states_turn_budget_when_given() -> None:
     prompt = build_system_prompt(task=_task(), spec_slice="slice", turn_budget=60)
     assert "WORKING METHOD" in prompt
