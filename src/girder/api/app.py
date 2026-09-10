@@ -109,9 +109,14 @@ def create_app(
         name="static",
     )
 
+    from girder.api.metrics import router as metrics_router
     from girder.api.routes import router
 
     app.include_router(router)
+    # /metrics (WP 12.3) is registered here rather than in routes.py: the
+    # console router is a contention point for parallel workstreams, and the
+    # metrics endpoint is an operational side-channel, not console surface.
+    app.include_router(metrics_router)
     return app
 
 
