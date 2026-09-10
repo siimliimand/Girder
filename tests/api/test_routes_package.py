@@ -50,6 +50,8 @@ PRE_SPLIT_ROUTES: set[tuple[tuple[str, ...], str]] = {
     (("POST",), "/api/runs/{rid}/regenerate"),
     (("POST",), "/api/runs/{rid}/reviewed"),
     (("POST",), "/api/runs/{rid}/steer"),
+    # Post-split additions (registered in app.py, not routes/):
+    (("GET",), "/metrics"),  # WP 12.3 — operational side-channel (WS-09)
 }
 
 
