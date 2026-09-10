@@ -11,7 +11,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import (
@@ -39,7 +39,9 @@ from girder.fsm import transition_run
 from girder.guard.redact import Redactor
 from girder.specs.amendment import AmendmentError, resolve_amendment
 from girder.specs.freeze import FreezeError, approve_and_freeze
+from girder.specs.generator import SpecGenerationError, _intent_with_clarification
 from girder.specs.validator import OPENSPEC_TEMPLATE, SpecValidationError, parse_spec
+from girder.util import new_id, utcnow_iso
 
 router = APIRouter()
 
@@ -280,7 +282,7 @@ async def _review_window_state(
 
 @router.post("/api/projects/{pid}/runs", response_model=None)
 async def create_run(
-    request: Request, pid: str, intent: str = Form(...)
+    request: Request, pid: str, intent: str = Form(...), clarify: bool = False
 ) -> RedirectResponse | HTMLResponse:
     app = request.app
     db: Database = app.state.db
@@ -317,9 +319,142 @@ async def create_run(
         db, pid, intent, branch="pending", budget_cap_usd=settings.budget.run_cap_usd
     )
     await repo.update_run_fields(db, run.id, branch=f"run/{run.id[:8]}")
+    # §8.5: clarify=true (or [specs] require_clarification) parks the run in
+    # CLARIFYING with generated questions instead of generating a spec now.
+    # With the flag off everywhere this branch is unreachable — the default
+    # flow is byte-for-byte unchanged.
+    if clarify or settings.specs.require_clarification:
+        return await _start_clarification(request, app, project, run)
     await transition_run(db, run.id, RunStatus.SPEC_PENDING, reason="spec_generation_dispatched")
     dispatch_generation(app, run.id, None)
     return RedirectResponse(f"/runs/{run.id}", status_code=303)
+
+
+# ------------------------------------------- intent clarification (WS-04, §8.5)
+# Additive section: the default flow above is untouched when clarify is
+# unset and [specs] require_clarification is false.
+#
+# NOTE (coordination): clarification-session SQL lives here as private
+# helpers because db/repo.py is outside WS-04's wave-1 file ownership; move
+# these into girder.db.repo at merge time if preferred.
+
+
+async def _insert_clarification_session(db: Database, run_id: str, questions: list[str]) -> None:
+    async with db.tx() as conn:
+        await conn.execute(
+            "INSERT INTO clarification_sessions (id, run_id, questions_json, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (new_id(), run_id, json.dumps(questions), utcnow_iso()),
+        )
+
+
+async def _latest_open_session(db: Database, run_id: str) -> Any | None:
+    return await db.fetchone(
+        "SELECT * FROM clarification_sessions"
+        " WHERE run_id = ? AND answers_json IS NULL ORDER BY rowid DESC LIMIT 1",
+        (run_id,),
+    )
+
+
+async def _start_clarification(
+    request: Request, app: Any, project: Project, run: Run
+) -> RedirectResponse | HTMLResponse:
+    """Park *run* in CLARIFYING with generated questions (§8.5)."""
+    db: Database = app.state.db
+    await transition_run(db, run.id, RunStatus.CLARIFYING, reason="clarification_requested")
+    try:
+        generator = app.state.create_spec_generator()
+        questions = await generator.generate_clarification_questions(run=run)
+    except SpecGenerationError as exc:
+        await repo.insert_event(
+            db,
+            "clarification_failed",
+            {"error": "; ".join(exc.errors)[:2000]},
+            run_id=run.id,
+        )
+        return render(
+            request,
+            "project.html",
+            {
+                "project": project,
+                "runs": await repo.list_runs_for_project(db, project.id),
+                "error": "clarification failed: " + "; ".join(exc.errors)[:500],
+            },
+            status_code=502,
+        )
+    await _insert_clarification_session(db, run.id, questions)
+    await repo.insert_event(
+        db, "clarification_requested", {"questions": len(questions)}, run_id=run.id
+    )
+    return RedirectResponse(f"/runs/{run.id}/clarify", status_code=303)
+
+
+@router.get("/runs/{rid}/clarify", response_class=HTMLResponse, response_model=None)
+async def clarify_page(request: Request, rid: str) -> HTMLResponse | RedirectResponse:
+    db: Database = request.app.state.db
+    run = await _require_run(db, rid)
+    session = await _latest_open_session(db, rid)
+    if run.status != RunStatus.CLARIFYING or session is None:
+        return RedirectResponse(f"/runs/{rid}", status_code=303)
+    questions: list[str] = json.loads(str(session["questions_json"]))
+    return render(request, "clarify.html", {"run": run, "questions": questions})
+
+
+@router.post("/api/runs/{rid}/clarify", response_model=None)
+async def submit_clarification(
+    request: Request, rid: str, answers: Annotated[list[str], Form(...)]
+) -> HTMLResponse | RedirectResponse:
+    app = request.app
+    db: Database = app.state.db
+    run = await _require_run(db, rid)
+    base = await _run_context(db, rid, redactor=app.state.redactor)
+    session = await _latest_open_session(db, rid)
+    if run.status != RunStatus.CLARIFYING or session is None:
+        return render(
+            request,
+            "_run_panel.html",
+            _panel_context(
+                run,
+                {**base, "errors": [f"cannot answer clarification: run is {run.status.value}"]},
+            ),
+            status_code=409,
+        )
+    questions: list[str] = json.loads(str(session["questions_json"]))
+    stripped = [a.strip() for a in answers]
+    if len(stripped) != len(questions) or any(not a for a in stripped):
+        return render(
+            request,
+            "clarify.html",
+            {
+                "run": run,
+                "questions": questions,
+                "answers": stripped,
+                "error": "Every question needs a non-empty answer.",
+            },
+            status_code=400,
+        )
+    clarification = dict(zip(questions, stripped, strict=True))
+    async with db.tx() as conn:
+        await conn.execute(
+            "UPDATE clarification_sessions SET answers_json = ? WHERE id = ?",
+            (json.dumps(stripped), session["id"]),
+        )
+    # Enrich the persisted intent with the answers so the dispatched
+    # generation (which reads run.intent) sees the full picture; the
+    # generator applies the same enrichment when given a clarification map.
+    enriched = _intent_with_clarification(run.intent, clarification)
+    # (Direct SQL: runs.intent is not in _RUN_WRITABLE_FIELDS, and db/repo.py
+    # is outside WS-04's wave-1 ownership — see the section note above.)
+    async with db.tx() as conn:
+        await conn.execute(
+            "UPDATE runs SET intent = ?, updated_at = ? WHERE id = ?",
+            (enriched, utcnow_iso(), rid),
+        )
+    await transition_run(db, rid, RunStatus.DRAFT, reason="clarification_answered")
+    await transition_run(db, rid, RunStatus.SPEC_PENDING, reason="spec_generation_dispatched")
+    await repo.insert_event(db, "clarification_answered", {"questions": len(questions)}, run_id=rid)
+    dispatch_generation(app, rid, None)
+    return RedirectResponse(f"/runs/{rid}", status_code=303)
 
 
 @router.get("/runs/{rid}", response_class=HTMLResponse)
@@ -545,9 +680,7 @@ async def _project_timestamps(db: Database, project_id: str) -> dict[str, Any]:
 async def projects_json(request: Request) -> JSONResponse:
     db: Database = request.app.state.db
     projects = await repo.list_projects(db)
-    return JSONResponse(
-        [_project_json(p, await _project_timestamps(db, p.id)) for p in projects]
-    )
+    return JSONResponse([_project_json(p, await _project_timestamps(db, p.id)) for p in projects])
 
 
 @router.get("/api/projects/{pid}")
@@ -756,8 +889,7 @@ async def run_events(
                         "payload": payload,
                     }
                     yield (
-                        f"event: {_event_class(row['event_type'])}\n"
-                        f"data: {json.dumps(data)}\n\n"
+                        f"event: {_event_class(row['event_type'])}\ndata: {json.dumps(data)}\n\n"
                     )
                 run = await repo.get_run(db, rid)
                 if run is not None and run.status in _STREAM_END_STATUSES:
@@ -1058,9 +1190,7 @@ async def merge_run(request: Request, rid: str) -> HTMLResponse | RedirectRespon
     if run.status != RunStatus.MERGE_PENDING_HUMAN:
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"cannot merge: run status is {run.status.value}, not merge_pending_human"
-            ),
+            detail=(f"cannot merge: run status is {run.status.value}, not merge_pending_human"),
         )
     fresh = await repo.get_run(db, rid)
     if fresh is None:  # pragma: no cover - _require_run already loaded it
@@ -1069,8 +1199,7 @@ async def merge_run(request: Request, rid: str) -> HTMLResponse | RedirectRespon
         raise HTTPException(
             status_code=409,
             detail=(
-                f"merge gate: {fresh.integrity_violations} integrity violation(s) — "
-                "merge blocked"
+                f"merge gate: {fresh.integrity_violations} integrity violation(s) — merge blocked"
             ),
         )
     if fresh.pr_number is None:
@@ -1100,11 +1229,7 @@ async def merge_run(request: Request, rid: str) -> HTMLResponse | RedirectRespon
 
 async def _tier_context(db: Database, request: Request, project: Project) -> dict[str, Any]:
     settings = request.app.state.settings
-    queue = [
-        q
-        for q in await _merge_queue(db)
-        if q["project_id"] == project.id
-    ]
+    queue = [q for q in await _merge_queue(db) if q["project_id"] == project.id]
     return {
         "project": project,
         "queue": queue,
@@ -1139,8 +1264,10 @@ async def set_tier(
         return render(
             request,
             "tier.html",
-            {**await _tier_context(db, request, project),
-             "error": f"invalid tier {tier!r}: must be 0, 1 or 2."},
+            {
+                **await _tier_context(db, request, project),
+                "error": f"invalid tier {tier!r}: must be 0, 1 or 2.",
+            },
             status_code=400,
         )
     current = project.autonomy_tier
@@ -1236,9 +1363,7 @@ async def postmortem(request: Request, rid: str) -> HTMLResponse:
                     "held": bool(c["held"]),
                     "verdict": c.get("verdict"),
                     "input_json": _redact(redactor, c["input_json"]),
-                    "output_excerpt": _redact(
-                        redactor, _excerpt(c["output_blob_redacted"])
-                    ),
+                    "output_excerpt": _redact(redactor, _excerpt(c["output_blob_redacted"])),
                 }
                 for c in await repo.list_tool_calls_for_attempt(db, a.id)
             ]
@@ -1262,9 +1387,7 @@ async def postmortem(request: Request, rid: str) -> HTMLResponse:
                         {
                             "ts": e["ts"],
                             "event_type": e["event_type"],
-                            "payload": _redact_value(
-                                redactor, json.loads(e["payload_json"])
-                            ),
+                            "payload": _redact_value(redactor, json.loads(e["payload_json"])),
                         }
                         for e in events
                         if e["attempt_id"] == a.id
