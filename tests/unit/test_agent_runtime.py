@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from girder.agent.runtime import AgentRuntime
+from girder.agent.tools import TOOL_SCHEMAS
 from girder.config import LimitsConfig
 from girder.db import repo
 from girder.db.engine import Database
@@ -307,7 +308,7 @@ async def test_guidance_and_schema_reach_the_gateway(
     role, messages, tools, seen_run, seen_attempt = gateway.calls[0]
     assert role == "tier2"
     assert seen_run == run_id and seen_attempt == attempt.id
-    assert tools is not None and len(tools) == 9
+    assert tools is not None and len(tools) == len(TOOL_SCHEMAS)
     assert "[TRUSTED] Steering directive (user-authored):" in messages[1].content
     assert "slice-text" in messages[1].content
     # system message carries the untrusted-content framing rule
