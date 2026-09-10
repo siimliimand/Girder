@@ -177,6 +177,9 @@ class Task:
     test_content_hash: str | None = None
     attempts_used: int = 0
     depends_on: list[str] = field(default_factory=list)
+    # WP 8.4 codebase index ("RAG Lite"): JSON blob of the attempt worktree's
+    # structural index, rebuilt every attempt (R-SP8-4); NULL when disabled.
+    codebase_index_json: str | None = None
 
 
 @dataclass
