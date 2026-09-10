@@ -243,7 +243,10 @@ class RunEngine:
         await transition_run(self.db, run.id, RunStatus.ACTIVE,
                             payload={"reason": "budget cap raised"})
         fresh = await repo.get_run(self.db, run.id)
-        assert fresh is not None
+        if fresh is None:
+            raise RuntimeError(
+                f"run {run.id} disappeared during pump — database consistency error"
+            )
         return await self._pump_active(fresh)
 
     async def run_to_completion(
@@ -339,7 +342,10 @@ class RunEngine:
         tasks = await repo.list_tasks_for_run(self.db, run.id)
         if not tasks:
             fresh = await repo.get_run(self.db, run.id)
-            assert fresh is not None
+            if fresh is None:
+                raise RuntimeError(
+                    f"run {run.id} disappeared during pump — database consistency error"
+                )
             if not await self._decompose(fresh):
                 return "failed"
             tasks = await repo.list_tasks_for_run(self.db, run.id)
@@ -374,7 +380,10 @@ class RunEngine:
             return await self._execute(run, task)
 
         fresh = await repo.get_run(self.db, run.id)
-        assert fresh is not None
+        if fresh is None:
+            raise RuntimeError(
+                f"run {run.id} disappeared during pump — database consistency error"
+            )
         if await self._scheduler.all_completed(fresh):
             await self._announce_local_green(fresh)
             if self.delivery is None:
@@ -420,7 +429,10 @@ class RunEngine:
             return "budget_exhausted"
         # failed | integrity_violation — the run cannot continue (§4.3).
         fresh = await repo.get_run(self.db, run.id)
-        assert fresh is not None
+        if fresh is None:
+            raise RuntimeError(
+                f"run {run.id} disappeared during pump — database consistency error"
+            )
         if self.notifier is not None:
             await self.notifier.notify(
                 "error",
@@ -707,7 +719,10 @@ class RunEngine:
         if "failed" in kinds or "integrity_violation" in kinds:
             offending = next(o for o in outcomes if o.kind in ("failed", "integrity_violation"))
             fresh = await repo.get_run(self.db, run.id)
-            assert fresh is not None
+            if fresh is None:
+                raise RuntimeError(
+                    f"run {run.id} disappeared during pump — database consistency error"
+                )
             if self.notifier is not None:
                 await self.notifier.notify(
                     "error",
@@ -745,12 +760,18 @@ class RunEngine:
             return "budget_exhausted"
         if outcome.kind == "escalated":
             fresh = await repo.get_run(self.db, run.id)
-            assert fresh is not None
+            if fresh is None:
+                raise RuntimeError(
+                    f"run {run.id} disappeared during pump — database consistency error"
+                )
             reason = outcome.detail or "wave integration escalated"
             return await transition_run(self.db, fresh.id, RunStatus.ESCALATED,
                                         payload={"reason": reason})
         fresh = await repo.get_run(self.db, run.id)
-        assert fresh is not None
+        if fresh is None:
+            raise RuntimeError(
+                f"run {run.id} disappeared during pump — database consistency error"
+            )
         if self.notifier is not None:
             await self.notifier.notify(
                 "error",
@@ -767,7 +788,10 @@ class RunEngine:
         if any(w.status not in TERMINAL_WAVE_STATUSES for w in waves):
             return "wave_completed"
         fresh = await repo.get_run(self.db, run.id)
-        assert fresh is not None
+        if fresh is None:
+            raise RuntimeError(
+                f"run {run.id} disappeared during pump — database consistency error"
+            )
         if await self._scheduler.all_completed(fresh):
             await self._announce_local_green(fresh)
             if self.delivery is None:

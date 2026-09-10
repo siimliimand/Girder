@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from girder.db.engine import Database
 from girder.util import utcnow_iso
 
 
 async def insert_steering_event(
-    db: Database, run_id: str, kind: str, payload: dict[str, Any]
+    db: Database, run_id: str, kind: str, payload: Mapping[str, object]
 ) -> int:
     cur = await db.execute(
         "INSERT INTO steering_events (run_id, kind, payload_json, created_at)"

@@ -125,7 +125,11 @@ class WaveIntegrator:
         )
 
         wave_tip = await branch_ops.run_branch_tip(wave_branch)
-        assert wave_tip is not None  # ensured above
+        if wave_tip is None:
+            raise RuntimeError(
+                f"wave branch {wave_branch} has no tip right after"
+                " ensure_run_branch — git state consistency error"
+            )
         tasks = await repo.list_tasks_for_wave(self.db, wave.id)
         # Resolution attempts may touch either side of a conflicted
         # interaction: their write scope is the union of the wave's scopes
@@ -231,7 +235,11 @@ class WaveIntegrator:
         # i.e. only an exact sha match skips, anything absent re-runs.
         suite_verified_at: str | None = None
         if result.merged:
-            assert result.merged_commit is not None
+            if result.merged_commit is None:
+                raise RuntimeError(
+                    f"merge of {wave_branch} reported success but returned no"
+                    f" commit — task {task.id} verification consistency error"
+                )
             new_tip = result.merged_commit
         elif result.reason == "merge conflict":
             resolution = await resolver.resolve(

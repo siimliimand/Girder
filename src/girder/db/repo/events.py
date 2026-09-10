@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from girder.db.engine import Database
 from girder.util import utcnow_iso
@@ -12,7 +12,7 @@ from girder.util import utcnow_iso
 async def insert_event(
     db: Database,
     event_type: str,
-    payload: dict[str, Any],
+    payload: Mapping[str, object],
     *,
     run_id: str | None = None,
     attempt_id: str | None = None,
