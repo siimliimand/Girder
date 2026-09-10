@@ -12,24 +12,32 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import aiosqlite
 
 from girder import __version__, fsm
 from girder.api.app import create_app
 from girder.budget.guard import BudgetGuard
 from girder.config import (
+    DEFAULT_SECRETS_PATH,
     Secrets,
     SecretsPermissionError,
     Settings,
+    _find_project_toml,
     load_secrets,
     load_settings,
 )
 from girder.db import repo
 from girder.db.engine import Database, default_migrations_dir
-from girder.db.models import Run, RunStatus
+from girder.db.models import TERMINAL_RUN_STATUSES, Run, RunStatus
 from girder.github.client import GitHubClient
 from girder.gitops.worktree import DEFAULT_BASE
 from girder.guard.redact import Redactor
@@ -439,6 +447,345 @@ async def cmd_review(args: argparse.Namespace) -> int:
         await db.close()
 
 
+# ------------------------------------------------------------------- prune (WP 13.2)
+#
+# No FK in migrations 001-013 declares ON DELETE CASCADE, and the engine runs
+# with ``PRAGMA foreign_keys=ON`` — deleting a run with children would fail.
+# Prune therefore deletes child rows explicitly, deepest dependents first,
+# inside one transaction (``db.tx()``). Rows linked only by bare TEXT columns
+# (no FK) — steering_events, integrity_violations, notifications_log — are
+# included so nothing referencing a pruned run survives.
+
+
+@dataclass
+class PruneReport:
+    """What one prune pass deleted (or would delete, in dry-run mode)."""
+
+    run_ids: list[str]
+    child_rows: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def run_count(self) -> int:
+        return len(self.run_ids)
+
+    def summary(self, *, dry_run: bool) -> str:
+        verb = "would delete" if dry_run else "deleted"
+        lines = [f"{verb} {self.run_count} run(s) past the prune horizon:"]
+        lines.extend(f"  {run_id}" for run_id in self.run_ids)
+        lines.append(f"{verb} child rows:")
+        for table, count in self.child_rows.items():
+            lines.append(f"  {table}: {count}")
+        return "\n".join(lines)
+
+
+# Run-id scoping subqueries. _RUN_SCOPE selects the ids to prune; _ATTEMPT_SCOPE
+# selects the attempts belonging to those runs via waves -> tasks -> attempts.
+_RUN_SCOPE = "SELECT id FROM prune_run_ids"
+_ATTEMPT_SCOPE = (
+    "SELECT a.id FROM attempts a"
+    " JOIN tasks t ON a.task_id = t.id"
+    " JOIN waves w ON t.wave_id = w.id"
+    f" WHERE w.run_id IN ({_RUN_SCOPE})"
+)
+_TASK_SCOPE = (
+    "SELECT t.id FROM tasks t"
+    " JOIN waves w ON t.wave_id = w.id"
+    f" WHERE w.run_id IN ({_RUN_SCOPE})"
+)
+
+# (table, where-clause) pairs in dependency-safe delete order. FK targets are
+# always emptied before their parents: attempt-level rows, then attempts, then
+# tasks, then waves, then run-level rows, then runs themselves.
+_PRUNE_TABLES: list[tuple[str, str]] = [
+    ("worktrees", f"attempt_id IN ({_ATTEMPT_SCOPE})"),
+    ("redaction_log", f"attempt_id IN ({_ATTEMPT_SCOPE})"),
+    ("tool_calls", f"attempt_id IN ({_ATTEMPT_SCOPE})"),
+    ("token_usage", f"attempt_id IN ({_ATTEMPT_SCOPE}) OR run_id IN ({_RUN_SCOPE})"),
+    ("attempt_prompts", f"attempt_id IN ({_ATTEMPT_SCOPE}) OR run_id IN ({_RUN_SCOPE})"),
+    ("attempt_diffs", f"attempt_id IN ({_ATTEMPT_SCOPE}) OR run_id IN ({_RUN_SCOPE})"),
+    ("attempts", f"task_id IN ({_TASK_SCOPE})"),
+    ("spec_amendments", f"run_id IN ({_RUN_SCOPE}) OR task_id IN ({_TASK_SCOPE})"),
+    ("tasks", f"wave_id IN (SELECT id FROM waves WHERE run_id IN ({_RUN_SCOPE}))"),
+    ("waves", f"run_id IN ({_RUN_SCOPE})"),
+    ("ci_check_results", f"run_id IN ({_RUN_SCOPE})"),
+    ("agent_events", f"run_id IN ({_RUN_SCOPE}) OR attempt_id IN ({_ATTEMPT_SCOPE})"),
+    ("integrity_violations", f"run_id IN ({_RUN_SCOPE})"),
+    ("steering_events", f"run_id IN ({_RUN_SCOPE})"),
+    ("notifications_log", f"run_id IN ({_RUN_SCOPE})"),
+]
+
+
+async def _prune_run_ids(db: Database, older_than_days: int) -> list[str]:
+    """Terminal-status runs whose created_at is older than the horizon."""
+    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).replace(
+        microsecond=0
+    ).isoformat()
+    statuses = sorted(s.value for s in TERMINAL_RUN_STATUSES)
+    placeholders = ",".join("?" * len(statuses))
+    rows = await db.fetchall(
+        f"SELECT id FROM runs WHERE status IN ({placeholders})"
+        " AND created_at < ? ORDER BY created_at",
+        (*statuses, cutoff),
+    )
+    return [str(r["id"]) for r in rows]
+
+
+async def _count_prune_rows(conn: aiosqlite.Connection, run_ids: list[str]) -> dict[str, int]:
+    """Per-child-table row counts that a prune of *run_ids* would remove."""
+    counts: dict[str, int] = {}
+    for table, where in _PRUNE_TABLES:
+        cur = await conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}")
+        row = await cur.fetchone()
+        counts[table] = int(row[0]) if row is not None else 0
+    return counts
+
+
+async def prune_runs(db: Database, *, older_than_days: int, dry_run: bool) -> PruneReport:
+    """Delete terminal runs older than the horizon (or just report them).
+
+    Both modes scope the victim set into a TEMP table first so every count and
+    delete below shares one exact definition of "the runs being pruned".
+    Dry-run never issues a DELETE against the main database.
+    """
+    run_ids = await _prune_run_ids(db, older_than_days)
+    conn = db.conn
+    await conn.execute("CREATE TEMP TABLE IF NOT EXISTS prune_run_ids (id TEXT PRIMARY KEY)")
+    await conn.execute("DELETE FROM prune_run_ids")
+    if run_ids:
+        await conn.executemany(
+            "INSERT INTO prune_run_ids (id) VALUES (?)", [(rid,) for rid in run_ids]
+        )
+    if dry_run:
+        counts = await _count_prune_rows(conn, run_ids)
+        await conn.execute("DROP TABLE IF EXISTS temp.prune_run_ids")
+        return PruneReport(run_ids=run_ids, child_rows=counts)
+    async with db.tx() as tx:
+        counts = await _count_prune_rows(tx, run_ids)
+        for table, where in _PRUNE_TABLES:
+            await tx.execute(f"DELETE FROM {table} WHERE {where}")
+        await tx.execute(f"DELETE FROM runs WHERE id IN ({_RUN_SCOPE})")
+        await tx.execute("DELETE FROM prune_run_ids")
+        await tx.execute("DROP TABLE IF EXISTS temp.prune_run_ids")
+    return PruneReport(run_ids=run_ids, child_rows=counts)
+
+
+async def cmd_prune(args: argparse.Namespace) -> int:
+    db = await _open_db(args)
+    try:
+        report = await prune_runs(
+            db, older_than_days=args.older_than_days, dry_run=args.dry_run
+        )
+    finally:
+        await db.close()
+    print(report.summary(dry_run=args.dry_run))
+    return 0
+
+
+# ----------------------------------------------------------------- validate (WP 13.3)
+
+# Sprint-11 multi-stack has not landed (no STACK_REGISTRY yet); the known set is
+# the single stack the codebase currently ships (config.ProjectConfig default).
+KNOWN_STACKS = frozenset({"python-3.12"})
+
+_MODEL_TIERS = ("tier1", "tier2", "tier3")
+
+# provider -> the Secrets field that must hold a non-empty key for it.
+_PROVIDER_SECRET_FIELDS = {
+    "openrouter": "models_openrouter_api_key",
+    "anthropic": "models_anthropic_api_key",
+    "openai": "models_openai_api_key",
+}
+
+
+@dataclass
+class ValidationContext:
+    """Everything the checks read, gathered before any check runs."""
+
+    settings: Settings | None
+    config_error: str | None
+    secrets: Secrets | None
+    secrets_error: str | None
+    config_root: Path
+    stack: str
+
+
+def _gather_validation_context(config_path: Path | None) -> ValidationContext:
+    """Load settings + secrets, capturing failures instead of raising."""
+    settings_error: str | None = None
+    settings: Settings | None = None
+    try:
+        settings = load_settings(config_path)
+    except Exception as exc:
+        settings_error = str(exc)
+    secrets_error: str | None = None
+    secrets: Secrets | None = None
+    try:
+        secrets = load_secrets()
+    except Exception as exc:  # SecretsPermissionError and malformed TOML
+        secrets_error = str(exc)
+    if config_path is not None:
+        config_root = config_path.resolve().parent
+    else:
+        found = _find_project_toml()
+        config_root = found.parent if found is not None else Path.cwd()
+    stack = settings.project.stack if settings is not None else ""
+    return ValidationContext(
+        settings=settings,
+        config_error=settings_error,
+        secrets=secrets,
+        secrets_error=secrets_error,
+        config_root=config_root,
+        stack=stack,
+    )
+
+
+def _check_model_roles(settings: Settings) -> list[str]:
+    failures: list[str] = []
+    roles = {role.role: role for role in settings.models.roles}
+    missing = [tier for tier in _MODEL_TIERS if tier not in roles]
+    if missing:
+        failures.append(
+            "model roles: missing tier(s) " + ", ".join(missing)
+            + " — declare [[models.roles]] entries for tier1, tier2 and tier3 in girder.toml"
+        )
+    for name in sorted(set(roles) - set(_MODEL_TIERS)):
+        failures.append(f"model roles: unknown tier {name!r} (expected tier1..tier3)")
+    for tier in _MODEL_TIERS:
+        role = roles.get(tier)
+        if role is None:
+            continue
+        if role.price_in_per_mtok <= 0 or role.price_out_per_mtok <= 0:
+            failures.append(
+                f"model roles: {tier} ({role.model}) must declare non-zero prices"
+                " (price_in_per_mtok and price_out_per_mtok)"
+            )
+    return failures
+
+
+def _check_secrets() -> list[str]:
+    failures: list[str] = []
+    path = DEFAULT_SECRETS_PATH
+    if not path.is_file():
+        failures.append(f"secrets: file {path} does not exist — create it (mode 0600)")
+        return failures
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        failures.append(
+            f"secrets: {path} is mode {mode:o}, not owner-only 0600 — run: chmod 600 {path}"
+        )
+    return failures
+
+
+def _check_api_keys(settings: Settings, secrets: Secrets) -> list[str]:
+    failures: list[str] = []
+    providers = sorted({role.provider for role in settings.models.roles})
+    for provider in providers:
+        field_name = _PROVIDER_SECRET_FIELDS.get(provider)
+        if field_name is None:
+            failures.append(
+                f"api keys: unknown provider {provider!r}"
+                f" (known: {', '.join(sorted(_PROVIDER_SECRET_FIELDS))})"
+            )
+            continue
+        value: str | None = getattr(secrets, field_name)
+        if not value:
+            failures.append(
+                f"api keys: no key configured for provider {provider!r}"
+                f" — set {field_name} in {DEFAULT_SECRETS_PATH}"
+            )
+    return failures
+
+
+def _detect_runtime(preferred: str) -> str | None:
+    """First container runtime in PATH, preferring the configured one."""
+    for runtime in (preferred, "podman", "docker"):
+        if runtime in ("podman", "docker") and shutil.which(runtime):
+            return runtime
+    return None
+
+
+def _check_runtime_and_image(stack: str) -> list[str]:
+    failures: list[str] = []
+    runtime = _detect_runtime("podman")
+    if runtime is None:
+        failures.append(
+            "sandbox runtime: neither podman nor docker found in PATH"
+            " — install rootless podman (see docs/deployment.md)"
+        )
+        return failures
+    try:
+        result = subprocess.run(
+            [runtime, "images", "-q", f"girder-runner:{stack}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        failures.append(f"runner image: could not query {runtime}: {exc}")
+        return failures
+    if not result.stdout.strip():
+        failures.append(
+            f"runner image: girder-runner:{stack} not found in {runtime}"
+            f" — build it before running (podman build -t girder-runner:{stack})"
+        )
+    return failures
+
+
+def _check_test_directories(settings: Settings, config_root: Path) -> list[str]:
+    failures: list[str] = []
+    for directory in settings.project.test_directories:
+        if not (config_root / directory).is_dir():
+            failures.append(
+                f"test directories: {directory!r} does not exist under {config_root}"
+            )
+    return failures
+
+
+def collect_validation_failures(
+    ctx: ValidationContext,
+    *,
+    check_sandbox: bool = True,
+) -> list[str]:
+    """Run every WP 13.3 check, collecting ALL failures (never stop at the first)."""
+    failures: list[str] = []
+    if ctx.config_error is not None:
+        failures.append(f"girder.toml: {ctx.config_error}")
+    settings = ctx.settings
+    if settings is None:
+        if ctx.config_error is None:
+            failures.append("girder.toml: could not load settings")
+        return failures
+    failures.extend(_check_model_roles(settings))
+    if ctx.stack not in KNOWN_STACKS:
+        failures.append(
+            f"project.stack: {ctx.stack!r} is not a known stack"
+            f" (known: {', '.join(sorted(KNOWN_STACKS))})"
+        )
+    if ctx.secrets_error is not None:
+        failures.append(f"secrets: {ctx.secrets_error}")
+    elif ctx.secrets is not None:
+        failures.extend(_check_secrets())
+        failures.extend(_check_api_keys(settings, ctx.secrets))
+    if check_sandbox:
+        failures.extend(_check_runtime_and_image(ctx.stack))
+    failures.extend(_check_test_directories(settings, ctx.config_root))
+    return failures
+
+
+async def cmd_validate(args: argparse.Namespace) -> int:
+    config_path = Path(args.config_path) if args.config_path else None
+    ctx = _gather_validation_context(config_path)
+    failures = collect_validation_failures(ctx)
+    if failures:
+        print("girder validate: FAILED")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print("girder validate: OK — configuration looks valid")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="girder", description=__doc__)
     parser.add_argument("--version", action="version", version=f"girder {__version__}")
@@ -508,6 +855,31 @@ def main(argv: list[str] | None = None) -> int:
         "review", help="mark a merged run as human-reviewed (T1 review window, §2.3)"
     )
     review_parser.add_argument("run_id", help="merged run id to mark reviewed")
+    prune_parser = sub.add_parser(
+        "prune", help="delete terminal-status runs older than the horizon (WP 13.2)"
+    )
+    prune_parser.add_argument(
+        "--older-than-days",
+        dest="older_than_days",
+        type=int,
+        default=90,
+        help="delete runs created more than this many days ago (default: 90)",
+    )
+    prune_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="report what would be deleted without touching the database",
+    )
+    validate_parser = sub.add_parser(
+        "validate", help="check girder.toml, secrets and sandbox setup (WP 13.3)"
+    )
+    validate_parser.add_argument(
+        "--config-path",
+        dest="config_path",
+        default=None,
+        help="explicit girder.toml path (default: walk up from CWD)",
+    )
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -529,6 +901,8 @@ def main(argv: list[str] | None = None) -> int:
         "pump": cmd_pump,
         "web": cmd_web,
         "review": cmd_review,
+        "prune": cmd_prune,
+        "validate": cmd_validate,
     }
     try:
         return asyncio.run(handlers[args.command](args))
