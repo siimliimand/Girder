@@ -47,6 +47,8 @@ Wave 4  (after WS-05 deployed + WS-10, ~1 wk)
 
 Serial total from the original plan is ~12 weeks; the wave structure compresses wall-clock to ~8 weeks with up to 7 tracks running concurrently in wave 1.
 
+**Status (2026-09-10):** waves 1 and 3 both merged the same day, **wave 3 first** (WS-06 + WS-10 landed out of order — owner-approved; waves 1–2 were then integrated on top of the split layout). Per-workstream status lives in each doc's **Status** field; wave-3 landing details and adaptation notes are in the ws06/ws10 Coordination sections. Wave 2 (WS-02, WS-07B) and WS-11 remain open.
+
 ## Migration-number pre-allocation
 
 All migrations live in repo-root `migrations/`; latest is `013`. Numbers are assigned up front so parallel workstreams never collide:

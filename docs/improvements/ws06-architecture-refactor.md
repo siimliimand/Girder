@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 10 (WP 10.1 – WP 10.5) |
-| **Status** | Not started |
+| **Status** | Merged (wave 3, 2026-09-10 — landed **out of order**, before waves 1–2, per owner-approved PM call; waves 1–2 were then integrated on top of the split layout the same day — see Coordination) |
 | **Wave** | **3** — MUST start only after waves 1–2 merge (it moves the very files WS-02/03/04/05/09 touch). WS-10 lands after this. |
 | **Effort** | ~1.5 weeks · ~5 new tests (mostly refactor) |
 | **Owned files** | `src/girder/api/routes.py`, `src/girder/orchestrator/task_engine.py`, `src/girder/db/repo.py`, `src/girder/orchestrator/run_engine.py`, `scheduler.py`, `integrator.py`, new `src/girder/db/payloads.py` |
@@ -176,6 +176,17 @@ Annotate the most-called repo functions first; `mypy --strict` surfaces the rema
 
 - **WS-08/WS-09/WS-10** touch the route/template surface — land them before this wave, or rebase their additions into the new module layout.
 - **WS-10's auth middleware** is designed against the post-split layout (`deps.py`), which is why WS-10 follows this workstream.
+
+### Implementation record (2026-09-10, wave 3 merged out of order)
+
+- **Ordering decision:** the "MUST start only after waves 1–2 merge" gate was waived by the owner (waves 1–2 had not been started; WS-06 is a no-behavior-change refactor with no functional dependency on them). Wave 3 landed first; wave 1 (WS-03/04/05/08/09, stacks foundation) was integrated **on top of the split layout** the same day — see commit `e63541a` ("adopt task_engine split") for the adoption pattern. Wave-1/2 docs referencing `routes.py`, `repo.py` or monolithic `task_engine.py` should now target the split modules:
+  - routes: `src/girder/api/routes/` (`projects, runs, specs, steering, amendments, delivery, history, tiers, webhooks, clarify, metrics`-adjacent modules) + `api/deps.py` + `api/auth.py`; legacy `girder.api.routes` surface re-exported by `routes/__init__.py`.
+  - task_engine: `task_engine.py` (execute_task + retry loop) + `attempt_lifecycle.py` + `verification.py` + `work_salvage.py`; legacy import surface re-exported.
+  - repo: `src/girder/db/repo/` (16 modules) with fully re-exporting `__init__.py` — zero call-site changes (R-SP10-1 held).
+- **WP 10.1:** landed as 11 route modules + `deps.py` + internal `routes/_shared.py` (shared helpers, avoids circular imports — not in the spec sketch). `app.py` untouched.
+- **WP 10.2:** `task_engine.py` is 326 lines vs the ≤300 target (≤600 DoD met); residual bulk is the execute_task loop, `__init__` state and the `_container_spec` test shim. Cut lines re-derived after commit `7358bcc` moved `verify_cmd` behind the stack plugins — stack-plugin dispatch lives in `verification.py` (`VERIFY_CMD`), re-exported for `suites.py`.
+- **WP 10.4:** 10 `assert x is not None` sites converted (run_engine 8, integrator 2) with entity-id-bearing messages. Left as-is: `run_engine.py:711` isinstance-narrowing assert; `db/repo/waves.py:66` (outside WP file scope). `run_engine.py` (886 lines, >600 pre-existing) is a future split candidate.
+- **WP 10.5:** TypedDict fields corrected against real payload shapes: transition events key `from` (not `from_`) plus `id` and arbitrary extras (`pr_number`, `head_sha`, `merge_sha`, `fix`, `flaky`, `failed`); `BudgetEventPayload` is `total=False` (no site supplies all four spec fields). Repo side annotated as `Mapping[str, object]` params — accepts TypedDicts and legacy dicts.
 
 ## Relevant resolution log decision
 

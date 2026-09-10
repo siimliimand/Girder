@@ -401,8 +401,6 @@ async def test_symbol_outline_non_python_fallback_unchanged(
     assert sandbox.execs == [
         ("ctr", ["grep", "-nE", r"^\s*(def|class|function)\b", "src/a.go"], 120.0)
     ]
-
-
 # ---------------------------------------------------------------------------
 # WP 7.1-7.5: new tools. RealSandbox actually executes argv in a tmpdir so
 # the python3 -c snippets and git plumbing are exercised for real; FakeSandbox
@@ -835,3 +833,4 @@ async def test_search_symbols_real_definitions_and_usages(
     assert "class Foo:" in defs.output and defs.output.endswith(":1:class Foo:\n")
     uses = await registry.execute("search_symbols", {"name": "Foo", "kind": "usage"})
     assert "return Foo()" in uses.output
+

@@ -215,7 +215,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "view_symbol_outline",
             "description": (
                 "List classes/functions with line numbers for a source file."
-                " Full support for Python (precise AST outlines); other"
+                " Routing is per-stack via the project's stack plugin —"
+                " full support for Python (precise AST outlines); other"
                 " languages fall back to a line-based declaration grep."
             ),
             "parameters": {
@@ -749,7 +750,9 @@ class ToolRegistry:
         path = str(args["path"])
         if path.endswith(".py"):
             return await self._exec(self.stack.symbol_outline_command(path))
-        return await self._exec(["grep", "-nE", r"^\s*(def|class|function)\b", path])
+        return await self._exec(
+            ["grep", "-nE", r"^\s*(def|class|function)\b", path]
+        )
 
     async def _run_command(self, args: dict[str, Any]) -> tuple[bool, str]:
         cmd = str(args["cmd"])
