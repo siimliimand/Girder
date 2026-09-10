@@ -432,6 +432,7 @@ Concrete invocation (host-side, orchestrator process — the agent has no path t
 podman run --detach --rm \
   --name girder-<attempt-id> \
   --cap-drop=ALL --security-opt no-new-privileges \
+  --init \
   --network none --pids-limit 512 --memory 4g --cpus 2 \
   -v /var/cache/orchestrator/pip:/root/.cache/pip:ro \
   -v /var/cache/orchestrator/npm:/root/.npm:ro \

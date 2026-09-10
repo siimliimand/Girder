@@ -6,6 +6,9 @@ Every mechanical property of the sandbox is expressed in the ``run`` argv the
 * ``--cap-drop=ALL --security-opt no-new-privileges`` — in-guest root (uid
   mapped) has no ``CAP_SYS_ADMIN``, so the read-only test-snapshot bind mount
   cannot be remounted writable (plan.md §8.2 Layer 1).
+* ``--init`` — tini/catatonit runs as PID 1 and reaps orphaned children;
+  without it, zombie subprocesses pile up against ``--pids-limit`` until
+  ``fork()`` fails mid-suite and every later test (and rerun) breaks.
 * ``--network none`` by default — dependencies come from RO cache mounts and
   the pre-baked runner image, never the internet (§8.1).
 * ``network="private"`` (spec §3.1: "slirp4netns, loopback only") currently
@@ -67,6 +70,11 @@ class PodmanEngine(SandboxEngine):
             "--cap-drop=ALL",
             "--security-opt",
             "no-new-privileges",
+            # tini/catatonit as PID 1: the image CMD is ``sleep infinity``,
+            # which never reaps orphans — a suite that leaks subprocesses
+            # accumulates zombies against --pids-limit until fork() starts
+            # failing mid-suite (girder-on-girder baseline, 2026-09-10).
+            "--init",
             "--network",
             # spec §3.1 describes network="private" as "slirp4netns, loopback
             # only", but rootless podman offers no loopback-only flag, so it

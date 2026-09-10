@@ -548,12 +548,16 @@ class DeliveryEngine:
                 ["git", "-C", str(repo_path), "worktree", "add", "--detach", str(worktree), tip],
                 timeout_s=60,
             )
+            # Forward the operator's [sandbox] policy (cf. task_engine._container_spec).
             container = await self.sandbox.start(
                 ContainerSpec(
                     name=f"girder-delivery-{run.id[:8]}",
                     image=f"girder-runner:{self.settings.project.stack}",
                     worktree=worktree,
-                    network="none",
+                    network=self.settings.sandbox.network,
+                    memory=self.settings.sandbox.memory,
+                    cpus=self.settings.sandbox.cpus,
+                    pids_limit=self.settings.sandbox.pids_limit,
                 )
             )
             exec_res = await self.sandbox.exec(

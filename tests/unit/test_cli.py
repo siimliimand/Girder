@@ -227,9 +227,10 @@ async def test_daemon_refuses_to_start_without_model_roles(
     """Spec §6.1: at least one model role per tier — config validation only
     warns, but the daemon must not start pumping with an empty registry."""
     from girder.cli import cmd_daemon
-    from girder.config import Settings
+    from girder.config import Secrets, Settings
 
     monkeypatch.setattr("girder.cli.load_settings", lambda: Settings())
+    monkeypatch.setattr("girder.cli.load_secrets", lambda: Secrets())
     rc = await cmd_daemon(
         Namespace(db=":memory:", migrations_dir=None, sandbox="podman")
     )
@@ -240,9 +241,10 @@ async def test_daemon_guard_is_overridable_by_env(monkeypatch: pytest.MonkeyPatc
     """GIRDER_ALLOW_NO_ROLES=1 opts out (test/dev harnesses)."""
     import girder.cli as cli_module
     from girder.cli import cmd_daemon
-    from girder.config import Settings
+    from girder.config import Secrets, Settings
 
     monkeypatch.setattr("girder.cli.load_settings", lambda: Settings())
+    monkeypatch.setattr("girder.cli.load_secrets", lambda: Secrets())
     monkeypatch.setenv("GIRDER_ALLOW_NO_ROLES", "1")
 
     async def refuse_to_proceed(args: object) -> object:
@@ -257,8 +259,10 @@ async def test_daemon_starts_with_roles_configured(monkeypatch: pytest.MonkeyPat
     """The empty-registry guard does not fire when roles exist."""
     import girder.cli as cli_module
     from girder.cli import cmd_daemon
+    from girder.config import Secrets
 
     monkeypatch.setattr("girder.cli.load_settings", _roles_settings)
+    monkeypatch.setattr("girder.cli.load_secrets", lambda: Secrets())
 
     async def refuse_to_proceed(args: object) -> object:
         raise RuntimeError("guard passed — reached db open")

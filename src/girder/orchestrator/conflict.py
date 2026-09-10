@@ -201,7 +201,16 @@ class ConflictResolver:
                 return ("failed", None, f"merge failed: {proc.stderr.strip()[:200]}")
 
         manifest = await self._audit.capture_test_manifest(path)
-        spec = ContainerSpec(name=f"girder-{attempt.id[:8]}", image=self.image, worktree=path)
+        # Forward the operator's [sandbox] policy (cf. task_engine._container_spec).
+        spec = ContainerSpec(
+            name=f"girder-{attempt.id[:8]}",
+            image=self.image,
+            worktree=path,
+            network=self.settings.sandbox.network,
+            memory=self.settings.sandbox.memory,
+            cpus=self.settings.sandbox.cpus,
+            pids_limit=self.settings.sandbox.pids_limit,
+        )
         await self.sandbox.start(spec)
         await repo.update_attempt_fields(self.db, attempt.id, container_id=spec.name)
         await transition_attempt(self.db, attempt.id, AttemptStatus.RUNNING)

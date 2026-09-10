@@ -137,6 +137,38 @@ def test_suite_cmd_defaults_to_configured_python_bin(db: Database) -> None:
     assert "pytest" in runner.suite_cmd
 
 
+async def test_container_spec_forwards_sandbox_policy(
+    db: Database,
+    seeded: tuple[Project, Run, str],
+    spy_worktree: None,
+    worktree_holder: list[Path],
+) -> None:
+    """The operator's [sandbox] network/resource policy reaches the baseline
+    container too — not just attempt containers (cf. task_engine._container_spec)."""
+    from girder.config import SandboxNetwork
+
+    project, run, sha = seeded
+    xml = junit([("tests.test_a", "test_one", "tests/test_a.py", "")])
+    sandbox = FakeSandbox([suite_effect(worktree_holder, xml)])
+    runner = BaselineRunner(
+        db=db,
+        sandbox=sandbox,  # type: ignore[arg-type]
+        settings=Settings(
+            sandbox=SandboxNetwork(network="private", memory="2g", cpus=1.5, pids_limit=777)
+        ),
+        redactor=Redactor(),
+    )
+
+    outcome = await run_baseline(runner, project, run, sha)
+
+    assert outcome.broken is False
+    (spec,) = sandbox.started
+    assert spec.network == "private"
+    assert spec.memory == "2g"
+    assert spec.cpus == 1.5
+    assert spec.pids_limit == 777
+
+
 def _init_git_repo(repo_dir: Path) -> str:
     """Sync helper — heavy blocking git setup, run via asyncio.to_thread."""
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True)

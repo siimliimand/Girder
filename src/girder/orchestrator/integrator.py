@@ -345,8 +345,15 @@ class WaveIntegrator:
             label=f"int-w{wave.sequence_order}-{task.id[:8]}",
             commit=commit,
         )
+        # Forward the operator's [sandbox] policy (cf. task_engine._container_spec).
         spec = ContainerSpec(
-            name=f"girder-int-{wave.id[:8]}-{task.id[:8]}", image=self.image, worktree=path
+            name=f"girder-int-{wave.id[:8]}-{task.id[:8]}",
+            image=self.image,
+            worktree=path,
+            network=self.settings.sandbox.network,
+            memory=self.settings.sandbox.memory,
+            cpus=self.settings.sandbox.cpus,
+            pids_limit=self.settings.sandbox.pids_limit,
         )
         await self.sandbox.start(spec)
         try:
