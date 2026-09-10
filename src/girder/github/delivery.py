@@ -159,6 +159,16 @@ class DeliveryEngine:
             task_lines=[t.title for t in tasks],
             criteria=await self._criteria_of(run, repo_path),
             spend_usd=fresh.spend_usd,
+            run_id=run.id,
+            tasks=[
+                {
+                    "title": t.title,
+                    "task_type": t.task_type.value,
+                    "status": t.status.value,
+                }
+                for t in tasks
+            ],
+            total_attempts=sum(t.attempts_used for t in tasks),
         )
         pr_number = await self.github.open_pr(
             head=run.branch,
