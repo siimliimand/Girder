@@ -25,6 +25,7 @@ are exhausted.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -139,9 +140,7 @@ def _read_conventions(repo_path: Path) -> str | None:
 def _file_listing(repo_path: Path) -> str | None:
     """Sorted top-level entries (names only, dirs suffixed '/'), ≤100 lines."""
     try:
-        entries = sorted(
-            (p.name + "/" if p.is_dir() else p.name) for p in repo_path.iterdir()
-        )
+        entries = sorted((p.name + "/" if p.is_dir() else p.name) for p in repo_path.iterdir())
     except OSError:
         return None
     lines = entries[:_MAX_FILE_LISTING_LINES]
@@ -190,6 +189,57 @@ def _normalize(text: str) -> str:
     return text
 
 
+def _intent_with_clarification(intent: str, clarification: dict[str, str] | None) -> str:
+    """Append §8.5 clarification answers to the raw user intent.
+
+    Trusted requester input (same trust level as the intent itself), so it
+    stays inside the <user-intent> block — never wrapped as untrusted data.
+    """
+    if not clarification:
+        return intent
+    lines = [intent, "", "Clarifications provided by the requester:"]
+    for question, answer in clarification.items():
+        lines.append(f"- Q: {question}\n  A: {answer}")
+    return "\n".join(lines)
+
+
+_CLARIFY_SYSTEM_TEMPLATE = """\
+You gate spec generation for the Girder orchestrator (plan §8.5).
+
+The requester's intent follows in a <user-intent> block. Before a precise \
+OpenSpec proposal can be authored, decide what is under-specified about it.
+
+OUTPUT CONTRACT: Output ONLY a JSON array of 2 to 4 question strings — no \
+code fences, no commentary. Each question must be answerable in one or two \
+sentences and must materially change the shape of the eventual proposal \
+(scope, constraints, interfaces, success criteria). Do not ask questions \
+the intent already answers."""
+
+_CLARIFY_MIN_QUESTIONS = 2
+_CLARIFY_MAX_QUESTIONS = 4
+
+
+def _parse_clarification_questions(content: str) -> list[str]:
+    """Parse the gate model's JSON array; tolerate a surrounding fence."""
+    text = _strip_fences(content).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SpecGenerationError([f"clarification gate returned non-JSON output: {exc}"]) from exc
+    if (
+        not isinstance(parsed, list)
+        or not all(isinstance(q, str) and q.strip() for q in parsed)
+        or not _CLARIFY_MIN_QUESTIONS <= len(parsed) <= _CLARIFY_MAX_QUESTIONS
+    ):
+        raise SpecGenerationError(
+            [
+                "clarification gate must return a JSON array of 2-4 non-empty "
+                f"question strings; got: {text[:200]}"
+            ]
+        )
+    return [q.strip() for q in parsed]
+
+
 class SpecGenerator:
     """Builds the Tier-1 prompt, dispatches it, validates the result (§6.9)."""
 
@@ -204,6 +254,7 @@ class SpecGenerator:
         project: Project,
         repo_path: Path,
         feedback: str | None = None,
+        clarification: dict[str, str] | None = None,
     ) -> str:
         """Return the validated proposal text (markdown + YAML frontmatter).
 
@@ -211,10 +262,17 @@ class SpecGenerator:
         raw output and the aggregated validator errors are fed back as a
         follow-up user message. Raises SpecGenerationError on gateway
         failure, empty content, or exhaustion of all attempts.
+
+        *clarification* (§8.5): question→answer pairs from the pre-spec
+        clarification loop, appended to the user intent so the proposal is
+        generated against the enriched problem statement.
         """
         messages = [
             Message(role="system", content=self._system_prompt()),
-            Message(role="user", content=self._user_prompt(run.intent, repo_path, feedback)),
+            Message(
+                role="user",
+                content=self._user_prompt(run.intent, repo_path, feedback, clarification),
+            ),
         ]
         attempts = max(1, self.settings.specs.generation_attempts)
         for attempt in range(attempts):
@@ -235,12 +293,14 @@ class SpecGenerator:
                 # reasoning models can burn the whole max_output_tokens on
                 # hidden reasoning and return content=None. Nothing to
                 # repair, so no retry.
-                raise SpecGenerationError([
-                    f"model produced no content (finish_reason="
-                    f"{response.finish_reason!r}) — reasoning models can "
-                    "exhaust max_output_tokens before emitting content; "
-                    "raise models.max_output_tokens"
-                ]) from None
+                raise SpecGenerationError(
+                    [
+                        f"model produced no content (finish_reason="
+                        f"{response.finish_reason!r}) — reasoning models can "
+                        "exhaust max_output_tokens before emitting content; "
+                        "raise models.max_output_tokens"
+                    ]
+                ) from None
 
             raw = content
             normalized = _normalize(raw)
@@ -251,28 +311,62 @@ class SpecGenerator:
                     raise SpecGenerationError(exc.errors, raw_output=raw) from exc
                 # Feed the rejected output back as untrusted data plus the
                 # aggregated errors, mirroring the <user-feedback> framing.
-                messages.append(Message(
-                    role="user",
-                    content=(
-                        f"<previous-attempt>\n{raw}\n</previous-attempt>\n\n"
-                        "Your previous output failed structural validation:\n"
-                        + "\n".join(f"- {e}" for e in exc.errors)
-                        + "\n\nFix every listed violation. Output ONLY the "
-                        "corrected OpenSpec document — YAML frontmatter + "
-                        "markdown body, no code fences, no commentary."
-                    ),
-                ))
+                messages.append(
+                    Message(
+                        role="user",
+                        content=(
+                            f"<previous-attempt>\n{raw}\n</previous-attempt>\n\n"
+                            "Your previous output failed structural validation:\n"
+                            + "\n".join(f"- {e}" for e in exc.errors)
+                            + "\n\nFix every listed violation. Output ONLY the "
+                            "corrected OpenSpec document — YAML frontmatter + "
+                            "markdown body, no code fences, no commentary."
+                        ),
+                    )
+                )
                 continue
             return normalized
         raise AssertionError("unreachable: repair loop must return or raise")
 
-    def _system_prompt(self) -> str:
-        return _SYSTEM_TEMPLATE.format(
-            untrusted_rule=_UNTRUSTED_RULE, template=OPENSPEC_TEMPLATE
-        )
+    async def generate_clarification_questions(self, *, run: Run) -> list[str]:
+        """Ask Tier-1 for 2-4 clarifying questions about *run*'s intent (§8.5).
 
-    def _user_prompt(self, intent: str, repo_path: Path, feedback: str | None) -> str:
-        parts = [f"<user-intent>\n{intent}\n</user-intent>"]
+        Single-shot: no repair loop. A response that is not a JSON array of
+        2-4 non-empty strings raises SpecGenerationError — a malformed gate
+        answer must never silently degrade into skipping clarification.
+        """
+        messages = [
+            Message(role="system", content=_CLARIFY_SYSTEM_TEMPLATE),
+            Message(role="user", content=f"<user-intent>\n{run.intent}\n</user-intent>"),
+        ]
+        try:
+            response = await self.gateway.complete("tier1", messages, run_id=run.id)
+        except BudgetExceeded as exc:
+            raise SpecGenerationError([f"budget exceeded: {exc}"]) from exc
+        except ModelError as exc:
+            raise SpecGenerationError([str(exc)]) from exc
+        content = response.content
+        if content is None or not content.strip():
+            raise SpecGenerationError(
+                [
+                    f"clarification gate produced no content (finish_reason="
+                    f"{response.finish_reason!r})"
+                ]
+            ) from None
+        return _parse_clarification_questions(content)
+
+    def _system_prompt(self) -> str:
+        return _SYSTEM_TEMPLATE.format(untrusted_rule=_UNTRUSTED_RULE, template=OPENSPEC_TEMPLATE)
+
+    def _user_prompt(
+        self,
+        intent: str,
+        repo_path: Path,
+        feedback: str | None,
+        clarification: dict[str, str] | None = None,
+    ) -> str:
+        intent_block = _intent_with_clarification(intent, clarification)
+        parts = [f"<user-intent>\n{intent_block}\n</user-intent>"]
         readme = _read_readme(repo_path)
         if readme is not None:
             parts.append(f'<untrusted-data source="README.md">\n{readme}\n</untrusted-data>')
@@ -284,9 +378,7 @@ class SpecGenerator:
             )
         listing = _file_listing(repo_path)
         if listing is not None:
-            parts.append(
-                f'<untrusted-data source="file-listing">\n{listing}\n</untrusted-data>'
-            )
+            parts.append(f'<untrusted-data source="file-listing">\n{listing}\n</untrusted-data>')
         if feedback is not None:
             parts.append(f"<user-feedback>\n{feedback}\n</user-feedback>")
         return "\n\n".join(parts)

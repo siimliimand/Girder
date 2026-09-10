@@ -154,6 +154,9 @@ class SpecsConfig(BaseModel):
     cli: bool = False
     cli_bin: str = "openspec"
     generation_attempts: int = 3  # bounded validation-feedback retries for the native generator
+    # §8.5: force the pre-spec clarification loop on every new run. Default
+    # off — the zero-friction flow is untouched unless explicitly enabled.
+    require_clarification: bool = False
 
 
 class WebConfig(BaseModel):
