@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from girder.api.app import create_app
 from girder.config import AutonomyConfig, Secrets, Settings
 from girder.db import repo
 from girder.db.engine import Database, default_migrations_dir
 from girder.db.models import TaskType
+from tests.conftest import seed_run_status
 
 SECRET = "ghp_" + "a" * 30
 AWS_KEY = "AKIA" + "B" * 16
@@ -148,6 +150,53 @@ async def test_steering_unknown_action_and_abort(tmp_path: Path) -> None:
         assert [x["kind"] for x in rows] == ["abort"]
 
 
+async def test_steering_parked_run_takes_only_abort(tmp_path: Path) -> None:
+    """Regression (real incident): the console accepted a resume on an
+    ESCALATED run and queued an event `_pump_escalated` never reads — a silent
+    no-op presented as a successful action. Non-abort steering on a parked
+    status must now 409 without writing anything; abort must keep working
+    everywhere (R14: "queues an abort in any status")."""
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+        await seed_run_status(db, r.id, "escalated")
+
+        resp = await client.post(f"/api/runs/{r.id}/steer", data={"action": "resume"})
+        assert resp.status_code == 409
+        assert "escalated" in resp.text and "abort" in resp.text
+        rows = await db.fetchall(
+            "SELECT kind FROM steering_events WHERE run_id = ?", (r.id,)
+        )
+        assert rows == []  # nothing queued — no dead event, no fake success
+
+        abort = await client.post(f"/api/runs/{r.id}/steer", data={"action": "abort"})
+        assert abort.status_code == 303
+        rows = await db.fetchall(
+            "SELECT kind FROM steering_events WHERE run_id = ?", (r.id,)
+        )
+        assert [x["kind"] for x in rows] == ["abort"]
+
+
+@pytest.mark.parametrize("status", ["merged", "failed", "aborted"])
+async def test_steering_terminal_run_rejects_non_abort(
+    tmp_path: Path, status: str
+) -> None:
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+        await seed_run_status(db, r.id, status)
+        resp = await client.post(f"/api/runs/{r.id}/steer", data={"action": "pause"})
+        assert resp.status_code == 409
+        rows = await db.fetchall(
+            "SELECT kind FROM steering_events WHERE run_id = ?", (r.id,)
+        )
+        assert rows == []
+
+
 # ------------------------------------------------------------------------ SSE
 
 
@@ -186,6 +235,24 @@ async def test_sse_ends_on_terminal_status(tmp_path: Path) -> None:
         resp = await client.get(f"/api/runs/{r.id}/events?after_id=0&max_ticks=5&poll_s=0.05")
         pairs = parse_sse(resp.text)
         assert pairs[-1] == ("end", json.dumps({"status": "merged"}))
+
+
+async def test_sse_keepalive_comment_on_idle_stream(tmp_path: Path) -> None:
+    """A quiet run emits no frames, so intermediaries (and the operator) can't
+    tell a live stream from a hung one. Every 15 silent ticks the stream yields
+    an SSE comment — ignored by EventSource's event dispatch, but it keeps
+    bytes flowing through proxies and shows liveness."""
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+        resp = await client.get(
+            f"/api/runs/{r.id}/events?after_id=0&max_ticks=16&poll_s=0.01"
+        )
+        assert ": keepalive" in resp.text
+        # Comments carry no event/data: nothing parseable for the client.
+        assert parse_sse(resp.text) == []
 
 
 # ---------------------------------------------------------------------- graph

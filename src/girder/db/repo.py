@@ -687,15 +687,15 @@ async def list_runs_for_project(db: Database, project_id: str) -> list[Run]:
 async def get_latest_event(
     db: Database, run_id: str, event_type: str
 ) -> dict[str, Any] | None:
-    """Most recent event of *event_type* for a run, as {payload, ts}."""
+    """Most recent event of *event_type* for a run, as {id, payload, ts}."""
     r = await db.fetchone(
-        "SELECT payload_json, ts FROM agent_events WHERE run_id = ? AND event_type = ?"
+        "SELECT id, payload_json, ts FROM agent_events WHERE run_id = ? AND event_type = ?"
         " ORDER BY id DESC LIMIT 1",
         (run_id, event_type),
     )
     if r is None:
         return None
-    return {"payload": json.loads(r["payload_json"]), "ts": r["ts"]}
+    return {"id": r["id"], "payload": json.loads(r["payload_json"]), "ts": r["ts"]}
 
 
 async def get_first_transition_ts_to(

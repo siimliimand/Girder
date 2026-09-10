@@ -65,7 +65,7 @@ role = "tier1"  # specs, plan estimation, review
 provider = "openrouter"
 model = "~deepseek/deepseek-v4-flash-latest"
 context_window = 1_310_720
-max_output_tokens = 8192
+max_output_tokens = 32768
 price_in_per_mtok = 0.05
 price_out_per_mtok = 0.16
 
@@ -74,7 +74,7 @@ role = "tier2"  # coding attempts
 provider = "openrouter"
 model = "~deepseek/deepseek-v4-flash-latest"
 context_window = 1_310_720
-max_output_tokens = 8192
+max_output_tokens = 32768
 price_in_per_mtok = 0.05
 price_out_per_mtok = 0.16
 
@@ -83,6 +83,6 @@ role = "tier3"  # summaries, triage, utility calls
 provider = "openrouter"
 model = "~deepseek/deepseek-v4-flash-latest"
 context_window = 1_310_720
-max_output_tokens = 8192
+max_output_tokens = 32768
 price_in_per_mtok = 0.05
 price_out_per_mtok = 0.16

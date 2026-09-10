@@ -74,6 +74,12 @@ async def _run_context(
     project = await _require_project(db, run.project_id)
     usage = await repo.list_token_usage_for_run(db, run_id)
     failure = await repo.get_latest_event(db, run_id, "spec_generation_failed")
+    # A successful generation supersedes the failure it followed: after a
+    # regenerate the stale banner/artifact must not keep implying the current
+    # proposal is broken. Only the LATEST outcome may claim the panel.
+    finished = await repo.get_latest_event(db, run_id, "spec_generation_finished")
+    if failure is not None and finished is not None and finished["id"] > failure["id"]:
+        failure = None
     # Raw rejected model output from the latest failed generation, if the
     # failure carried one (redacted upstream by the gateway; nothing new here).
     failed_raw_output: dict[str, object] | None = None
@@ -735,6 +741,7 @@ async def run_events(
 
     async def gen() -> AsyncIterator[str]:
         last = after_id
+        silent_ticks = 0
         try:
             for _ in range(max(1, max_ticks)):
                 rows = await repo.list_events_for_run(db, rid, after_id=last)
@@ -757,6 +764,13 @@ async def run_events(
                     yield f"event: end\ndata: {json.dumps({'status': run.status.value})}\n\n"
                     return
                 if not rows:
+                    silent_ticks += 1
+                    if silent_ticks % 15 == 0:
+                        # SSE comment frame: EventSource ignores it, but it
+                        # pushes bytes through intermediaries that would
+                        # otherwise see an idle stream and buffer or drop it,
+                        # and proves the socket is alive while nothing happens.
+                        yield ": keepalive\n\n"
                     await asyncio.sleep(poll)
         except asyncio.CancelledError:  # client disconnected
             return
@@ -871,6 +885,21 @@ async def steer(
         kind = SteeringKind(action)
     except ValueError:
         return fail(f"unknown steering action {action!r}.")
+
+    # R14: abort is consumable from any status by design ("queues an abort in
+    # any status"). Every other kind is only ever read at the ACTIVE pump
+    # boundary (or mid-attempt by the agent runtime), while an escalated run's
+    # pump reads abort only (_pump_escalated) and terminal runs are never
+    # pumped again. Accepting other kinds there would write a queue entry
+    # nothing ever consumes — a silent no-op presented as a successful action.
+    if kind is not SteeringKind.ABORT and (
+        run.status is RunStatus.ESCALATED or run.status in TERMINAL_RUN_STATUSES
+    ):
+        return fail(
+            f"run is {run.status.value}: {kind.value!r} would queue a steering"
+            " event no pump ever reads. Only abort applies to this status.",
+            status=409,
+        )
 
     payload: dict[str, Any] = {}
     if kind is SteeringKind.INJECT:

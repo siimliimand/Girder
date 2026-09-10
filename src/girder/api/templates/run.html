@@ -79,13 +79,20 @@
   {% endif %}
 </div>
 
+{# Steering kinds the pump can actually consume: everything but abort is
+   read only at the ACTIVE pump boundary, so parked/terminal runs get
+   Abort only (the steer endpoint 409s the rest — don't offer dead buttons). #}
+{% set parked = run.status.value in ("escalated", "merged", "failed", "aborted") %}
 <h2>Steering</h2>
 <div class="actions">
   <form method="post" action="/api/runs/{{ run.id }}/steer">
-    <button type="submit" name="action" value="pause">Pause</button>
-    <button type="submit" name="action" value="resume">Resume</button>
+    {% if not parked %}
+      <button type="submit" name="action" value="pause">Pause</button>
+      <button type="submit" name="action" value="resume">Resume</button>
+    {% endif %}
     <button type="submit" name="action" value="abort">Abort</button>
   </form>
+  {% if not parked %}
   <form method="post" action="/api/runs/{{ run.id }}/steer">
     <label>Directive<br>
       <textarea name="directive" rows="2" cols="60"></textarea></label><br>
@@ -102,7 +109,13 @@
     <button type="submit" name="action" value="skip">Skip</button>
     <button type="submit" name="action" value="force_pass">Force-pass</button>
   </form>
+  {% endif %}
 </div>
+{% if run.status.value == "escalated" %}
+<p class="muted">Escalated is terminal: the pump consumes only abort here —
+   pause/resume/inject would queue events nothing reads. To redo this work,
+   abort the run and start a new one.</p>
+{% endif %}
 
 <h2>Live events</h2>
 <p id="stream-note" class="muted">connecting…</p>
@@ -126,6 +139,7 @@
     es.close();
     note.textContent = "stream ended (run " + JSON.parse(e.data).status + ")";
   });
+  es.onopen = function () { note.textContent = "live"; };
   es.onerror = function () { note.textContent = "reconnecting…"; };
 })();
 </script>

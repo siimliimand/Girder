@@ -121,3 +121,44 @@ async def test_run_page_omits_block_without_raw_output(tmp_path: Path) -> None:
         assert resp.status_code == 200
         assert "Generation failed" in resp.text
         assert "Last failed model output" not in resp.text
+
+
+async def test_successful_generation_hides_stale_failure_banner(tmp_path: Path) -> None:
+    """Regression (real incident): after a failed generate followed by a
+    successful regenerate, the panel kept showing 'Generation failed' from the
+    superseded attempt. Only the LATEST generation outcome may claim the
+    panel — a newer success hides the failure banner and its artifact."""
+    app = make_app(tmp_path, "rejected draft")  # factory unused; events seeded by hand
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await repo.create_project(db, "proj", ".")
+        r = await repo.create_run(db, p.id, "Ship it", branch="run/abc", budget_cap_usd=5.0)
+
+        await repo.insert_event(
+            db, "spec_generation_failed", {"error": "model produced no content"}, run_id=r.id
+        )
+        page = await client.get(f"/runs/{r.id}")
+        assert "Generation failed" in page.text  # latest outcome is the failure
+
+        await repo.insert_event(db, "spec_generation_finished", {"chars": 5975}, run_id=r.id)
+        page = await client.get(f"/runs/{r.id}")
+        assert "Generation failed" not in page.text
+        panel = await client.get(f"/runs/{r.id}/panel")
+        assert "Generation failed" not in panel.text
+        assert "Last failed model output" not in panel.text
+
+
+async def test_later_failure_supersedes_earlier_success(tmp_path: Path) -> None:
+    """The suppression is symmetric: a failure AFTER a success is the latest
+    outcome and must still show."""
+    app = make_app(tmp_path, None)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await repo.create_project(db, "proj", ".")
+        r = await repo.create_run(db, p.id, "Ship it", branch="run/abc", budget_cap_usd=5.0)
+        await repo.insert_event(db, "spec_generation_finished", {"chars": 100}, run_id=r.id)
+        await repo.insert_event(
+            db, "spec_generation_failed", {"error": "model produced no content"}, run_id=r.id
+        )
+        resp = await client.get(f"/runs/{r.id}")
+        assert "Generation failed" in resp.text
