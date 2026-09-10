@@ -8,8 +8,10 @@
 --    deferred constraints). Instead the CHECK literal list is widened in
 --    place via a bounded writable_schema edit: the replace() anchor is the
 --    exact substring "'draft', 'spec_pending'", which occurs in exactly one
---    schema row (runs, from migration 001) — verified at authoring time. No
---    data rows are touched and the table is re-read (writable_schema=RESET)
+--    schema row (runs, from migration 001) — verified at authoring time. The
+--    instr() guard makes the statement idempotent for the boot-time self-heal
+--    path (partial application re-applied statement-by-statement); no data
+--    rows are touched and the table is re-read (writable_schema=RESET)
 --    before any later statement in this script.
 --
 -- 2. clarification_sessions: one row per run parked in 'clarifying' — the
@@ -22,14 +24,15 @@ UPDATE sqlite_master
   SET sql = replace(sql,
                     '''draft'', ''spec_pending''',
                     '''clarifying'', ''draft'', ''spec_pending''')
-  WHERE type = 'table' AND name = 'runs';
+  WHERE type = 'table' AND name = 'runs'
+    AND instr(sql, '''clarifying''') = 0;
 PRAGMA writable_schema = RESET;
 
-CREATE TABLE clarification_sessions (
+CREATE TABLE IF NOT EXISTS clarification_sessions (
   id            TEXT PRIMARY KEY,
   run_id        TEXT NOT NULL REFERENCES runs(id),
   questions_json TEXT NOT NULL,
   answers_json  TEXT,
   created_at    TEXT NOT NULL
 );
-CREATE INDEX idx_clarification_run ON clarification_sessions(run_id);
+CREATE INDEX IF NOT EXISTS idx_clarification_run ON clarification_sessions(run_id);

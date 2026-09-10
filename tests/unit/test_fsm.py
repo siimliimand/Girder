@@ -220,6 +220,9 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         return {(f.value, t.value) for f, targets in table.items() for t in targets}
 
     expected_runs = {
+        # §8.5 (WS-04): pre-spec clarification park; answering is the only way out.
+        ("draft", "clarifying"),
+        ("clarifying", "draft"),
         ("draft", "spec_pending"),
         ("draft", "aborted"),
         ("spec_pending", "spec_pending"),
@@ -468,7 +471,7 @@ async def test_self_test_fails_when_tables_and_engine_disagree(
         return str(new_state)
 
     monkeypatch.setattr(fsm_module, "transition", permissive)
-    with pytest.raises(fsm.FsmSelfTestError, match="run draft->spec_approved"):
+    with pytest.raises(fsm.FsmSelfTestError, match="run clarifying->clarifying disagrees"):
         await fsm.self_test()
 
 
