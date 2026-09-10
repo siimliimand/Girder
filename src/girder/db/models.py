@@ -17,6 +17,11 @@ class AutonomyTier(StrEnum):
 
 
 class RunStatus(StrEnum):
+    # Pre-spec clarification park (WS-04): with clarify=true the run waits
+    # here while the user answers clarifying questions. Order note: listed
+    # before DRAFT only because the runs.status CHECK literal list in
+    # migration 015 puts 'clarifying' first (replace() anchor).
+    CLARIFYING = "clarifying"
     DRAFT = "draft"
     SPEC_PENDING = "spec_pending"
     SPEC_APPROVED = "spec_approved"

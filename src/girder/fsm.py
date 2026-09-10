@@ -28,7 +28,12 @@ _TABLE = {"run": "runs", "task": "tasks", "attempt": "attempts"}
 
 # Run states (impl-plan §5.1). Terminal: merged / failed / aborted.
 _RUN_EDGES: dict[RunStatus, frozenset[RunStatus]] = {
-    RunStatus.DRAFT: frozenset({RunStatus.SPEC_PENDING, RunStatus.ABORTED}),
+    # §8.5: clarify=true parks a fresh run in clarifying until the user
+    # answers; answering is the only way out (abort path goes through the
+    # generic run-abort route only if a clarifying→aborted edge is ever
+    # added — deliberately not declared now, per WS-04's edge list).
+    RunStatus.DRAFT: frozenset({RunStatus.CLARIFYING, RunStatus.SPEC_PENDING, RunStatus.ABORTED}),
+    RunStatus.CLARIFYING: frozenset({RunStatus.DRAFT}),
     # spec_pending is spend-bearing (generation calls the model), so the
     # BudgetGuard tripwire routes it to budget_exhausted (plan.md §5.1);
     # Sprint 1 omitted the edge because nothing spent money yet.
@@ -307,7 +312,8 @@ class FsmSelfTestError(RuntimeError):
 
     def __init__(self, failures: list[str]) -> None:
         super().__init__(
-            "FSM self-test failed: " + "; ".join(failures[:10])
+            "FSM self-test failed: "
+            + "; ".join(failures[:10])
             + (f" (+{len(failures) - 10} more)" if len(failures) > 10 else "")
         )
         self.failures = failures
