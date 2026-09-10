@@ -1,9 +1,13 @@
 """Console routes package (WP 10.1) — one router per resource family.
 
 ``create_app`` includes :data:`router`; every submodule contributes its own
-``APIRouter``. All names that existed at module level in the pre-split
-``girder/api/routes.py`` are re-exported here under their original names so
-``from girder.api.routes import X`` keeps working unchanged.
+``APIRouter``. The compat surface is the HTTP behavior of the routes themselves
+(verified by tests), not the full pre-split symbol table: this package
+re-exports the aggregate ``router``, each per-module ``APIRouter``, a few
+helpers under their old names (``_next_generation_estimate`` & co.), and the
+legacy handler name ``merge_queue`` (now an alias for
+:func:`girder.api.routes.delivery.merge_queue_json`). Other pre-split handler
+functions moved into their route modules and are not re-exported.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from girder.api.routes._shared import (
     excerpt as _excerpt,
 )
 from girder.api.routes._shared import (
-    merge_queue as _merge_queue,
+    load_merge_queue as _merge_queue,
 )
 from girder.api.routes._shared import (
     merged_rows as _merged_rows,
@@ -104,6 +108,9 @@ from girder.api.routes.amendments import (  # noqa: E402
     _amendments_inbox,
     _resolve_amendment_route,
 )
+from girder.api.routes.delivery import (  # noqa: E402
+    merge_queue_json as merge_queue,
+)
 from girder.api.routes.projects import (  # noqa: E402
     _project_json,
     _project_timestamps,
@@ -151,5 +158,6 @@ __all__ = [
     "_run_context",
     "_task_view",
     "_tier1_role",
+    "merge_queue",
     "router",
 ]

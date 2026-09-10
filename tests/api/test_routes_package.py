@@ -149,6 +149,15 @@ def test_legacy_import_surface() -> None:
         assert hasattr(legacy, name), name
 
 
+def test_merge_queue_legacy_name_is_the_http_handler() -> None:
+    from girder.api import routes as legacy
+    from girder.api.routes import delivery
+    from girder.api.routes._shared import load_merge_queue
+
+    assert legacy.merge_queue is delivery.merge_queue_json
+    assert callable(load_merge_queue)
+
+
 def test_no_route_module_exceeds_600_lines() -> None:
     import girder.api as api_pkg
 

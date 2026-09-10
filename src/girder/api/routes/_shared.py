@@ -165,7 +165,7 @@ async def review_window_state(
     }
 
 
-async def merge_queue(db: Database) -> list[dict[str, Any]]:
+async def load_merge_queue(db: Database) -> list[dict[str, Any]]:
     projects = {p.id: p for p in await repo.list_projects(db)}
     runs = await repo.list_runs_in_status(db, "merge_pending_human")
     return [

@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from girder.api.app import render
 from girder.api.deps import Db
 from girder.api.routes._shared import (
-    merge_queue,
+    load_merge_queue,
     merged_rows,
     require_project,
     review_window_state,
@@ -29,7 +29,7 @@ async def _tier_context(db: Database, request: Request, project: Project) -> dic
     settings = request.app.state.settings
     queue = [
         q
-        for q in await merge_queue(db)
+        for q in await load_merge_queue(db)
         if q["project_id"] == project.id
     ]
     return {
