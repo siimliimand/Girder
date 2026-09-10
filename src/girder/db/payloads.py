@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-
 # Functional syntax: the stored JSON key is the reserved word "from".
 TransitionPayload = TypedDict(
     "TransitionPayload",

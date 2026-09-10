@@ -6,9 +6,9 @@ from typing import Any
 
 from aiosqlite import Row
 
-from girder.db.repo._common import _validate_fields
 from girder.db.engine import Database
 from girder.db.models import Run, RunStatus
+from girder.db.repo._common import _validate_fields
 from girder.util import new_id, utcnow_iso
 
 # Non-status columns each update_*_fields may write. Status is excluded on

@@ -94,7 +94,9 @@ async def steer(
 
 
 @router.post("/api/runs/{rid}/reviewed", response_model=None)
-async def mark_merge_reviewed(request: Request, db: Db, rid: str) -> HTMLResponse | RedirectResponse:
+async def mark_merge_reviewed(
+    request: Request, db: Db, rid: str
+) -> HTMLResponse | RedirectResponse:
     """Produce the ``merge_reviewed`` event the T1 review window counts
     (issue 3) — the exact event type repo.count_unreviewed_merges checks."""
     run = await require_run(db, rid)

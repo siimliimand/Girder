@@ -221,7 +221,11 @@ class TaskEngine:
                     outcome = await runtime.execute_attempt(
                         spec_slice=fresh.spec_slice_md,
                         guidance=await codebase_index_guidance(
-                            _effective_guidance(), self.db, fresh, ctx.worktree.path, self.settings.limits
+                            _effective_guidance(),
+                            self.db,
+                            fresh,
+                            ctx.worktree.path,
+                            self.settings.limits,
                         ),
                         deadline_s=deadline,
                     )

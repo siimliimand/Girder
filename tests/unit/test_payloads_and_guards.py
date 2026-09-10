@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from girder.db import repo
-from girder.db.payloads import BudgetEventPayload, SteeringPayload, TransitionPayload
 from girder.db.engine import Database
+from girder.db.payloads import BudgetEventPayload, SteeringPayload, TransitionPayload
 
 
 async def test_repo_accepts_typed_payloads(db: Database) -> None:

@@ -16,7 +16,6 @@ from girder.api.deps import Db
 from girder.api.routes._shared import (
     excerpt,
     panel_context,
-    redact,
     require_run,
     run_context,
 )

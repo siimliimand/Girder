@@ -11,9 +11,22 @@ from __future__ import annotations
 import asyncio
 
 import girder.db.repo as repo
-from girder.db.repo import amendments, attempts, baselines, ci, events
-from girder.db.repo import integrity, projects, runs, steering, tasks, tool_calls
-from girder.db.repo import usage, waves, worktrees
+from girder.db.repo import (
+    amendments,
+    attempts,
+    baselines,
+    ci,
+    events,
+    integrity,
+    projects,
+    runs,
+    steering,
+    tasks,
+    tool_calls,
+    usage,
+    waves,
+    worktrees,
+)
 
 # The complete public surface of the pre-split repo.py (all top-level,
 # non-underscore functions and public dataclasses; the old module had no

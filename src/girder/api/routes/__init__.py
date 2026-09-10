@@ -13,28 +13,68 @@ from fastapi import APIRouter, Depends
 from girder.api.auth import require_api_key
 from girder.api.routes import (
     amendments as _amendments,
+)
+from girder.api.routes import (
     clarify as _clarify,
+)
+from girder.api.routes import (
     delivery as _delivery,
+)
+from girder.api.routes import (
     history as _history,
+)
+from girder.api.routes import (
     projects as _projects,
+)
+from girder.api.routes import (
     runs as _runs,
+)
+from girder.api.routes import (
     specs as _specs,
+)
+from girder.api.routes import (
     steering as _steering,
+)
+from girder.api.routes import (
     tiers as _tiers,
+)
+from girder.api.routes import (
     webhooks as _webhooks,
 )
 from girder.api.routes._shared import (
     excerpt as _excerpt,
+)
+from girder.api.routes._shared import (
     merge_queue as _merge_queue,
+)
+from girder.api.routes._shared import (
     merged_rows as _merged_rows,
+)
+from girder.api.routes._shared import (
     panel_context as _panel_context,
+)
+from girder.api.routes._shared import (
     proposal_task_rows as _proposal_task_rows,
+)
+from girder.api.routes._shared import (
     redact as _redact,
+)
+from girder.api.routes._shared import (
     redact_value as _redact_value,
+)
+from girder.api.routes._shared import (
     require_project as _require_project,
+)
+from girder.api.routes._shared import (
     require_run as _require_run,
+)
+from girder.api.routes._shared import (
     review_window_message as _review_window_message,
+)
+from girder.api.routes._shared import (
     review_window_state as _review_window_state,
+)
+from girder.api.routes._shared import (
     run_context as _run_context,
 )
 
@@ -69,8 +109,8 @@ from girder.api.routes.projects import (  # noqa: E402
     _project_timestamps,
 )
 from girder.api.routes.runs import (  # noqa: E402
-    _TASK_STATUS_CLASSES,
     _STREAM_END_STATUSES,
+    _TASK_STATUS_CLASSES,
     _event_class,
     _graph,
     _task_view,
@@ -84,9 +124,8 @@ from girder.api.routes.specs import (  # noqa: E402
 from girder.api.routes.steering import _github_for  # noqa: E402
 
 __all__ = [
-    "router",
-    "_TASK_STATUS_CLASSES",
     "_STREAM_END_STATUSES",
+    "_TASK_STATUS_CLASSES",
     "_amendments_inbox",
     "_estimate_ctx",
     "_event_class",
@@ -112,4 +151,5 @@ __all__ = [
     "_run_context",
     "_task_view",
     "_tier1_role",
+    "router",
 ]

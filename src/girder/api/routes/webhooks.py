@@ -17,12 +17,12 @@ from fastapi.responses import JSONResponse
 
 from girder.api.app import dispatch_generation
 from girder.api.routes._shared import review_window_message, review_window_state
+from girder.config import Settings
 from girder.db import repo
 from girder.db.engine import Database
-from girder.db.models import Project, RunStatus, TERMINAL_RUN_STATUSES
+from girder.db.models import TERMINAL_RUN_STATUSES, Project, RunStatus
 from girder.fsm import transition_run
 from girder.github.webhook import WebhookProcessor, parse_webhook_body, verify_github_signature
-from girder.config import Settings
 from girder.notify.slack import (
     make_amendment_resolver,
     parse_interactive_payload,

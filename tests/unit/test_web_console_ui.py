@@ -14,10 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from girder.api.app import create_app
-from girder.config import Secrets, Settings
 from girder.db import repo
-from girder.db.engine import Database, default_migrations_dir
+from girder.db.engine import Database
 from girder.db.models import TaskType
 from tests.unit.test_console_api import make_app, make_client, make_project, make_run
 
