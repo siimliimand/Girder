@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+from girder.config import Secrets, Settings
 from girder.db import repo
 from girder.db.engine import Database
 from girder.db.payloads import BudgetEventPayload, SteeringPayload, TransitionPayload
+from girder.guard.redact import Redactor
+from girder.orchestrator.run_engine import RunEngine
+
+from tests.conftest import seed_run_status
 
 
 async def test_repo_accepts_typed_payloads(db: Database) -> None:
@@ -48,16 +53,39 @@ async def test_get_latest_event_missing_returns_none(db: Database) -> None:
     assert await repo.get_latest_event(db, run.id, "no_such_event") is None
 
 
-async def test_guard_raises_informative_runtime_error(db: Database) -> None:
+async def test_guard_raises_informative_runtime_error(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """WP 10.4: the converted guards are always-on RuntimeErrors with the
-    entity id in the message, not -O-strippable asserts. Simulated directly:
-    a repo lookup returning None after the FSM row was deleted."""
+    entity id in the message, not -O-strippable asserts. Drives the REAL
+    re-fetch-after-transition guard in ``RunEngine._pump_budget_exhausted``
+    (run_engine.py) — the test fails if the guard is reverted to a bare
+    ``assert`` (or stripped under ``python -O``)."""
     project = await repo.create_project(db, "p", "/repo")
     run = await repo.create_run(db, project.id, "intent", "run/tp03", 5.0)
-    await db.execute("DELETE FROM runs WHERE id = ?", (run.id,))
-    assert await repo.get_run(db, run.id) is None
+    await seed_run_status(db, run.id, "budget_exhausted")
 
-    # The guard itself is exercised at the pump level; here we pin the
-    # contract: a vanished run id must surface as RuntimeError naming it.
+    engine = RunEngine(
+        db=db,
+        settings=Settings(),
+        secrets=Secrets(),
+        gateway=None,  # type: ignore[arg-type]
+        sandbox=None,  # type: ignore[arg-type]
+        notifier=None,
+        redactor=Redactor(),
+    )
+
+    # Spend < cap so the pump takes the resume path: transition to ACTIVE,
+    # then re-fetch the run — which we make vanish (None) to hit the guard.
+    # The downstream pump is stubbed so a removed guard fails cleanly with
+    # "did not raise" instead of an unrelated AttributeError on None.
+    async def vanished(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def noop_pump(run: object) -> str:
+        return "resumed"
+
+    monkeypatch.setattr(repo, "get_run", vanished)
+    monkeypatch.setattr(engine, "_pump_active", noop_pump)
     with pytest.raises(RuntimeError, match=run.id):
-        raise RuntimeError(f"run {run.id} disappeared during pump — database consistency error")
+        await engine._pump_budget_exhausted(run)

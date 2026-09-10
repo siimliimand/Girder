@@ -101,6 +101,15 @@ Exits 0 on success, 1 on any failure. Prints human-friendly error messages, one 
 - **WP 13.3 validate:** check 3 now reads the real `STACK_REGISTRY` (`girder.stacks`, arrived mid-flight in `7358bcc`) instead of the interim hardcoded set. `load_settings()` rejects unknown stacks early (pydantic), so a bad stack surfaces as the config-load failure path — validate collects it as one failure and still runs settings-independent checks (collect-all contract preserved; regression-tested).
 - **Testing:** 32 new tests across the three WPs (prune/validate 15, auth 11, incl. later additions); full suite green and `mypy --strict` clean at merge.
 
+### Post-merge review pass (2026-09-10)
+
+Five-reviewer re-read of the merged workstreams at HEAD (post wave-1/WS-02 integration); fixes landed the same day.
+
+- Prune: `clarification_sessions` added to `_PRUNE_TABLES` (`123590b`) — WS-04's migration 015 post-dated the original table sweep, so any victim run with a clarification session hit an FK violation and aborted the whole prune batch.
+- Console: `EventSource` now appends `?api_key=` from `localStorage["girder_api_key"]` (`08f5b4d`) — EventSource cannot send headers and bypasses the patched `fetch`, so live run events had been 403ing whenever auth was enabled.
+- Auth: `is_public_path` boundary tightened so prefix matching no longer exempts lookalikes (`/metricsEvil` ≠ `/metrics`); GET forms no longer receive the key in their action URL (`08f5b4d`).
+- Auth: the query-param channel is documented as a global-with-tradeoff decision (`08f5b4d`) — it exists for `EventSource` and forms, which cannot set headers; the cost (key may reach access logs/browser history on any route when that channel is used) is stated in `auth.py`.
+
 ## Relevant resolution log decision
 
 - **R-SP12-5:** API key auth, not sessions/OAuth — minimal surface; full auth is an explicit non-goal in plan.md §2.2.

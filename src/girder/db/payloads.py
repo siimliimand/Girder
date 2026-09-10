@@ -18,7 +18,11 @@ sites):
 - ``BudgetEventPayload``: the spec's four fields are required nowhere.
   ``budget_preflight_denied`` carries all of them plus token estimates,
   ``prompt_chars`` and ``reason``; ``model_call_dispatch`` omits
-  ``remaining_usd``. Hence total=False with the full observed key set.
+  ``remaining_usd``; the post-call audit events carry actuals —
+  ``model_call_completed`` adds ``prompt_tokens``, ``completion_tokens``,
+  ``cost_usd`` and ``over_budget``, and ``budget_tripwire`` adds
+  ``cost_usd``, ``run_spend_usd`` and ``budget_cap_usd``. Hence
+  total=False with the full observed key set.
 """
 
 from __future__ import annotations
@@ -53,7 +57,11 @@ class SteeringPayload(TypedDict, total=False):
 
 
 class BudgetEventPayload(TypedDict, total=False):
-    """Budget/model-call audit payloads (models/gateway.py)."""
+    """Budget/model-call audit payloads (models/gateway.py).
+
+    Covers the full write surface, not just preflight: estimates
+    (``budget_preflight_denied``, ``model_call_dispatch``) and actuals
+    (``model_call_completed``, ``budget_tripwire``)."""
 
     role: str
     model: str
@@ -63,3 +71,9 @@ class BudgetEventPayload(TypedDict, total=False):
     remaining_usd: float
     prompt_chars: int
     reason: str
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
+    over_budget: bool
+    run_spend_usd: float
+    budget_cap_usd: float
