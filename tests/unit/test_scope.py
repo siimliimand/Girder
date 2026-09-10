@@ -13,6 +13,7 @@ from girder.guard.scope import (
     glob_to_regex,
     path_matches,
     resolve_path,
+    run_command_path_args,
 )
 
 
@@ -171,6 +172,31 @@ def test_run_command_fd_dup_is_not_a_path_arg(scopes: TaskScopes) -> None:
     assert check_tool_call("run_command", {"cmd": "python -m pytest 2>&1"}, scopes) is (
         Verdict.ALLOW
     )
+
+
+def test_run_command_fd_dup_with_trailing_separator_is_not_a_write(
+    scopes: TaskScopes,
+) -> None:
+    """shlex keeps separator chars on the preceding token: `2>&1;` used to
+    parse as an attached `2>` write to `&1;` → VIOLATION, tainting a real
+    attempt for the innocent orientation command (dogfood run 32e16843)."""
+    cmd = (
+        'git rev-parse --show-toplevel 2>&1; echo "---"; '
+        'git rev-parse --git-dir 2>&1; echo "---"; git worktree list 2>&1'
+    )
+    assert check_tool_call("run_command", {"cmd": cmd}, scopes) is Verdict.ALLOW
+    assert check_tool_call("run_command", {"cmd": "git status 2>&1&& true"}, scopes) is (
+        Verdict.ALLOW
+    )
+
+
+def test_run_command_write_target_with_trailing_separator_still_writes(
+    scopes: TaskScopes,
+) -> None:
+    """The peel must not swallow real write targets: `> out;` writes `out`."""
+    _writes, _others = run_command_path_args("ls src > out;")
+    assert _writes == ["out"]
+    assert check_tool_call("run_command", {"cmd": "ls src > out;"}, scopes) is Verdict.VIOLATION
 
 
 def test_run_command_tee_in_scope_allowed(scopes: TaskScopes) -> None:

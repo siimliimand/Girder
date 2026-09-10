@@ -170,6 +170,13 @@ def run_command_path_args(cmd: str) -> tuple[list[str], list[str]]:
         tokens = shlex.split(cmd)
     except ValueError:
         return [], []
+    # shlex is not a shell parser: separator characters ride along on the
+    # preceding token ("git rev-parse 2>&1; echo x" yields "2>&1;"). Peel
+    # trailing separators so redirect classification stays correct — "2>&1;"
+    # is an fd-dup, not an attached "2>" write to "&1;" (the false positive
+    # that tainted a dogfood attempt for the innocent command
+    # `git rev-parse --show-toplevel 2>&1; echo ---; …`).
+    tokens = [t for t in (t.rstrip(";|&") for t in tokens) if t]
     writes: list[str] = []
     consumed: set[int] = set()
     i = 0
