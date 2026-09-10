@@ -3,6 +3,7 @@
    All dynamic strings were re-redacted in the route (plan §10). #}
 {% extends "base.html" %}
 {% block content %}
+<script src="/static/diff.js"></script>
 <h1>Post-mortem — run <code>{{ run.id[:8] }}</code></h1>
 <p>Project: <a href="/projects/{{ project.id }}">{{ project.name }}</a>
    | <a href="/runs/{{ run.id }}">run page</a>
@@ -83,7 +84,7 @@
       {% if av.diff %}
       <details class="diff">
         <summary>diff (base..head)</summary>
-        <pre>{{ av.diff }}</pre>
+        <pre class="diff-src">{{ av.diff }}</pre>
       </details>
       {% endif %}
       <h5>Tool calls</h5>
@@ -141,4 +142,7 @@
 {% else %}
   <p class="muted">No tasks.</p>
 {% endfor %}
+<script>
+  if (window.GirderDiff) window.GirderDiff.renderAll(document);
+</script>
 {% endblock %}

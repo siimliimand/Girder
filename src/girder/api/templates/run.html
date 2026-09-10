@@ -5,6 +5,7 @@
 #}
 {% extends "base.html" %}
 {% block content %}
+<script src="/static/diff.js"></script>
 <h1>Run <code>{{ run.id[:8] }}</code></h1>
 <p>Project: <a href="/projects/{{ project.id }}">{{ project.name }}</a>
    | <a href="/runs/{{ run.id }}/postmortem">Post-mortem</a></p>
@@ -28,6 +29,7 @@
       .then(function (r) { return r.text(); })
       .then(function (html) {
         el.innerHTML = html;
+        if (window.GirderDiff) window.GirderDiff.renderAll(el);
         if (html.indexOf('data-poll="true"') === -1 && timer) {
           clearInterval(timer);
           timer = null;
@@ -73,17 +75,17 @@
       <h3>Wave {{ w.sequence_order }}
         <span class="badge">{{ w.status }}</span></h3>
       {% for t in w.tasks %}
-        <div class="task task-{{ t.cls }}">
+        <div class="task task-{{ t.cls }}" data-task-id="{{ t.id }}">
           <strong>#{{ t.seq }} {{ t.title }}</strong>
           <span class="badge">{{ t.task_type }}</span>
-          <span class="badge">{{ t.status }}</span>
+          <span class="badge task-status-badge">{{ t.status }}</span>
           <div class="muted">scope: {% for g in t.scope_globs %}<code>{{ g }}</code> {% else %}—{% endfor %}</div>
           {% if t.depends_on %}<div class="muted">depends on: {{ t.depends_on|join(', ') }}</div>{% endif %}
           {% set diff = diffs_by_task.get(t.id) %}
           {% if diff %}
           <details class="diff">
             <summary>diff (latest attempt)</summary>
-            <pre>{{ diff }}</pre>
+            <pre class="diff-src">{{ diff }}</pre>
           </details>
           {% endif %}
         </div>
@@ -96,8 +98,8 @@
     <section class="wave">
       <h3>Unwaved tasks</h3>
       {% for t in graph.unwaved_tasks %}
-        <div class="task task-{{ t.cls }}"><strong>#{{ t.seq }} {{ t.title }}</strong>
-          <span class="badge">{{ t.status }}</span></div>
+        <div class="task task-{{ t.cls }}" data-task-id="{{ t.id }}"><strong>#{{ t.seq }} {{ t.title }}</strong>
+          <span class="badge task-status-badge">{{ t.status }}</span></div>
       {% endfor %}
     </section>
   {% endif %}
@@ -149,6 +151,30 @@
   var log = document.getElementById("event-log");
   var note = document.getElementById("stream-note");
   var es = new EventSource("/api/runs/{{ run.id }}/events?after_id=0");
+
+  {# WP 12.2 live DAG: task state_transition events carry
+     payload={entity:"task", id, from, to} (fsm.transition payload shape) —
+     flip the task box class and badge text in place, no panel re-fetch. #}
+  var _STATUS_CLASS = {
+    pending: "pending", scheduled: "running", running: "running",
+    verifying: "verifying", verify_passed: "done",
+    retry_scheduled: "retry", awaiting_amendment: "amendment",
+    completed: "done", failed: "failed",
+    skipped: "slate", force_passed: "slate", dropped: "slate"
+  };
+  es.addEventListener("state", function (e) {
+    var d;
+    try { d = JSON.parse(e.data); } catch (err) { return; }
+    var p = d.payload;
+    if (!p || p.entity !== "task") return;
+    var el = document.querySelector('[data-task-id="' + p.id + '"]');
+    if (!el) return;
+    var cls = _STATUS_CLASS[p.to] || "pending";
+    el.className = el.className.replace(/task-\S+/, "task-" + cls);
+    var badge = el.querySelector(".task-status-badge");
+    if (badge) badge.textContent = p.to;
+  });
+
   ["violation", "budget", "state", "tool", "info"].forEach(function (cls) {
     es.addEventListener(cls, function (e) {
       var d = JSON.parse(e.data);
@@ -166,5 +192,6 @@
   es.onopen = function () { note.textContent = "live"; };
   es.onerror = function () { note.textContent = "reconnecting…"; };
 })();
+if (window.GirderDiff) window.GirderDiff.renderAll(document);
 </script>
 {% endblock %}

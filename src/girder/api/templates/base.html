@@ -1,4 +1,10 @@
-{# Girder approval console — shared layout (impl-plan §10). #}
+{# Girder approval console — shared layout (impl-plan §10).
+
+   WP 12.1 dark mode: theme resolves at parse time (before first paint) —
+   localStorage("girder-theme") wins over prefers-color-scheme when set — and
+   the toggle button flips data-theme="dark"|"light" on <html>, persisting it.
+   data-theme="" clears the override back to OS preference.
+#}
 <!doctype html>
 <html lang="en">
 <head>
@@ -6,6 +12,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Girder</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("girder-theme"); } catch (e) {}
+      if (t === "dark" || t === "light") {
+        document.documentElement.setAttribute("data-theme", t);
+      }
+    })();
+  </script>
 </head>
 <body>
   <nav>
@@ -13,10 +28,24 @@
     <a href="/merge-queue">Merge queue</a>
     <a href="/amendments">Amendments</a>
     <a href="/history">History</a>
+    <button id="theme-toggle" type="button"
+            title="Toggle dark mode (empty = follow OS preference)">◐ theme</button>
     <span class="brand">Girder</span>
   </nav>
   <main>
     {% block content %}{% endblock %}
   </main>
+  <script>
+    (function () {
+      var btn = document.getElementById("theme-toggle");
+      if (!btn) return;
+      btn.addEventListener("click", function () {
+        var root = document.documentElement;
+        var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        root.setAttribute("data-theme", next);
+        try { localStorage.setItem("girder-theme", next); } catch (e) {}
+      });
+    })();
+  </script>
 </body>
 </html>
