@@ -33,6 +33,7 @@ from girder.db.models import Run, RunStatus
 from girder.github.client import GitHubClient
 from girder.gitops.worktree import DEFAULT_BASE
 from girder.guard.redact import Redactor
+from girder.logging_config import configure_logging
 from girder.models.gateway import ModelGateway
 from girder.notify.notifier import Notifier
 from girder.notify.telegram_inbound import TelegramReceiver
@@ -471,6 +472,13 @@ def main(argv: list[str] | None = None) -> int:
         help="confirm a development environment (required for --sandbox local,"
         " alternatively set GIRDER_DEV=1)",
     )
+    daemon_parser.add_argument(
+        "--log-format",
+        dest="log_format",
+        default="text",
+        choices=["text", "json"],
+        help="log output format; json for daemon/service mode (default: text)",
+    )
     pump_parser = sub.add_parser(
         "pump", help="drive one run a single pump step (or to completion with --wait)"
     )
@@ -510,9 +518,9 @@ def main(argv: list[str] | None = None) -> int:
     review_parser.add_argument("run_id", help="merged run id to mark reviewed")
 
     args = parser.parse_args(argv)
-    logging.basicConfig(
+    configure_logging(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        fmt=getattr(args, "log_format", "text"),
     )
     # fail fast with a readable message when migrations cannot be located
     try:
