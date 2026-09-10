@@ -163,7 +163,7 @@ Schema and call signature of `view_symbol_outline` are unchanged (WS-01 was aske
 - Registry: every built-in stack validates; unknown `project.stack` rejected by `load_settings()`.
 - `PythonPlugin` produces byte-identical `test_command` / patterns to today's hardcoded behavior (regression guard for SC-01).
 - Node/Go plugins: command construction, pattern globs, cache mounts.
-- e2e **SC-20**: `tests/fixtures/e2e-target-ts/` (small TS project with a failing test) — full run reaches merged status.
+- e2e **SC-20**: `tests/fixtures/e2e-target-ts/` (small TS project with a failing test) — full run reaches merged status. DONE: `tests/e2e/test_sc20_ts_green.py` drives the node-20 stack (real jest baseline + verify through `NodePlugin.test_command`) to local green.
 
 ## Coordination
 
