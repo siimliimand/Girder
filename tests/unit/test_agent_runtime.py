@@ -664,7 +664,7 @@ async def test_compaction_refreshes_structured_scratchpad_without_distillation(
     assert scratch.role == "system"
     assert scratch.content.startswith("[TRUSTED] Scratchpad:")
     assert '"files_read": ["src/a.py"]' in scratch.content
-    assert '"plan": "PLAN: write the thing"' in scratch.content
+    assert '"plan (untrusted model output, verbatim)": "PLAN: write the thing"' in scratch.content
     # second compaction refreshes in place — never two scratchpad messages
     messages.append(
         Message(
@@ -743,3 +743,75 @@ async def test_planning_hold_never_laundered_scope_violation_still_recorded(
     bad = next(r for r in rows if r["tool_name"] == "write_file")
     assert bad["scope_violation"] and bad["held"]
     assert await repo.count_held_tool_calls(db, attempt.id) == 1
+
+# ------------------------------------------------- B1/B3/R1 review fixes
+
+
+async def test_plan_only_turn_arms_the_unlock_latch(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """B1: a compliant model emits the PLAN block as plain text with NO tool
+    calls on turn 1 — that turn must still arm the latch and store the plan,
+    so the turn-2 write executes instead of being held. A forced compaction
+    afterwards re-injects the plan in the refreshed scratchpad message (with
+    its B3 untrusted provenance label)."""
+    _db, _run_id, _attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(content="PLAN:\n- Read: src/a.py\n- Write: src/b.py\n- Test: pytest"),
+            _resp(calls=[_tc("1", "write_file", '{"path":"src/b.py","content":"x"}')]),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
+    runtime = _planning_runtime(seeded, gateway, sandbox)
+    runtime._context_window = 1000  # force should_compact on the tail below
+    outcome = await runtime.execute_attempt(spec_slice="s")
+    assert outcome.status == "succeeded"
+    assert runtime._plan_emitted
+    assert "PLAN:" in runtime._scratchpad.plan
+    # the turn-2 write EXECUTED (mkdir plumbing), it was not held
+    assert any(cmd[0] == "mkdir" for _, cmd, _ in sandbox.execs)
+
+    # forced compaction: the plan survives in the refreshed [TRUSTED]
+    # scratchpad message, labeled untrusted inside the JSON
+    messages = [
+        Message(role="system", content="SYSTEM INVARIANTS"),
+        Message(role="user", content="TASK BRIEF"),
+        Message(role="user", content="X" * 6000),
+    ]
+    messages = runtime._maybe_compact(messages)
+    scratch = messages[2]
+    assert scratch.role == "system" and scratch.content.startswith("[TRUSTED] Scratchpad:")
+    assert "plan (untrusted model output, verbatim)" in scratch.content
+    assert "PLAN:" in scratch.content
+
+
+async def test_planning_hold_emits_planning_hold_event(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """R1/R3: every planning-phase hold fires a countable planning_hold
+    agent_event carrying the tool and the turn number."""
+    db, run_id, attempt, _ = seeded
+    gateway = FakeGateway(
+        [
+            _resp(calls=[_tc("1", "write_file", '{"path":"src/a.py","content":"x"}')]),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+    outcome = await _planning_runtime(seeded, gateway, FakeSandbox()).execute_attempt(
+        spec_slice="s"
+    )
+    assert outcome.status == "succeeded"
+    rows = await db.fetchall(
+        "SELECT payload_json FROM agent_events WHERE event_type = 'planning_hold'"
+        " AND attempt_id = ?",
+        (attempt.id,),
+    )
+    import json as _json
+
+    payloads = [_json.loads(r["payload_json"]) for r in rows]
+    assert payloads == [{"tool": "write_file", "turn": 1}]
+    # run scoping matches the other runtime events
+    assert all(r["payload_json"] for r in rows)
+    del run_id

@@ -66,6 +66,9 @@ class VerificationResult:
     # (salvage sha, changed files) when the failed attempt's dirty worktree
     # was committed to the task branch before teardown (Group B).
     salvage: tuple[str, list[str]] | None = None
+    # Test ids that failed in the JUnit report on the red-suite path —
+    # surfaced verbatim in the WP 8.3 retry brief (B2).
+    failing_tests: tuple[str, ...] = ()
 
 
 # Historical internal alias (pre-split name).
@@ -131,6 +134,7 @@ async def run_verification(
 
     if not suite_green:
         tail = redact_tail(engine, exec_res.stdout + "\n" + exec_res.stderr)
+        failing = tuple(tid for tid, r in test_results.items() if r != "passed")
         return await retry_step(
             engine,
             run,
@@ -140,6 +144,7 @@ async def run_verification(
             event="verify_failed",
             note="verification suite failed",
             turns_used=turns_used,
+            failing_tests=failing,
         )
 
     # Suite green — kill the container BEFORE any orchestrator-side audit
@@ -370,6 +375,7 @@ async def retry_step(
     event: str,
     note: str,
     turns_used: int | None = None,
+    failing_tests: tuple[str, ...] = (),
 ) -> VerificationResult:
     """Close the attempt FAILED and retry with feedback, or fail the task."""
     # Group B: salvage any uncommitted work before the engine-level
@@ -390,4 +396,4 @@ async def retry_step(
     # Feedback to the next attempt must be the redacted tail (Phase 2
     # task 5): the raw detail can carry git stderr with secret-shaped
     # content (e.g. a merge-refusal echoing a token).
-    return VerificationResult("retry", tail, salvage=salvage)
+    return VerificationResult("retry", tail, salvage=salvage, failing_tests=failing_tests)

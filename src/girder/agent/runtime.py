@@ -260,6 +260,15 @@ class AgentRuntime:
                     "timeout", None, "wall-clock deadline exhausted mid-turn", turns_used
                 )
 
+            # WP 8.1: a PLAN block in the response unlocks write tools from
+            # this turn on (the planning budget is a ceiling, not a delay).
+            # Checked BEFORE the no-tool-call branch (B1): a compliant model
+            # emits the plan as plain text with no tool calls, and that turn
+            # must still arm the latch and store the plan.
+            if not self._plan_emitted and "PLAN:" in (response.content or ""):
+                self._plan_emitted = True
+                self._scratchpad.plan = (response.content or "")[:_PLAN_MAX_CHARS]
+
             if not response.tool_calls:
                 # No action: nudge and count the turn; cap handled by the loop.
                 # Final-turn nudge reminds the agent the budget was announced.
@@ -273,11 +282,6 @@ class AgentRuntime:
                 messages = self._maybe_compact(messages)
                 continue
 
-            # WP 8.1: a PLAN block in the response unlocks write tools from
-            # this turn on (the planning budget is a ceiling, not a delay).
-            if not self._plan_emitted and "PLAN:" in (response.content or ""):
-                self._plan_emitted = True
-                self._scratchpad.plan = (response.content or "")[:_PLAN_MAX_CHARS]
             try:
                 calls = await self._run_calls(
                     response.tool_calls, deadline_s=deadline_s, turn=turns_used
@@ -442,6 +446,16 @@ class AgentRuntime:
                 if verdict is not Verdict.VIOLATION:
                     executed.append(
                         (tc.name, {}, ToolExecResult(ok=False, output=_PLANNING_HOLD_OUTPUT))
+                    )
+                    # R1/R3 instrumentation: countable planning-phase holds
+                    # for dogfood analysis (same fire-and-forget machinery as
+                    # tool_result / terminal_bounced).
+                    await repo.insert_event(
+                        self.db,
+                        "planning_hold",
+                        {"tool": tc.name, "turn": turn},
+                        run_id=self.run_id,
+                        attempt_id=self.attempt.id,
                     )
                     continue
             try:

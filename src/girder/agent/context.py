@@ -77,7 +77,11 @@ class Scratchpad:
         """Compact JSON rendering (injected/refreshed verbatim on compaction)."""
         return json.dumps(
             {
-                "plan": self.plan,
+                # B3 provenance: the plan is verbatim MODEL text stored by the
+                # runtime — it rides inside a [TRUSTED] system message only for
+                # compaction-survival, so its key carries the untrusted marker
+                # (no sanitization machinery; labeling only).
+                "plan (untrusted model output, verbatim)": self.plan,
                 "files_read": self.files_read,
                 "files_written": self.files_written,
                 "test_results": self.test_results,

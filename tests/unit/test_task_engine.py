@@ -331,17 +331,88 @@ async def test_suite_red_then_green_retries_with_guidance(harness: Harness) -> N
     fresh = await repo.get_task(h.db, task.id)
     assert fresh is not None and fresh.attempts_used == 2
 
-    # second attempt saw the redacted failure tail as trusted guidance
+    # second attempt saw the redacted failure tail inside the structured
+    # [TRUSTED] retry brief (WP 8.3, B2: verify-fail retries get the brief too)
     second_user = next(
         m for m in gateway.calls[3] if getattr(m, "role", "") == "user"  # first msg of attempt 2
     )
-    assert "Previous attempt failed verification" in second_user.content
+    assert "[TRUSTED] Retry brief (attempt 1 failed):" in second_user.content
     assert "assert 1 == 2" in second_user.content
+    assert "Failing tests:" in second_user.content
+    assert "test_bad" in second_user.content
 
     events = await h.db.fetchall(
         "SELECT event_type FROM agent_events WHERE run_id = ?", (h.run.id,)
     )
     assert any(e["event_type"] == "verify_failed" for e in events)
+
+
+async def test_verify_fail_retry_brief_carries_salvage_and_failing_tests(
+    harness: Harness,
+) -> None:
+    """B2/R4: a verify-fail death with a dirty worktree gives attempt 2 the
+    structured [TRUSTED] brief — failure detail, failing tests, salvage sha —
+    and the salvage sentence appears exactly ONCE (the brief owns it; no
+    salvage_guidance append on top)."""
+    h = harness
+    task = await _seed_task(h)
+
+    class _FailingProbeSandbox(ScriptSandbox):
+        """ScriptSandbox whose terminal-gate dirty probe FAILS — the runtime
+        fails open, so the attempt completes with a genuinely dirty worktree
+        (verify's leftover-audit backstop then salvages it on the retry)."""
+
+        async def exec(
+            self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
+        ) -> ExecResult:
+            if cmd[:2] == ["git", "status"]:
+                return ExecResult(1, "", "probe unavailable")
+            return await super().exec(name, cmd, timeout_s=timeout_s, user=user)
+
+    h.sandbox = _FailingProbeSandbox(
+        suite_results=[
+            ExecResult(1, "assert 1 == 2\nFAILED tests/test_p.py::test_bad", ""),
+            ExecResult(0, "", ""),
+        ],
+        suite_xml=RED_XML,
+    )
+    dirty_writer = [
+        _resp(
+            calls=[
+                _tc(
+                    "1",
+                    "write_file",
+                    '{"path":"src/app.py","content":"def greet():\\n    return 1\\n"}',
+                )
+            ]
+        ),
+        _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+    ]
+    finish_only = [
+        _resp(calls=[_tc("1", "mark_task_complete", '{"summary":"finished salvaged work"}')]),
+    ]
+    gateway = FakeGateway(responses=[*dirty_writer, *finish_only])
+    outcome = await h.engine(gateway).execute_task(h.run, task)
+    assert outcome.kind == "completed"
+
+    attempts = await _attempt_rows(h.db, task.id)
+    assert len(attempts) == 2
+    assert attempts[0]["status"] == AttemptStatus.FAILED.value
+
+    # the salvage commit exists on the task branch
+    wip_sha = (
+        await _git(h.repo_path, "log", f"task/{task.id}", "--format=%H", "--grep=wip")
+    ).strip()
+    assert wip_sha, "no wip(attempt N) salvage commit on the task branch"
+
+    second_user = next(m for m in gateway.calls[2] if getattr(m, "role", "") == "user")
+    content = second_user.content
+    assert "[TRUSTED] Retry brief (attempt 1 failed):" in content
+    assert "assert 1 == 2" in content  # failure detail (redacted suite tail)
+    assert "Failing tests:" in content and "test_bad" in content
+    assert wip_sha.splitlines()[0] in content  # salvage sha in the brief
+    # single-sourced salvage wording: no duplicated salvage sentence
+    assert content.count("do not redo") == 1
 
 
 async def test_attempts_exhausted_fails_task_and_notifies(harness: Harness) -> None:
@@ -1034,12 +1105,14 @@ async def test_turn_cap_salvages_dirty_worktree_for_retry(harness: Harness) -> N
     merged = await _git(h.repo_path, "show", f"{tip}:src/app.py")
     assert "return 2" in merged
 
-    # attempt 2's guidance carried the salvage sha + do-not-redo phrasing
+    # attempt 2's guidance carried the salvage sha via the structured brief
+    # (R4: the brief owns the salvage wording — no separate salvage sentence)
     second_user = next(
         m for m in gateway.calls[2] if getattr(m, "role", "") == "user"  # attempt 1 = 2 msgs
     )
-    assert "salvaged as commit" in second_user.content
-    assert "do not redo completed work" in second_user.content
+    assert "committed to the task branch as" in second_user.content
+    assert "do not redo it" in second_user.content
+    assert second_user.content.count("do not redo") == 1
     assert wip_sha.splitlines()[0] in second_user.content
     assert "turn budget" in second_user.content  # original failure detail kept
 
