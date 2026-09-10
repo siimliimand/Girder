@@ -1,0 +1,34 @@
+# girder-runner:go-1.23 — Go 1.23 runner image (WP 11.3).
+#
+# Mirrors Dockerfile.python-3.12: non-root agent user mapped to the worktree
+# owner; caches under /cache/* (world-traversable mount points).
+#
+# Build:  docker/podman build -t girder-runner:go-1.23 -f container/Dockerfile.go-1.23 container/
+# (context is the container/ directory)
+
+FROM golang:1.23-slim
+
+# Tooling the agent runtime relies on.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ripgrep procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# gotestsum wraps `go test` to emit JUnit XML (plain go test has no
+# junit-report flag). Pinned; re-pin deliberately.
+RUN go install gotest.tools/gotestsum@v1.12.0
+
+ENV GOPATH=/root/go \
+    GOMODCACHE=/root/go/pkg/mod
+
+# Agent user; uid/gid are overridden at container start to the worktree owner.
+RUN useradd --create-home --uid 10001 agent
+ENV HOME=/home/agent
+
+# World-traversable cache mount points (contents arrive read-only from host;
+# the module cache lives under /root/go in the image, mounted over at runtime).
+# The module cache mount lands under /root (per WP 11.3), so /root must be
+# traversable by the non-root agent user.
+RUN mkdir -p /var/cache/orchestrator/go /root/go/pkg/mod && chmod 755 /root
+
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

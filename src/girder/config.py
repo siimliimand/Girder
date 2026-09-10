@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import PydanticBaseSettingsSource
 
+from girder.stacks import STACK_REGISTRY
+
 log = logging.getLogger(__name__)
 
 
@@ -378,6 +380,16 @@ def load_settings(
         token = None
     try:
         settings = Settings()
+        # WS-07 (WP 11.1): an unknown stack must be a hard configuration
+        # error, not a silent fall-through to Python defaults mid-run.
+        # Checked before the roles validation so basic project config errors
+        # surface first.
+        stack = settings.project.stack
+        if stack not in STACK_REGISTRY:
+            raise ValueError(
+                f"project.stack {stack!r} is not a registered stack;"
+                f" known stacks: {sorted(STACK_REGISTRY)}"
+            )
         if not settings.models.roles:
             # impl-plan §6.1 ("Validates: … at least one model role per tier",
             # issue 16): an empty registry must be a hard configuration error,

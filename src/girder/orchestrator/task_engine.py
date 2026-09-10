@@ -60,6 +60,7 @@ from girder.notify.notifier import Notifier
 from girder.orchestrator.baseline import empty_suite_accepted, parse_junit_xml
 from girder.sandbox.engine import ContainerSpec, SandboxEngine
 from girder.specs import amendment as spec_amendment
+from girder.stacks import get_stack  # WS-07A: per-stack verify suite (WP 11.1)
 from girder.util import run_host_cmd, utcnow_iso
 
 log = logging.getLogger(__name__)
@@ -565,7 +566,11 @@ class TaskEngine:
             return _VerifyStep("integrity_violation", reason)
         exec_res = await self.sandbox.exec(
             container,
-            verify_cmd(self.settings.sandbox.python_bin),
+            # WS-07A (WP 11.1): the stack plugin resolves the verify suite;
+            # PythonPlugin returns exactly verify_cmd(python_bin) (SC-01 guard).
+            get_stack(self.settings.project.stack).test_command(
+                self.settings.sandbox.python_bin
+            ),
             timeout_s=_VERIFY_TIMEOUT_S,
         )
         xml_path = worktree.path / VERIFY_XML

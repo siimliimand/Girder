@@ -1,0 +1,39 @@
+# girder-runner:node-20 — Node.js 20 / TypeScript runner image (WP 11.2).
+#
+# Mirrors the structure of Dockerfile.python-3.12: the agent runs as a
+# non-root user whose uid maps to the worktree owner, and package caches
+# target /cache/* because /root is not traversable for a non-root user with
+# CAP_DAC_OVERRIDE dropped.
+#
+# Build:  docker/podman build -t girder-runner:node-20 -f container/Dockerfile.node-20 container/
+# (context is the container/ directory)
+
+FROM node:20-slim
+
+# Tooling the agent runtime relies on (same set as the Python runner minus fd's
+# Debian alias — node-slim ships no fd-find; ripgrep and git are baked).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ripgrep procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-baked test toolchain (deps baked so --network=none testing works).
+# NOTE: the real jest JUnit reporter package is `jest-junit` (no
+# `@jest/junit-reporter` exists on npm). typescript-eslint provides the
+# parser used by the symbol-outline snippet.
+RUN npm install -g typescript jest ts-jest jest-junit @typescript-eslint/parser
+
+# jest-junit report location: the orchestrator parses
+# /workspace/.girder-verify.xml (task_engine.VERIFY_XML) after every verify.
+ENV NPM_CONFIG_CACHE=/cache/npm \
+    JEST_JUNIT_OUTPUT_FILE=/workspace/.girder-verify.xml \
+    JEST_JUNIT_OUTPUT_NAME=/workspace/.girder-verify.xml
+
+# Agent user; uid/gid are overridden at container start to the worktree owner.
+RUN useradd --create-home --uid 10001 agent
+ENV HOME=/home/agent
+
+# World-traversable cache mount point (contents arrive read-only from host).
+RUN mkdir -p /cache/npm /var/cache/orchestrator/npm && chmod 755 /cache
+
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
