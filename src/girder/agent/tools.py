@@ -23,6 +23,8 @@ import json
 import re
 import shlex
 import time
+import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,8 +38,18 @@ from girder.guard.scope import TaskScopes, Verdict, check_tool_call
 from girder.sandbox.engine import SandboxEngine
 
 _TERMINAL_TOOLS = ("mark_task_complete", "request_spec_amendment")
-_WRITE_TOOLS = ("write_file", "apply_patch")
-_READ_TOOLS = ("read_file", "ripgrep", "find_files", "view_symbol_outline")
+_WRITE_TOOLS = ("write_file", "apply_patch", "edit_file")
+_READ_TOOLS = (
+    "read_file",
+    "ripgrep",
+    "find_files",
+    "view_symbol_outline",
+    "list_directory",
+    "git_status",
+    "git_diff",
+    "run_tests",
+    "search_symbols",
+)
 
 _B64_DECODE_SNIPPET = (
     "import base64,sys,pathlib; pathlib.Path(sys.argv[1]).write_bytes("
@@ -53,6 +65,57 @@ _AST_OUTLINE_SNIPPET = (
 
 _PATCH_PREFIX = "/tmp/.girder-patch"
 _MATCH_CAP = 200  # rg / grep match cap before truncation
+_RUN_TESTS_JUNIT = "/tmp/.girder-run-tests.xml"
+
+# edit_file (WP 7.1): replace lines start..end (1-indexed, inclusive) with the
+# base64-argv replacement. Out-of-range ranges fail via assert — a silent
+# clamp would corrupt the wrong lines.
+_EDIT_SNIPPET = (
+    "import sys, pathlib, base64; "
+    "p = pathlib.Path(sys.argv[1]); "
+    "lines = p.read_text().splitlines(keepends=True); "
+    "s, e = int(sys.argv[2]) - 1, int(sys.argv[3]); "
+    "repl = base64.b64decode(sys.argv[4]).decode(); "
+    "assert 1 <= s + 1 <= e <= len(lines), ("
+    "f'line range {s + 1}..{e} out of range: file has {len(lines)} lines'); "
+    "lines[s:e] = [repl] if repl.endswith('\\n') else [repl + '\\n']; "
+    "p.write_text(''.join(lines))"
+)
+
+# list_directory (WP 7.2): os.walk with a depth limit; depth counts tree
+# levels (1 = direct children of `root`). Output lines are
+# "<path> [dir]" / "<path> [file N bytes]", .git pruned, entries sorted.
+_DIR_LIST_SNIPPET = (
+    "import os, sys; "
+    "root, maxd = sys.argv[1], max(1, min(3, int(sys.argv[2]))); "
+    "if not os.path.isdir(root): raise SystemExit('error: not a directory: ' + root); "
+    "base = os.path.normpath(root); "
+    "out = []; "
+    "for d, dirs, files in os.walk(root): "
+    "rel = os.path.relpath(d, base); "
+    "depth = 0 if rel == '.' else rel.count(os.sep) + 1; "
+    "dirs[:] = sorted(x for x in dirs if x != '.git'); "
+    "files = sorted(files); "
+    "out.extend(os.path.join(d, n) + ' [dir]' for n in dirs); "
+    "out.extend("
+    "os.path.join(d, n) + ' [file ' + str("
+    "os.path.getsize(os.path.join(d, n)) if os.path.exists(os.path.join(d, n)) else 0"
+    ") + ' bytes]' for n in files); "
+    "if depth + 1 >= maxd: dirs[:] = []; "
+    "print('\\n'.join(out))"
+)
+
+# New tools whose scope verdict is derived from an existing gate shape
+# (R-SP7 scope policy applied without touching guard/scope.py, which WS-01
+# does not own): edit_file -> write_file policy on `path`,
+# list_directory/search_symbols -> read_file policy on `path`,
+# run_tests -> run_command policy on the synthesized pytest command.
+_NEW_TOOL_ALIASES = {
+    "edit_file": "write_file",
+    "list_directory": "read_file",
+    "search_symbols": "read_file",
+}
+_GATED_NEW_TOOLS = frozenset(_NEW_TOOL_ALIASES) | {"git_status", "git_diff", "run_tests"}
 
 # git-status --porcelain XY codes whose working tree is UNMERGED (conflict):
 # completing on top of these is judged downstream, never bounced (see
@@ -123,7 +186,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "find_files",
-            "description": "Find files by glob pattern (fd if available, find otherwise).",
+            "description": "Find files matching a glob pattern across the worktree.",
             "parameters": {
                 "type": "object",
                 "properties": {"glob": {"type": "string"}},
@@ -135,7 +198,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "ripgrep",
-            "description": "Regex search across the worktree (rg if available, grep otherwise).",
+            "description": "Regex search across the worktree.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -151,7 +214,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "view_symbol_outline",
-            "description": "List classes/functions with line numbers for a source file.",
+            "description": (
+                "List classes/functions with line numbers for a source file."
+                " Full support for Python (precise AST outlines); other"
+                " languages fall back to a line-based declaration grep."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -163,7 +230,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Run a shell command inside the sandbox (no network).",
+            "description": (
+                "Run a shell command inside the sandbox (no network)."
+                " Denied commands: curl, wget, nc, ssh, git push, sudo,"
+                " podman, docker, mount."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -171,6 +242,141 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "timeout_s": {"type": "number"},
                 },
                 "required": ["cmd"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace a contiguous block of lines in a file."
+                " Use view_symbol_outline + read_file first to identify exact"
+                " line numbers. start_line and end_line are 1-indexed and"
+                " inclusive. The replacement text replaces those lines exactly"
+                " — do not include surrounding context lines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to replace (1-indexed, inclusive)",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to replace (1-indexed, inclusive)",
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "description": "New content for lines start_line..end_line",
+                    },
+                },
+                "required": ["path", "start_line", "end_line", "replacement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": (
+                "List entries in a directory. Returns name, type (file/dir),"
+                " and size for each entry. Depth controls recursion"
+                " (1 = direct children only). Use this instead of 'ls' or"
+                " 'find' when surveying a new area."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                    "depth": {
+                        "type": "integer",
+                        "default": 1,
+                        "description": "Max recursion depth (1-3)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "Show the worktree status (git status --short). Read-only.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": "Show unstaged (or staged) changes for the worktree. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Restrict diff to this file (optional)",
+                    },
+                    "staged": {"type": "boolean", "default": False},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run the project test suite (or a subset) and return a"
+                " structured summary. Prefer this over 'run_command' with"
+                " pytest — it returns structured results and clips verbose"
+                " passing output automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Test files or directories to run (empty = full suite)",
+                    },
+                    "keyword": {"type": "string", "description": "pytest -k filter expression"},
+                    "timeout_s": {"type": "number", "default": 120},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_symbols",
+            "description": (
+                "Find symbol definitions or usages across the codebase."
+                " kind='definition' finds where a symbol is defined;"
+                " kind='usage' finds all call sites;"
+                " kind='export' lists what a module exports."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Symbol name (class, function, variable)",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["definition", "usage", "export"],
+                        "default": "definition",
+                    },
+                    "path": {"type": "string", "description": "Restrict search to this path"},
+                },
+                "required": ["name"],
             },
         },
     },
@@ -277,6 +483,71 @@ def screen_command(cmd: str) -> None:
                 raise CommandDenied(f"denied: chmod targeting a test-signal path: {cmd[:120]}")
 
 
+def _gate_new_tool(name: str, args: dict[str, Any], scopes: TaskScopes) -> Verdict:
+    """Scope verdict for the WP 7.x tools, expressed via existing gate shapes.
+
+    ``check_tool_call`` returns ``ALLOW`` for tools it does not know; these
+    tools re-enter the same decision point under their policy-equivalent
+    tool/args so write-policy, protected globs, strict read scope and the
+    run_command path screening all apply unchanged.
+    """
+    if name in _NEW_TOOL_ALIASES:
+        return check_tool_call(_NEW_TOOL_ALIASES[name], {"path": str(args.get("path", ""))}, scopes)
+    if name in ("git_status", "git_diff"):
+        # Read-only over the git object store — always in-scope, but logged.
+        return Verdict.ALLOW_LOGGED
+    if name == "run_tests":
+        # Same policy as run_command on the equivalent pytest invocation.
+        paths = " ".join(shlex.quote(str(p)) for p in (args.get("paths") or []))
+        cmd = "pytest " + paths
+        keyword = str(args.get("keyword") or "")
+        if keyword:
+            cmd += " -k " + shlex.quote(keyword)
+        return check_tool_call("run_command", {"cmd": cmd}, scopes)
+    return Verdict.ALLOW
+
+
+def _summarize_junit(xml_text: str) -> str | None:
+    """JUnit XML -> stable one-line summary plus a full failure list.
+
+    Stable format (WS-02 parses the first line)::
+
+        PASSED: 42  FAILED: 2  ERROR: 0  [SKIPPED: 1]
+
+        FAILURES:
+          tests/test_api.py::test_rate_limit
+    """
+    # Deferred import: girder.orchestrator.__init__ pulls in conflict.py ->
+    # agent.runtime, which would make agent.tools -> orchestrator a cycle.
+    from girder.orchestrator.baseline import parse_junit_xml
+
+    try:
+        results = parse_junit_xml(xml_text)
+    except ET.ParseError:
+        return None
+    if not results:
+        return None
+    counts: dict[str, int] = {}
+    failures: list[str] = []
+    for r in results.values():
+        counts[r.status] = counts.get(r.status, 0) + 1
+        if r.status in ("failed", "error"):
+            failures.append(r.test_id)
+    head = (
+        f"PASSED: {counts.get('passed', 0)}  "
+        f"FAILED: {counts.get('failed', 0)}  "
+        f"ERROR: {counts.get('error', 0)}"
+    )
+    if counts.get("skipped"):
+        head += f"  SKIPPED: {counts['skipped']}"
+    lines = [head]
+    if failures:
+        lines.append("")
+        lines.append("FAILURES:")
+        lines.extend(f"  {test_id}" for test_id in failures)
+    return "\n".join(lines)
+
+
 def _truncate(text: str, limits: LimitsConfig) -> str:
     """Line budget first, then the token budget (R8 estimate)."""
     lines = text.splitlines()
@@ -318,6 +589,22 @@ class ToolRegistry:
         self.attempt_id = attempt_id
         self.run_id = run_id
         self.task = task
+        # Clean name -> handler registry (WS-02 hooks tool execution here).
+        self._handlers: dict[str, Callable[[dict[str, Any]], Awaitable[tuple[bool, str]]]] = {
+            "read_file": self._read_file,
+            "write_file": self._write_file,
+            "apply_patch": self._apply_patch,
+            "find_files": self._find_files,
+            "ripgrep": self._ripgrep,
+            "view_symbol_outline": self._symbol_outline,
+            "run_command": self._run_command,
+            "edit_file": self._edit_file,
+            "list_directory": self._list_directory,
+            "git_status": self._git_status,
+            "git_diff": self._git_diff,
+            "run_tests": self._run_tests,
+            "search_symbols": self._search_symbols,
+        }
 
     async def execute(self, name: str, args: dict[str, Any]) -> ToolExecResult:
         """Gate, dispatch, truncate, redact, log. Never raises outward."""
@@ -326,6 +613,8 @@ class ToolRegistry:
 
         # 1. Scope gate — violations are intercepted, never executed (§6.6 R2).
         verdict = check_tool_call(name, args, self.scopes)
+        if verdict is Verdict.ALLOW and name in _GATED_NEW_TOOLS:
+            verdict = _gate_new_tool(name, args, self.scopes)
         if verdict is Verdict.VIOLATION:
             return await self._violation(name, args, input_json)
 
@@ -367,21 +656,10 @@ class ToolRegistry:
     # ------------------------------------------------------------- dispatch
 
     async def _dispatch(self, name: str, args: dict[str, Any]) -> tuple[bool, str]:
-        if name == "read_file":
-            return await self._read_file(args)
-        if name == "write_file":
-            return await self._write_file(args)
-        if name == "apply_patch":
-            return await self._apply_patch(args)
-        if name == "find_files":
-            return await self._find_files(args)
-        if name == "ripgrep":
-            return await self._ripgrep(args)
-        if name == "view_symbol_outline":
-            return await self._symbol_outline(args)
-        if name == "run_command":
-            return await self._run_command(args)
-        return False, f"error: unknown tool {name!r}"
+        handler = self._handlers.get(name)
+        if handler is None:
+            return False, f"error: unknown tool {name!r}"
+        return await handler(args)
 
     async def worktree_dirty_with_output(self) -> tuple[bool, str]:
         """``(bounce-worthy dirt, porcelain output)`` for the terminal-tool gate.
@@ -479,6 +757,102 @@ class ToolRegistry:
         screen_command(cmd)  # raises CommandDenied — execute() maps it to a held result
         timeout = min(float(args.get("timeout_s") or 300.0), 300.0)
         return await self._exec(["sh", "-c", cmd], timeout_s=timeout)
+
+    async def _edit_file(self, args: dict[str, Any]) -> tuple[bool, str]:
+        path = str(args["path"])
+        try:
+            s = int(args["start_line"])
+            e = int(args["end_line"])
+        except (KeyError, TypeError, ValueError) as exc:
+            return False, f"error: invalid line range: {exc}"
+        if s < 1 or e < s:
+            return False, f"error: invalid line range: {s}..{e} (1-indexed, end >= start)"
+        return await self._exec(
+            [
+                "python3",
+                "-c",
+                _EDIT_SNIPPET,
+                path,
+                str(s),
+                str(e),
+                _b64(str(args.get("replacement", ""))),
+            ]
+        )
+
+    async def _list_directory(self, args: dict[str, Any]) -> tuple[bool, str]:
+        root = str(args.get("path") or ".")
+        try:
+            depth = max(1, min(3, int(args.get("depth") or 1)))
+        except (TypeError, ValueError) as exc:
+            return False, f"error: invalid depth: {exc}"
+        ok, out = await self._exec(["python3", "-c", _DIR_LIST_SNIPPET, root, str(depth)])
+        lines = out.splitlines()
+        if len(lines) > _MATCH_CAP:
+            dropped = len(lines) - _MATCH_CAP
+            out = "\n".join(lines[:_MATCH_CAP]) + f"\n[truncated: {dropped} more entries]"
+        return ok, out
+
+    async def _git_status(self, args: dict[str, Any]) -> tuple[bool, str]:
+        return await self._exec(["git", "status", "--short"])
+
+    async def _git_diff(self, args: dict[str, Any]) -> tuple[bool, str]:
+        cmd = ["git", "diff"]
+        if args.get("staged"):
+            cmd.append("--cached")
+        cmd.append("--")
+        path = str(args.get("path") or "").strip()
+        if path:
+            cmd.append(path)
+        return await self._exec(cmd)
+
+    async def _run_tests(self, args: dict[str, Any]) -> tuple[bool, str]:
+        raw_paths = args.get("paths") or []
+        paths = [str(p) for p in raw_paths]
+        timeout = min(float(args.get("timeout_s") or 120.0), 600.0)
+        cmd = ["pytest", "--tb=short", "--no-header", "-q", f"--junitxml={_RUN_TESTS_JUNIT}"]
+        cmd.extend(paths)
+        keyword = str(args.get("keyword") or "")
+        if keyword:
+            cmd.extend(["-k", keyword])
+        ok, raw = await self._exec(cmd, timeout_s=timeout)
+        # The JUnit report lives inside the container; fetch it, then parse.
+        xml_ok, xml_text = await self._exec(["cat", _RUN_TESTS_JUNIT])
+        if not xml_ok or not xml_text.strip():
+            # No report (collection error, pytest missing, …): fall back to
+            # the raw pytest output rather than inventing a summary.
+            return ok, raw.strip() or "error: no test report produced"
+        summary = _summarize_junit(xml_text)
+        if summary is None:
+            return ok, raw.strip() or "error: unparseable test report"
+        return ok, summary
+
+    async def _search_symbols(self, args: dict[str, Any]) -> tuple[bool, str]:
+        name = re.escape(str(args["name"]))
+        path = shlex.quote(str(args.get("path") or "."))
+        kind = str(args.get("kind") or "definition")
+        if kind == "definition":
+            regex = shlex.quote(rf"^(async def|def|class)\s+{name}\b")
+        elif kind == "usage":
+            regex = shlex.quote(rf"\b{name}\s*\(")
+        elif kind == "export":
+            # Phase 1: __all__ assignments, restricted (rg only) to files
+            # whose path matches the module name. WS-07B replaces this with
+            # stack-plugin commands.
+            regex = shlex.quote(r"__all__")
+            script = (
+                "if command -v rg >/dev/null 2>&1; then "
+                f"rg -n -g '*{name}*' -- {regex} {path}; "
+                f"else grep -rnE -- {regex} {path}; fi | head -n {_MATCH_CAP}"
+            )
+            return await self._exec(["sh", "-c", script])
+        else:
+            return False, f"error: unknown kind {kind!r} (definition|usage|export)"
+        script = (
+            "if command -v rg >/dev/null 2>&1; then "
+            f"rg -n -- {regex} {path}; "
+            f"else grep -rnE -- {regex} {path}; fi | head -n {_MATCH_CAP}"
+        )
+        return await self._exec(["sh", "-c", script])
 
     # ------------------------------------------------------ logging helpers
 
