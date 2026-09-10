@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 12 WP 12.5 + Sprint 13 WP 13.2, WP 13.3 |
-| **Status** | Not started |
+| **Status** | Merged (wave 3, 2026-09-10 — auth on post-split layout as planned; CLI parts pulled forward per the doc's allowance; landed out of order alongside WS-06, see Coordination) |
 | **Wave** | **3** — auth middleware lands against the **post-split route layout** (after WS-06). The CLI parts (`prune`, `validate`) have no upstream dependency and may be pulled forward if cli.py merges with WS-09's `--log-format` flag are coordinated. |
 | **Effort** | ~1 week · ~10 new tests |
 | **Owned files** | `src/girder/cli.py` (new subcommands/flags), `src/girder/api/deps.py` or auth middleware module (post-WS-06), `migrations/016_prune_indexes.sql` (new) |
@@ -92,6 +92,14 @@ Exits 0 on success, 1 on any failure. Prints human-friendly error messages, one 
 - **WS-05** webhook exemption needs a joint review once both land.
 - **WS-08** JS gains the API-key header injection — small follow-up edit there.
 - **cli.py** conflicts with WS-09's `--log-format` flag are trivial (different sections); if pulled forward, coordinate the merge.
+
+### Implementation record (2026-09-10, wave 3)
+
+- **WP 12.5 auth:** landed as a router-level dependency (`require_api_key` in new `api/auth.py`) installed once on the aggregated console router — the `/static` mount is exempt *structurally* (not a router route) and `app.py` stayed untouched. Comparison via `secrets.compare_digest`; 401 missing / 403 invalid per existing `HTTPException` house style. Key resolution: `[web] api_key` (girder.toml / `GIRDER_WEB__API_KEY` / `girder web --api-key`) → `secrets.toml [web] api_key` fallback → empty = anonymous. Console: `base.html` wraps `fetch` (X-API-Key from `localStorage["girder_api_key"]`) and appends `?api_key=` to form actions; WS-08 to polish + document the localStorage key.
+- **WS-05 joint review (both landed same day):** real webhook paths are `/api/webhooks/github` and `/api/webhooks/slack`; the exemption constant was corrected from the spec's tentative `/webhooks/` to `/api/webhooks/` — without this, configured API keys would have 403'd every inbound webhook. `/metrics` (WS-09) is mounted on the app itself and therefore doubly exempt (structurally + `PUBLIC_PATH_PREFIXES`).
+- **WP 13.2 prune:** the schema has **no `ON DELETE CASCADE`** on any FK (spec assumed cascade) — child rows are deleted explicitly in dependency order inside one transaction; `steering_events`/`integrity_violations`/`notifications_log` (FK-less tables) included. Migration `016_prune_indexes.sql` per pre-allocation.
+- **WP 13.3 validate:** check 3 now reads the real `STACK_REGISTRY` (`girder.stacks`, arrived mid-flight in `7358bcc`) instead of the interim hardcoded set. `load_settings()` rejects unknown stacks early (pydantic), so a bad stack surfaces as the config-load failure path — validate collects it as one failure and still runs settings-independent checks (collect-all contract preserved; regression-tested).
+- **Testing:** 32 new tests across the three WPs (prune/validate 15, auth 11, incl. later additions); full suite green and `mypy --strict` clean at merge.
 
 ## Relevant resolution log decision
 
