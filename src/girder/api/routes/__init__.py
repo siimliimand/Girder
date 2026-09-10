@@ -19,6 +19,7 @@ from girder.api.routes import (
     specs as _specs,
     steering as _steering,
     tiers as _tiers,
+    webhooks as _webhooks,
 )
 from girder.api.routes._shared import (
     excerpt as _excerpt,
@@ -45,6 +46,7 @@ for _module in (
     _delivery,
     _history,
     _tiers,
+    _webhooks,
 ):
     router.include_router(_module.router)
 

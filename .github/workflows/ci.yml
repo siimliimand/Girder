@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # WP 9.4: nightly sandbox/CI parity audit — the parity job's event filter
+  # admits schedule; push/PR runs still skip it via the same filter.
+  schedule:
+    - cron: "0 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,13 +43,12 @@ jobs:
   # any python/pip/pytest divergence between image and CI
   # (container/parity-check.sh -> girder.github.parity).
   #
-  # Manual/dispatch-only on purpose: it builds a container image (a few minutes
-  # of pull + build on every push would dominate CI), and the pinned toolchain
-  # (python:3.12-slim, pytest==8.3.2) only changes when the Dockerfile changes.
-  # Run it via "Run workflow" whenever the Dockerfile or CI pins move; flip on
-  # a `schedule:` trigger if you want it nightly.
+  # Runs on workflow_dispatch (manual) and nightly via the schedule trigger
+  # (WP 9.4); push/PR runs skip it — the container build dominates CI time.
+  # A nightly parity failure surfaces through Girder's own CI poller
+  # (github/ci.py) as a failed check on the default branch.
   parity:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
