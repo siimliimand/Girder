@@ -215,7 +215,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "view_symbol_outline",
             "description": (
                 "List classes/functions with line numbers for a source file."
-                " Full support for Python (precise AST outlines); other"
+                " Routing is per-stack via the project's stack plugin —"
+                " full support for Python (precise AST outlines); other"
                 " languages fall back to a line-based declaration grep."
             ),
             "parameters": {
