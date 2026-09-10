@@ -283,13 +283,12 @@ class Secrets(BaseModel):
         openrouter_api_key = "…"
         [github]
         token = "…"
+        github_webhook_secret = "…"
         [notify]
         telegram_bot_token = "…"
         discord_webhook_url = "…"
         slack_bot_token = "…"
         slack_signing_secret = "…"
-        [github]
-        webhook_secret = "…"
         [redaction]
         secret_env_names = ["GITHUB_TOKEN", …]
 
