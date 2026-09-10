@@ -16,6 +16,10 @@ from abc import ABC, abstractmethod
 VERIFY_XML = ".girder-verify.xml"
 
 
+class UnknownStackError(ValueError):
+    """``project.stack`` names no registered stack plugin."""
+
+
 class StackPlugin(ABC):
     """One supported language stack (WS-07 WP 11.1)."""
 
@@ -27,7 +31,13 @@ class StackPlugin(ABC):
 
     @abstractmethod
     def test_command(self, python_bin: str | None = None) -> list[str]:
-        """Command to run the full test suite and produce JUnit XML."""
+        """Command to run the full test suite and produce JUnit XML.
+
+        The JUnit report must land at ``/workspace/.girder-verify.xml`` inside
+        the container — the verify loop and baselines parse that exact path.
+        ``python_bin`` only matters for the Python stack (interpreter
+        override); other stacks ignore it.
+        """
 
     @abstractmethod
     def symbol_outline_command(self, path: str) -> list[str]:
@@ -42,8 +52,31 @@ class StackPlugin(ABC):
         """Host path -> container path for read-only package cache mounts."""
 
 
+STACK_REGISTRY: dict[str, StackPlugin] = {}
+"""Registered stacks, keyed by :attr:`StackPlugin.name`."""
+
+
+def register(plugin: StackPlugin) -> StackPlugin:
+    """Add *plugin* to the registry (import-time hook for built-ins)."""
+    STACK_REGISTRY[plugin.name] = plugin
+    return plugin
+
+
+def get_stack(name: str) -> StackPlugin:
+    """Resolve a stack name to its plugin; unknown names are a hard error."""
+    try:
+        return STACK_REGISTRY[name]
+    except KeyError:
+        raise UnknownStackError(
+            f"unknown project.stack {name!r}; known stacks: {sorted(STACK_REGISTRY)}"
+        ) from None
+
+
+# Built-ins. Import order is irrelevant — registration is idempotent by name.
+from girder.stacks.golang import GoPlugin  # noqa: E402
+from girder.stacks.node import NodePlugin  # noqa: E402
 from girder.stacks.python import PythonPlugin  # noqa: E402
 
-STACK_REGISTRY: dict[str, StackPlugin] = {
-    PythonPlugin.name: PythonPlugin(),
-}
+register(GoPlugin())
+register(NodePlugin())
+register(PythonPlugin())
