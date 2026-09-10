@@ -55,6 +55,9 @@ PRE_SPLIT_ROUTES: set[tuple[tuple[str, ...], str]] = {
     # Post-split additions (own package module, api/routes/webhooks.py):
     (("POST",), "/api/webhooks/github"),  # WP 9.1 — HMAC-authenticated (WS-05)
     (("POST",), "/api/webhooks/slack"),  # WP 9.2 — HMAC-authenticated (WS-05)
+    # Post-split additions (own package module, api/routes/clarify.py):
+    (("GET",), "/runs/{rid}/clarify"),  # §8.5 — clarification form (WS-04)
+    (("POST",), "/api/runs/{rid}/clarify"),  # §8.5 — answers → spec gen (WS-04)
 }
 
 

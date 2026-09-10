@@ -12,6 +12,7 @@ from fastapi import APIRouter
 
 from girder.api.routes import (
     amendments as _amendments,
+    clarify as _clarify,
     delivery as _delivery,
     history as _history,
     projects as _projects,
@@ -43,6 +44,7 @@ for _module in (
     _specs,
     _steering,
     _amendments,
+    _clarify,
     _delivery,
     _history,
     _tiers,

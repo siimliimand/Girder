@@ -19,6 +19,7 @@ from girder.api.routes._shared import (
     review_window_message,
     review_window_state,
 )
+from girder.api.routes.clarify import _start_clarification
 from girder.api.app import dispatch_generation, render
 from girder.db import repo
 from girder.db.engine import Database
@@ -71,7 +72,7 @@ async def project_page(request: Request, db: Db, pid: str) -> HTMLResponse:
 
 @router.post("/api/projects/{pid}/runs", response_model=None)
 async def create_run(
-    request: Request, db: Db, pid: str, intent: str = Form(...)
+    request: Request, db: Db, pid: str, intent: str = Form(...), clarify: bool = False
 ) -> RedirectResponse | HTMLResponse:
     app = request.app
     project = await require_project(db, pid)
@@ -107,6 +108,12 @@ async def create_run(
         db, pid, intent, branch="pending", budget_cap_usd=settings.budget.run_cap_usd
     )
     await repo.update_run_fields(db, run.id, branch=f"run/{run.id[:8]}")
+    # §8.5: clarify=true (or [specs] require_clarification) parks the run in
+    # CLARIFYING with generated questions instead of generating a spec now.
+    # With the flag off everywhere this branch is unreachable — the default
+    # flow is byte-for-byte unchanged.
+    if clarify or settings.specs.require_clarification:
+        return await _start_clarification(request, app, project, run)
     await transition_run(db, run.id, RunStatus.SPEC_PENDING, reason="spec_generation_dispatched")
     dispatch_generation(app, run.id, None)
     return RedirectResponse(f"/runs/{run.id}", status_code=303)

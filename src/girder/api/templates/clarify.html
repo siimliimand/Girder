@@ -1,0 +1,17 @@
+{# Intent clarification (plan §8.5 / WS-04): answer the gate's questions to
+   unpark the run into spec generation. #}
+{% extends "base.html" %}
+{% block content %}
+<h1>Clarify run {{ run.id[:8] }}</h1>
+<p>Before generating a spec, Girder needs a few details about this intent:</p>
+<blockquote>{{ run.intent }}</blockquote>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="/api/runs/{{ run.id }}/clarify">
+  {% for q in questions %}
+  <label>Q{{ loop.index }}. {{ q }}
+    <input type="text" name="answers" value="{{ answers[loop.index0] if answers else '' }}" required>
+  </label>
+  {% endfor %}
+  <button type="submit">Submit answers and generate spec</button>
+</form>
+{% endblock %}
