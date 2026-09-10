@@ -449,9 +449,13 @@ async def regenerate(
 
 @router.post("/api/runs/{rid}/amendments/{aid}/approve", response_model=None)
 async def approve_amendment(
-    request: Request, rid: str, aid: str
+    request: Request, rid: str, aid: str, scope_globs: str = Form("")
 ) -> HTMLResponse | RedirectResponse:
-    return await _resolve_amendment_route(request, rid, aid, "approved")
+    # §8.4: an approval may widen the amended task's write scope. Globs arrive
+    # newline/comma-separated; blank input means "no scope change".
+    raw = [g.strip() for chunk in scope_globs.splitlines() for g in chunk.split(",")]
+    globs = [g for g in raw if g] or None
+    return await _resolve_amendment_route(request, rid, aid, "approved", scope_globs=globs)
 
 
 @router.post("/api/runs/{rid}/amendments/{aid}/reject", response_model=None)
@@ -475,6 +479,7 @@ async def _resolve_amendment_route(
     decision: str,
     *,
     guidance: str | None = None,
+    scope_globs: list[str] | None = None,
 ) -> HTMLResponse | RedirectResponse:
     db: Database = request.app.state.db
     base = await _run_context(db, rid)
@@ -491,6 +496,7 @@ async def _resolve_amendment_route(
             amendment=amendment,
             decision=decision,
             guidance=guidance,
+            scope_globs=scope_globs,
             notifier=request.app.state.notifier,
         )
     except AmendmentError as exc:
@@ -620,6 +626,7 @@ async def run_spend(request: Request, rid: str) -> JSONResponse:
     run = await _require_run(db, rid)
     usage = await repo.list_token_usage_for_run(db, rid)
     roles = await repo.sum_token_usage_for_run(db, rid)
+    per_task = await repo.sum_token_usage_by_task_for_run(db, rid)
     violations = await repo.list_integrity_violations_for_run(db, rid)
     return JSONResponse(
         {
@@ -628,6 +635,7 @@ async def run_spend(request: Request, rid: str) -> JSONResponse:
             "projected_spend_usd": run.projected_spend_usd,
             "usage": usage,
             "roles": roles,
+            "per_task": per_task,
             "violations": len(violations),
         }
     )

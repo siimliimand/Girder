@@ -105,7 +105,9 @@ _RUN_EDGES: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.MERGED: frozenset(),
     RunStatus.FAILED: frozenset(),
     RunStatus.ABORTED: frozenset(),
-    RunStatus.BUDGET_EXHAUSTED: frozenset({RunStatus.ABORTED}),
+    # §8.3: hard ceilings are per-cap, not per-run-lifetime — an operator
+    # raising budget_cap_usd lets the run resume from budget_exhausted.
+    RunStatus.BUDGET_EXHAUSTED: frozenset({RunStatus.ABORTED, RunStatus.ACTIVE}),
     # §5.1: escalated is a hard stop — a human reviews at every tier (D4).
     # No automated exit exists: only an explicit operator abort leaves it.
     RunStatus.ESCALATED: frozenset({RunStatus.ABORTED}),

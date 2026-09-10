@@ -199,7 +199,9 @@ def test_plan_waves_overlap_decided_against_tree_not_globs() -> None:
     assert _seqs(plan_waves(tasks, tree)) == [["a", "b"]]
 
 
-def test_plan_waves_demotion_is_transitive_through_depends_on() -> None:
+async def test_plan_waves_demotion_is_transitive_through_depends_on(
+    db: Database, tmp_path: Path
+) -> None:
     tasks = [
         _task("a", 1, globs=["src/**"]),
         _task("b", 2, globs=["src/**"]),
@@ -210,6 +212,31 @@ def test_plan_waves_demotion_is_transitive_through_depends_on() -> None:
     assert ids["a"] == 0
     assert ids["b"] == 1
     assert ids["c"] >= 2
+
+    # Audit reporting: the transitively demoted task (c moves only because its
+    # dependency b was demoted by glob overlap) must appear in the
+    # waves_planned event's demoted_task_ids too.
+    repo_path = await _seed_git_repo(tmp_path)
+    project = await repo.create_project(db, "p", str(repo_path))
+    run = await repo.create_run(db, project.id, "intent", "main", 5.0)
+    wave0 = await repo.get_or_create_wave0(db, run.id)
+    ta = await repo.create_task(db, wave0.id, 1, "a", TaskType.CODE_CHANGE, scope_globs=["src/**"])
+    tb = await repo.create_task(db, wave0.id, 2, "b", TaskType.CODE_CHANGE, scope_globs=["src/**"])
+    tc = await repo.create_task(
+        db, wave0.id, 3, "c", TaskType.CODE_CHANGE, scope_globs=["other/**"], depends_on=[tb.id]
+    )
+    await Scheduler(db).plan_run_waves(run, repo_path)
+    event = await repo.get_latest_event(db, run.id, "waves_planned")
+    assert event is not None
+    demoted = event["payload"]["demoted_task_ids"]
+    assert ta.id not in demoted
+    assert tb.id in demoted
+    assert tc.id in demoted  # transitively demoted through b
+    assert event["payload"]["wave_assignment"] == {
+        ta.id: 0,
+        tb.id: 1,
+        tc.id: 2,
+    }
 
 
 def test_plan_waves_three_pairwise_overlapping_tasks_stagger() -> None:

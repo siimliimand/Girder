@@ -914,3 +914,51 @@ async def test_held_call_in_earlier_turn_fails_attempt_without_retry(
     )
     assert len(held) == 1
     assert h.notifier.calls  # integrity violation notified
+
+
+async def test_container_spec_forwards_sandbox_settings(db: Database, tmp_path: Path) -> None:
+    """[sandbox] network/resource settings reach the attempt ContainerSpec.
+
+    impl-plan §6.4 (R11): girder.toml ``[sandbox]`` values must not be dead
+    config — non-default settings must land on the spec, and the default path
+    must still yield the previous dataclass-default values.
+    """
+    custom = Settings(
+        sandbox=SandboxNetwork(network="private", memory="2g", cpus=1.0, pids_limit=256)
+    )
+    custom_engine = TaskEngine(
+        db=db,
+        gateway=FakeGateway(responses=[]),  # type: ignore[arg-type]
+        sandbox=ScriptSandbox(suite_results=[], suite_xml=GREEN_XML),
+        settings=custom,
+        redactor=Redactor(),
+        notifier=None,
+        project=None,  # type: ignore[arg-type]
+        repo_path=tmp_path,
+    )
+    default_engine = TaskEngine(
+        db=db,
+        gateway=FakeGateway(responses=[]),  # type: ignore[arg-type]
+        sandbox=ScriptSandbox(suite_results=[], suite_xml=GREEN_XML),
+        settings=Settings(),
+        redactor=Redactor(),
+        notifier=None,
+        project=None,  # type: ignore[arg-type]
+        repo_path=tmp_path,
+    )
+    worktree = tmp_path / "wt"
+
+    spec = custom_engine._container_spec("girder-deadbeef", worktree)
+    assert (spec.network, spec.memory, spec.cpus, spec.pids_limit) == (
+        "private",
+        "2g",
+        1.0,
+        256,
+    )
+    assert spec.name == "girder-deadbeef"
+    assert spec.worktree == worktree
+
+    # Default config is byte-identical to the pre-fix dataclass defaults.
+    default_spec = default_engine._container_spec("girder-deadbeef", worktree)
+    assert (default_spec.network, default_spec.memory, default_spec.cpus) == ("none", "4g", 2.0)
+    assert default_spec.pids_limit == 512

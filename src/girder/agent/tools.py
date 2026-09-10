@@ -57,6 +57,9 @@ _MATCH_CAP = 200  # rg / grep match cap before truncation
 # run_command denylist — word-boundary tokens plus explicit network verbs.
 _DENY_TOKENS = re.compile(r"\b(curl|wget|nc|ncat|netcat|ssh|scp|sftp|sudo|podman|docker|mount)\b")
 _TEST_SIGNAL = re.compile(r"(tests?/|test_|_test|conftest|pytest)", re.IGNORECASE)
+# Bare test-directory segments that count as a test signal even without a
+# trailing slash or dotted filename (impl-plan §6.6).
+_TEST_DIR_SEGMENTS = frozenset({"tests", "test"})
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -202,14 +205,46 @@ class CommandDenied(RuntimeError):
     """A run_command string matched the denylist; it was never executed."""
 
 
+def _normalized_tokens(cmd: str) -> list[str]:
+    """shlex tokens with quote/backslash artifacts stripped (impl-plan §6.6).
+
+    Defeats lexical evasions like ``c'u'r'l`` or ``cur\\l``: shlex already
+    removes shell quotes, and remaining backslashes are dropped before the
+    denylist regex runs over the re-joined token sequence. Falls back to a
+    raw whitespace split when the shell string is unparsable.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    # Strip quotes per-character (not just at the edges) so concatenations
+    # like ``c'u'r'l`` collapse to ``curl`` even when shlex bails.
+    return [t.replace("\\", "").replace("'", "").replace('"', "") for t in tokens]
+
+
+def _is_test_signal_path(token: str) -> bool:
+    """A path-shaped token pointing at a test file/dir (impl-plan §6.6)."""
+    if _TEST_SIGNAL.search(token):
+        return True
+    segments = [s for s in token.replace("\\", "/").split("/") if s]
+    return bool(segments) and segments[0] in _TEST_DIR_SEGMENTS
+
+
 def screen_command(cmd: str) -> None:
     """Raise :class:`CommandDenied` if the command string is denylisted."""
-    if _DENY_TOKENS.search(cmd):
-        raise CommandDenied(f"denied: network/escalation command: {cmd[:120]}")
-    if "git push" in cmd:
+    normalized = " ".join(_normalized_tokens(cmd))
+    for candidate in (cmd, normalized):
+        if _DENY_TOKENS.search(candidate):
+            raise CommandDenied(f"denied: network/escalation command: {cmd[:120]}")
+    tokens = normalized.split()
+    if "git" in tokens and "push" in tokens[tokens.index("git") + 1 :]:
         raise CommandDenied(f"denied: git push is orchestrator-only: {cmd[:120]}")
-    if re.search(r"\bchmod\b", cmd) and _TEST_SIGNAL.search(cmd):
-        raise CommandDenied(f"denied: chmod targeting a test-signal path: {cmd[:120]}")
+    if "git push" in cmd:  # keep the literal check as a cheap backstop
+        raise CommandDenied(f"denied: git push is orchestrator-only: {cmd[:120]}")
+    if "chmod" in tokens:
+        for tok in tokens:
+            if tok != "chmod" and not tok.startswith("-") and _is_test_signal_path(tok):
+                raise CommandDenied(f"denied: chmod targeting a test-signal path: {cmd[:120]}")
 
 
 def _truncate(text: str, limits: LimitsConfig) -> str:

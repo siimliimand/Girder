@@ -363,6 +363,33 @@ async def test_t1_parked_by_review_window_resumes_after_review(dh: DHarness) -> 
     assert fresh is not None and fresh.status is RunStatus.MERGED
 
 
+@pytest.mark.parametrize("dh", [1], indirect=True)
+async def test_marking_one_merge_reviewed_frees_t1_window_slot(dh: DHarness) -> None:
+    """The mark-reviewed surface (POST /api/runs/{rid}/reviewed writes the
+    same ``merge_reviewed`` event repo.count_unreviewed_merges counts) drops
+    that run from the T1 rolling window — a single review frees one slot and
+    a new T1 run merges instead of parking for a human."""
+    old_runs = []
+    for i in range(3):
+        other = await repo.create_run(dh.db, dh.project.id, f"old {i}", f"run/old{i}", 1.0)
+        await seed_run_status(dh.db, other.id, "merged")
+        old_runs.append(other)
+    assert await repo.count_unreviewed_merges(dh.db, dh.project.id) == 3
+
+    # the user marks ONE of the merged runs reviewed
+    await repo.insert_event(
+        dh.db, "merge_reviewed", {"run_id": old_runs[0].id}, run_id=old_runs[0].id
+    )
+    assert await repo.count_unreviewed_merges(dh.db, dh.project.id) == 2
+
+    gateway = FakeGateway(responses=[_resp(content=GOOD_VERDICT)])
+    d = dh.delivery(gateway)
+    assert await d.enter_delivery(dh.run) == "pr_opened"
+    # window of 3 has one slot free (the reviewed run no longer counts)
+    assert await _drive(d, dh.run.id) == "merged"
+    assert dh.api.merge_calls == 1
+
+
 # --------------------------------------------------------------------- T0
 
 

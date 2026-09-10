@@ -142,6 +142,24 @@ class TaskEngine:
         )
         self._snapshot_dirs: dict[str, list[Path]] = {}
 
+    def _container_spec(self, name: str, worktree: Path) -> ContainerSpec:
+        """Build the attempt ContainerSpec (impl-plan §6.4, R11).
+
+        Forwards the operator's ``[sandbox]`` network/resource policy so the
+        girder.toml settings actually reach the container; the config defaults
+        equal the ContainerSpec dataclass defaults, so the default-config
+        behavior is unchanged.
+        """
+        return ContainerSpec(
+            name=name,
+            image=self.image,
+            worktree=worktree,
+            network=self.settings.sandbox.network,
+            memory=self.settings.sandbox.memory,
+            cpus=self.settings.sandbox.cpus,
+            pids_limit=self.settings.sandbox.pids_limit,
+        )
+
     # ------------------------------------------------------------- entrypoint
 
     async def execute_task(self, run: Run, task: Task, *, integrate: bool = True) -> TaskOutcome:
@@ -351,11 +369,7 @@ class TaskEngine:
         # Layer 2 anchor: hash of every test-signal file before the agent acts.
         await repo.update_task_fields(self.db, task.id, test_content_hash=manifest.root_hash)
 
-        spec = ContainerSpec(
-            name=f"girder-{attempt.id[:8]}",
-            image=self.image,
-            worktree=ref.path,
-        )
+        spec = self._container_spec(f"girder-{attempt.id[:8]}", ref.path)
         # Layer 1 test shadowing (§8.2): mount a pristine RO snapshot of each
         # configured test directory over the worktree's own copy — one
         # snapshot dir + one RO shadow mount per test directory (the engine

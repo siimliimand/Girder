@@ -12,12 +12,18 @@ import pytest
 from girder.db.engine import Database, MigrationError, default_migrations_dir
 
 
+def _expected_versions() -> list[int]:
+    """Versions derivable from the shipped migrations dir — keeps this file
+    from needing a manual bump on every new migration."""
+    return sorted(int(p.name.split("_", 1)[0]) for p in default_migrations_dir().glob("*.sql"))
+
+
 async def test_fresh_boot_applies_all_migrations(tmp_path: Path) -> None:
     db = await Database.open(tmp_path / "g.db", migrations_dir=default_migrations_dir())
     try:
         rows = await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         versions = [r["version"] for r in rows]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert versions == _expected_versions()
         # every table from the DDL exists
         for table in (
             "projects",
@@ -57,6 +63,9 @@ async def test_fresh_boot_applies_all_migrations(tmp_path: Path) -> None:
         assert "verdict" in tc_cols
         notif_cols = {r["name"] for r in await db.fetchall("PRAGMA table_info(notifications_log)")}
         assert "run_id" in notif_cols
+        # Amendment scope widening landed by 013 (plan.md §8.4 fix pass).
+        amend_cols = {r["name"] for r in await db.fetchall("PRAGMA table_info(spec_amendments)")}
+        assert "scope_globs_json" in amend_cols
     finally:
         await db.close()
 
@@ -67,7 +76,7 @@ async def test_open_creates_missing_parent_dirs(tmp_path: Path) -> None:
     db = await Database.open(path, migrations_dir=default_migrations_dir())
     try:
         applied = await db.fetchall("SELECT version FROM schema_migrations")
-        assert [r["version"] for r in applied] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert [r["version"] for r in applied] == _expected_versions()
     finally:
         await db.close()
     assert path.is_file()
@@ -77,7 +86,7 @@ async def test_memory_db_creates_no_file(tmp_path: Path) -> None:
     db = await Database.open(":memory:", migrations_dir=default_migrations_dir())
     try:
         r = await db.fetchone("SELECT COUNT(*) AS c FROM schema_migrations")
-        assert r["c"] == 12
+        assert r["c"] == len(_expected_versions())
     finally:
         await db.close()
     assert list(tmp_path.iterdir()) == []  # noqa: ASYNC240
@@ -90,7 +99,7 @@ async def test_reopen_is_idempotent(tmp_path: Path) -> None:
     db2 = await Database.open(path, migrations_dir=default_migrations_dir())
     try:
         applied = await db2.fetchall("SELECT version FROM schema_migrations")
-        assert len(applied) == 12  # nothing re-applied
+        assert len(applied) == len(_expected_versions())  # nothing re-applied
     finally:
         await db2.close()
 
@@ -221,6 +230,8 @@ async def test_migration_008_retries_after_mid_script_crash(tmp_path: Path) -> N
             DROP TABLE attempt_prompts;
             -- rewind migration 012 artifacts so the replay re-creates them
             DROP TABLE attempt_diffs;
+            -- rewind migration 013 artifacts so the replay re-adds them
+            ALTER TABLE spec_amendments DROP COLUMN scope_globs_json;
             """
         )
     finally:
@@ -232,7 +243,7 @@ async def test_migration_008_retries_after_mid_script_crash(tmp_path: Path) -> N
             r["version"]
             for r in await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert versions == _expected_versions()
         # final schema matches the clean boot
         assert await _schema_fingerprint(db, "token_usage") == ref_usage
         assert await _schema_fingerprint(db, "runs") == ref_runs
@@ -284,7 +295,7 @@ async def test_poisoned_duplicate_column_self_heals(tmp_path: Path) -> None:
             r["version"]
             for r in await db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert versions == _expected_versions()
         assert await _schema_fingerprint(db, "attempt_prompts") == ref_prompts
     finally:
         await db.close()

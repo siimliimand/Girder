@@ -13,7 +13,7 @@ from girder.api.app import create_app
 from girder.config import Secrets, Settings
 from girder.db import repo
 from girder.db.engine import Database, default_migrations_dir
-from girder.db.models import RunStatus
+from girder.db.models import RunStatus, TaskType
 from girder.specs.freeze import approve_and_freeze
 from girder.util import run_host_cmd
 from tests.conftest import seed_run_status
@@ -200,3 +200,40 @@ async def test_pending_amendment_rendered_on_run_page(git_repo: Path, tmp_path: 
 class _NoopGenerator:
     async def generate(self, **kwargs: Any) -> str:  # pragma: no cover - never dispatched
         return PROPOSAL
+
+
+async def test_approve_endpoint_applies_scope_globs(git_repo: Path, tmp_path: Path) -> None:
+    """§8.4: approving with scope_globs unions them into the task's globs."""
+    ctx = await _setup(git_repo, tmp_path)
+    try:
+        db = ctx.db
+        # attach a running task to the amendment (crash-window style: the run
+        # is parked, the task never was)
+        wave = await repo.get_or_create_wave0(db, ctx.run_id)
+        task = await repo.create_task(
+            db, wave.id, 1, "Do the thing", TaskType.CODE_CHANGE,
+            scope_globs=["src/**"], spec_slice_md="",
+        )
+        await db.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task.id,))
+        await db.conn.commit()
+        await db.execute(
+            "UPDATE spec_amendments SET task_id = ? WHERE id = ?",
+            (task.id, ctx.amendment_id),
+        )
+        await db.conn.commit()
+
+        resp = await ctx.client.post(
+            f"/api/runs/{ctx.run_id}/amendments/{ctx.amendment_id}/approve",
+            data={"scope_globs": "docs/**\nsrc/**"},
+        )
+        assert resp.status_code == 303, resp.text
+        fresh = await repo.get_task(db, task.id)
+        assert fresh is not None
+        assert fresh.scope_globs == ["src/**", "docs/**"]
+        stored = await repo.get_spec_amendment(db, ctx.amendment_id)
+        assert stored is not None
+        assert stored.status == "approved"
+        assert stored.scope_globs == ["docs/**", "src/**"]
+    finally:
+        await ctx.lifespan.__aexit__(None, None, None)
+        await ctx.client.aclose()

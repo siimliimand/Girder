@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from aiosqlite import Row
@@ -752,6 +752,9 @@ class SpecAmendment:
     guidance: str | None = None
     new_spec_hash: str | None = None
     resolved_at: str | None = None
+    # Migration 013: scope globs the resolver wants unioned into the amended
+    # task on approve (§8.4); None/[] for amendments that don't touch scope.
+    scope_globs: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- baseline runs
@@ -827,16 +830,21 @@ async def list_flaky_tests(db: Database, project_id: str) -> list[FlakyTest]:
 async def create_spec_amendment(
     db: Database, run_id: str, reason: str, suggested_change: str, *,
     task_id: str | None = None,
+    scope_globs: list[str] | None = None,
 ) -> SpecAmendment:
     amendment = SpecAmendment(
         id=new_id(), run_id=run_id, task_id=task_id, reason=reason,
-        suggested_change=suggested_change,
+        suggested_change=suggested_change, scope_globs=scope_globs or [],
     )
     async with db.tx() as conn:
         await conn.execute(
-            "INSERT INTO spec_amendments (id, run_id, task_id, reason, suggested_change, status)"
-            " VALUES (?, ?, ?, ?, ?, 'pending')",
-            (amendment.id, run_id, task_id, reason, suggested_change),
+            "INSERT INTO spec_amendments (id, run_id, task_id, reason, suggested_change,"
+            " status, scope_globs_json)"
+            " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                amendment.id, run_id, task_id, reason, suggested_change,
+                json.dumps(amendment.scope_globs),
+            ),
         )
     return amendment
 
@@ -852,7 +860,30 @@ def _row_to_spec_amendment(r: Row) -> SpecAmendment:
         guidance=r["guidance"],
         new_spec_hash=r["new_spec_hash"],
         resolved_at=r["resolved_at"],
+        scope_globs=json.loads(r["scope_globs_json"]) if r["scope_globs_json"] else [],
     )
+
+
+async def update_spec_amendment_scope_globs(
+    db: Database, amendment_id: str, globs: list[str]
+) -> None:
+    """Persist resolver-supplied scope globs onto the amendment row (§8.4)."""
+    async with db.tx() as conn:
+        await conn.execute(
+            "UPDATE spec_amendments SET scope_globs_json = ? WHERE id = ?",
+            (json.dumps(list(globs)), amendment_id),
+        )
+
+
+async def update_task_scope_globs(db: Database, task_id: str, globs: list[str]) -> None:
+    """Union *globs* into the task's scope_globs (§8.4: an approved amendment
+    may widen scope; union with the existing globs is the safe default — an
+    amendment never narrows what was already authorized)."""
+    task = await get_task(db, task_id)
+    if task is None:
+        raise ValueError(f"task {task_id} not found")
+    merged = list(dict.fromkeys([*task.scope_globs, *globs]))
+    await update_task_fields(db, task_id, scope_globs_json=json.dumps(merged))
 
 
 async def get_spec_amendment(db: Database, amendment_id: str) -> SpecAmendment | None:
@@ -1258,6 +1289,22 @@ async def list_notifications_for_run(db: Database, run_id: str) -> list[dict[str
     rows = await db.fetchall(
         "SELECT id, channel, payload_redacted, status, run_id, ts FROM notifications_log"
         " WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def sum_token_usage_by_task_for_run(db: Database, run_id: str) -> list[dict[str, Any]]:
+    """Per-task usage rollup behind the spend dashboard (plan.md Phase 5):
+    token_usage rows aggregate through their attempt's task."""
+    rows = await db.fetchall(
+        "SELECT t.id AS task_id, t.title AS title,"
+        " SUM(u.prompt_tokens) AS prompt_tokens, SUM(u.completion_tokens) AS completion_tokens,"
+        " SUM(u.cost_usd) AS cost_usd, SUM(u.estimated_before_call) AS estimated_usd"
+        " FROM token_usage u"
+        " JOIN attempts a ON a.id = u.attempt_id"
+        " JOIN tasks t ON t.id = a.task_id"
+        " WHERE u.run_id = ? GROUP BY t.id, t.title ORDER BY t.seq",
         (run_id,),
     )
     return [dict(r) for r in rows]

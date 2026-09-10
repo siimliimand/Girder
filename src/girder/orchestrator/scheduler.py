@@ -203,11 +203,14 @@ class Scheduler:
         )
         tree = [line for line in proc.stdout.splitlines() if line.strip()]
         levels = plan_waves(tasks, tree)
-        # Dependency-implied layering (plan_waves already validated the DAG):
-        # only tasks placed STRICTLY later than their depends_on edges alone
-        # require were mechanically demoted by glob overlap.
-        dep_levels = compute_levels(tasks)
+        # Audit reporting (plan.md Phase 5): a task counts as demoted when its
+        # final wave is STRICTLY later than the level implied by its
+        # depends_on edges alone, computed on the PRE-demotion layering
+        # (compute_levels is transitive, so a task pushed later only because
+        # its own dependency was demoted is reported too). Wave assignment is
+        # untouched: this is reporting only.
         final_level = {t.id: i for i, level_tasks in enumerate(levels) for t in level_tasks}
+        dep_levels = compute_levels(tasks)
 
         demoted: list[str] = []
         waves_payload: list[dict[str, object]] = []

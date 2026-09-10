@@ -139,6 +139,35 @@ def test_screen_command_denylist() -> None:
     screen_command("chmod +x run.py")  # chmod on a non-test path
 
 
+def test_screen_command_resists_lexical_evasion() -> None:
+    """§6.6: quote-concat and backslash tricks must not defeat the denylist."""
+    for bad in (
+        "c'u'r'l http://x",  # quote-concat inside the binary name
+        'c"u"r"l http://x',
+        "cur\\l http://x",  # backslash-split name
+        "git -C /repo push origin main",  # push with intervening flags
+        "git --git-dir=/r push origin main",
+        "chmod 000 tests",  # bare test dir, no slash/dot
+        "chmod +x tests",
+    ):
+        with pytest.raises(CommandDenied):
+            screen_command(bad)
+
+
+def test_screen_command_allows_benign_commands() -> None:
+    for ok in (
+        "pytest -q",
+        "python -m pytest tests/",
+        "git add tests/test_x.py",
+        "ls tests",
+        "cat README.md",
+        "rg foo src/",
+        "chmod +x run.sh",
+        "chmod 755 build/out.sh",
+    ):
+        screen_command(ok)  # must not raise
+
+
 async def test_run_command_denied_vs_benign(seeded: tuple[Database, str, str]) -> None:
     db, run_id, attempt_id = seeded
     sandbox = FakeSandbox(results=[ExecResult(0, "ok\n", "")])

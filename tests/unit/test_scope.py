@@ -276,6 +276,72 @@ def test_run_command_unparsable_shell_falls_back_to_allow(scopes: TaskScopes) ->
     )
 
 
+# ------------------------------------------- run_command multi-token evaluation
+
+
+def _default_protected_scopes(strict: bool = False) -> TaskScopes:
+    """TaskScopes with the real default protected_read_paths from
+    src/girder/config.py (the way production builds scopes)."""
+    return TaskScopes(
+        write_globs=["src/**"],
+        protected_globs=[
+            ".github/**",
+            "openspec/**",
+            ".git/**",
+            ".env*",
+            "**/*.pem",
+            "**/*credentials*",
+        ],
+        strict_read_scope=strict,
+    )
+
+
+def test_run_command_multi_path_later_protected_token_is_violation() -> None:
+    """§6.6 R2: every read-shaped token is evaluated — the first clean token
+    must not short-circuit a later protected path."""
+    scopes = _default_protected_scopes()
+    assert check_tool_call(
+        "run_command", {"cmd": "cat src/a.py .github/workflows/ci.yml"}, scopes
+    ) is Verdict.VIOLATION
+    assert check_tool_call(
+        "run_command", {"cmd": "grep x src/a.py .env"}, scopes
+    ) is Verdict.VIOLATION
+
+
+def test_run_command_multi_path_all_clean_is_allow_logged() -> None:
+    scopes = _default_protected_scopes()
+    assert check_tool_call(
+        "run_command", {"cmd": "cat src/a.py src/b.py"}, scopes
+    ) is Verdict.ALLOW_LOGGED
+
+
+def test_run_command_first_token_clean_second_escape_is_violation() -> None:
+    scopes = _default_protected_scopes()
+    assert check_tool_call(
+        "run_command", {"cmd": "cat src/a.py ../../etc/passwd"}, scopes
+    ) is Verdict.VIOLATION
+
+
+def test_run_command_strict_read_scope_holds_out_of_scope_reads() -> None:
+    """strict_read_scope=True applies to run_command reads too (§6.6 R2):
+    an in-root, out-of-scope path token is a VIOLATION, matching read_file."""
+    strict = _default_protected_scopes(strict=True)
+    assert check_tool_call(
+        "run_command", {"cmd": "cat other/x.py"}, strict
+    ) is Verdict.VIOLATION
+    lax = _default_protected_scopes(strict=False)
+    assert check_tool_call(
+        "run_command", {"cmd": "cat other/x.py"}, lax
+    ) is Verdict.ALLOW_LOGGED
+
+
+def test_run_command_strict_read_scope_keeps_in_scope_reads_allowed() -> None:
+    strict = _default_protected_scopes(strict=True)
+    assert check_tool_call(
+        "run_command", {"cmd": "cat src/a.py"}, strict
+    ) is Verdict.ALLOW
+
+
 # ------------------------------------------------------- apply_patch diff body
 
 

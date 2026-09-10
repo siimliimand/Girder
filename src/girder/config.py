@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import os
 import tomllib
 from contextvars import ContextVar
 from pathlib import Path
@@ -130,6 +131,7 @@ class SpecsConfig(BaseModel):
 
     cli: bool = False
     cli_bin: str = "openspec"
+    generation_attempts: int = 3  # bounded validation-feedback retries for the native generator
 
 
 class WebConfig(BaseModel):
@@ -149,7 +151,9 @@ class ModelsConfig(BaseModel):
     def _check_tiers(self) -> ModelsConfig:
         # A partial registry is always an error: every sprint's pipeline calls
         # all three roles, so a missing tier would fail mid-run (issue 16).
-        # An *empty* registry still passes construction — load_settings warns.
+        # An *empty* registry still passes construction — load_settings raises
+        # (impl-plan §6.1 "at least one model role per tier"), unless the
+        # documented GIRDER_ALLOW_NO_ROLES=1 test/dev opt-out is set.
         have = {r.role for r in self.roles}
         missing = {"tier1", "tier2", "tier3"} - have
         if self.roles and missing:
@@ -353,8 +357,16 @@ def load_settings(
     try:
         settings = Settings()
         if not settings.models.roles:
-            # Issue 16: an empty registry validates but every sprint's pipeline
-            # calls models — say so loudly instead of failing later mid-run.
+            # impl-plan §6.1 ("Validates: … at least one model role per tier",
+            # issue 16): an empty registry must be a hard configuration error,
+            # not a warning — every sprint's pipeline calls all three roles.
+            # The CLI's documented test/dev opt-out keeps working role-less.
+            if os.environ.get("GIRDER_ALLOW_NO_ROLES") != "1":
+                raise ValueError(
+                    "no model roles configured: declare [[models.roles]]"
+                    " (tier1..tier3) in girder.toml"
+                    " (set GIRDER_ALLOW_NO_ROLES=1 to run role-less)"
+                )
             log.warning(
                 "no model roles configured; model calls will fail —"
                 " declare [[models.roles]] (tier1..tier3) in girder.toml"

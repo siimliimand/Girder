@@ -21,6 +21,7 @@ the amendment's own ``status`` is a plain CHECK column written only by
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from girder.db.engine import Database
 from girder.db.models import Attempt, Project, Run, RunStatus, Task, TaskStatus
 from girder.fsm import InvalidTransition, transition_attempt, transition_run, transition_task
 from girder.gitops.worktree import DEFAULT_BASE
+from girder.guard.scope import glob_to_regex
 from girder.notify.notifier import Notifier
 from girder.specs import freeze
 from girder.util import run_host_cmd
@@ -60,6 +62,7 @@ async def request_spec_amendment(
     attempt: Attempt,
     reason: str,
     suggested_change: str,
+    scope_globs: list[str] | None = None,
     notifier: Notifier | None = None,
 ) -> repo.SpecAmendment:
     """Park the attempt/task/run in amendment states and record the request.
@@ -67,19 +70,38 @@ async def request_spec_amendment(
     The amendment row is created first (it is the durable request record);
     the FSM transitions then guard the actual parking — an illegal state
     raises :class:`AmendmentError` via :class:`InvalidTransition`.
+
+    *scope_globs* optionally records the widened write scope the requester
+    needs (§8.4); on approve it is unioned into the task's scope globs.
     """
     amendment = await repo.create_spec_amendment(
-        db, run.id, reason, suggested_change, task_id=task.id
+        db, run.id, reason, suggested_change, task_id=task.id,
+        scope_globs=scope_globs,
     )
+    # Parking order is run -> task -> attempt (§8.7 reconciliation): the
+    # attempt is parked LAST because amendment_requested is a terminal attempt
+    # state with no FSM edge back out, so a mid-park failure must never leave
+    # a non-terminal amendment_requested attempt stranded. Any earlier failure
+    # is compensated by reversing the already-parked task/run (both have legal
+    # edges back to their running states).
+    parked_run = parked_task = False
     try:
-        await transition_attempt(db, attempt.id, "amendment_requested")
-        await transition_task(db, task.id, TaskStatus.AWAITING_AMENDMENT)
         await transition_run(db, run.id, RunStatus.AWAITING_AMENDMENT)
+        parked_run = True
+        await transition_task(db, task.id, TaskStatus.AWAITING_AMENDMENT)
+        parked_task = True
+        await transition_attempt(db, attempt.id, "amendment_requested")
     except InvalidTransition as exc:
         # Do not leave a dangling 'pending' row: get_pending_amendment (used
         # by the run pump to park) would freeze on a phantom amendment. The
-        # row is kept as 'aborted' for the audit trail (§8.4).
+        # row is kept as 'aborted' for the audit trail (§8.4), and any parking
+        # that already landed is reversed so no parked task/run survives a
+        # request that never became resolvable.
         await repo.resolve_spec_amendment(db, amendment.id, status="aborted")
+        if parked_task:
+            await transition_task(db, task.id, TaskStatus.RUNNING)
+        if parked_run:
+            await transition_run(db, run.id, RunStatus.ACTIVE)
         raise AmendmentError(f"cannot request amendment for run {run.id}: {exc}") from exc
 
     await repo.insert_event(
@@ -124,12 +146,16 @@ async def resolve_amendment(
     amendment: repo.SpecAmendment,
     decision: str,
     guidance: str | None = None,
+    scope_globs: list[str] | None = None,
     notifier: Notifier | None = None,
 ) -> ResolutionOutcome:
     """Resolve a pending amendment: approved / rejected / aborted.
 
     Raises :class:`AmendmentError` if the amendment does not exist, belongs to
-    another run, is already resolved, or the run is not ``awaiting_amendment``.
+    another run, is already resolved, or the run is neither
+    ``awaiting_amendment`` nor recoverably ``active`` (see below). On approve,
+    *scope_globs* (when given) is validated, persisted onto the amendment row,
+    and unioned into the amended task's scope globs (§8.4).
     """
     fresh_amendment = await repo.get_spec_amendment(db, amendment.id)
     if fresh_amendment is None:
@@ -140,9 +166,22 @@ async def resolve_amendment(
         raise AmendmentError(
             f"amendment {amendment.id} already resolved ({fresh_amendment.status})"
         )
+    # Validate any requested scope widening up front (§8.4): an invalid glob
+    # must refuse the resolution while the amendment stays pending.
+    if scope_globs and decision == "approved":
+        _validate_scope_globs(scope_globs)
     fresh_run = await repo.get_run(db, run.id)
     if fresh_run is None:
         raise AmendmentError(f"run {run.id} not found")
+    if fresh_run.status == RunStatus.ACTIVE and await repo.get_pending_amendment(db, run.id):
+        # Crash-window recovery (§8.7: DB state must always be reconcilable):
+        # a crash between the amendment row insert and the run parking left
+        # the run ACTIVE with a pending amendment. The
+        # active->awaiting_amendment edge exists, so finish the parking here
+        # instead of wedging the run forever (§8.4: Approve/Reject/Abort must
+        # always be reachable).
+        await transition_run(db, run.id, RunStatus.AWAITING_AMENDMENT)
+        fresh_run = await repo.get_run(db, run.id) or fresh_run
     if fresh_run.status != RunStatus.AWAITING_AMENDMENT:
         raise AmendmentError(
             f"run {run.id} must be awaiting_amendment to resolve an amendment"
@@ -150,7 +189,10 @@ async def resolve_amendment(
         )
 
     if decision == "approved":
-        outcome = await _approve(db, project=project, run=fresh_run, amendment=fresh_amendment)
+        outcome = await _approve(
+            db, project=project, run=fresh_run, amendment=fresh_amendment,
+            scope_globs=scope_globs,
+        )
     elif decision == "rejected":
         await repo.resolve_spec_amendment(db, amendment.id, status="rejected", guidance=guidance)
         run_status = await transition_run(db, run.id, RunStatus.ACTIVE)
@@ -187,14 +229,47 @@ async def resolve_amendment(
 
 
 async def _resume_task(db: Database, amendment: repo.SpecAmendment) -> str:
-    """Move the amended task back to running; no-op when the amendment is run-level."""
+    """Move the amended task back to running; no-op when the amendment is run-level.
+
+    After a crash window (§8.7) the task may never have been parked — it is
+    already running, which is not a legal self-edge, so detect and no-op."""
     if amendment.task_id is None:
         return "n/a"
+    task = await repo.get_task(db, amendment.task_id)
+    if task is not None and task.status is TaskStatus.RUNNING:
+        return TaskStatus.RUNNING.value
     return await transition_task(db, amendment.task_id, TaskStatus.RUNNING)
 
 
+def _validate_scope_globs(globs: list[str]) -> list[str]:
+    """Validate resolver-supplied scope globs by the same rules the spec
+    validator applies to task scope_globs (validator._check_glob): non-empty,
+    repo-relative, no '..' segments, compilable (§8.4)."""
+    clean = [g.strip() for g in globs if g.strip()]
+    if not clean:
+        raise AmendmentError("scope_globs must contain at least one non-empty glob")
+    errors: list[str] = []
+    for glob in clean:
+        if glob.startswith("/"):
+            errors.append(f"scope glob {glob!r} must be repo-relative (no leading '/')")
+        if ".." in glob.split("/"):
+            errors.append(f"scope glob {glob!r} must not contain '..' path segments")
+        try:
+            glob_to_regex(glob)
+        except re.error as exc:  # defensive: glob_to_regex currently escapes everything
+            errors.append(f"scope glob {glob!r} is not compilable: {exc}")
+    if errors:
+        raise AmendmentError("; ".join(errors))
+    return list(dict.fromkeys(clean))
+
+
 async def _approve(
-    db: Database, *, project: Project, run: Run, amendment: repo.SpecAmendment
+    db: Database,
+    *,
+    project: Project,
+    run: Run,
+    amendment: repo.SpecAmendment,
+    scope_globs: list[str] | None = None,
 ) -> ResolutionOutcome:
     """Re-freeze the proposal with the amendment appended; repin the hash."""
     repo_path = Path(project.repo_path)
@@ -219,6 +294,14 @@ async def _approve(
         db, amendment.id, status="approved", new_spec_hash=new_hash
     )
     await repo.update_run_fields(db, run.id, spec_hash=new_hash)
+    if scope_globs:
+        # §8.4: an approved amendment may widen the task's write scope; persist
+        # the globs onto the amendment row for the audit trail, then union them
+        # into the task (union is the safe default — approval never narrows).
+        clean = _validate_scope_globs(scope_globs)
+        await repo.update_spec_amendment_scope_globs(db, amendment.id, clean)
+        if amendment.task_id is not None:
+            await repo.update_task_scope_globs(db, amendment.task_id, clean)
     if amendment.task_id is not None:
         task = await repo.get_task(db, amendment.task_id)
         if task is not None:

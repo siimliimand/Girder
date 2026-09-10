@@ -63,7 +63,18 @@ async def approve_and_freeze(
     branch = run.branch
     base = await _resolve_base(repo_path, branch)
     wt_path = (worktree_base or DEFAULT_BASE) / f"spec-{run.id}"
-    commit_sha = await _commit_in_worktree(repo_path, wt_path, branch, base, run.id, proposal_text)
+    # Idempotent re-entry (crash invariance): the git commit may have landed
+    # before a prior attempt's DB writes. If the proposal blob is already on
+    # the run branch byte-identical, skip the (duplicate) commit and proceed
+    # straight to the DB writes; a differing blob is tamper evidence, not
+    # something to overwrite silently.
+    existing_head = await _committed_proposal_head(repo_path, branch, run.id, proposal_text)
+    if existing_head is not None:
+        commit_sha = existing_head
+    else:
+        commit_sha = await _commit_in_worktree(
+            repo_path, wt_path, branch, base, run.id, proposal_text
+        )
 
     updated = await repo.get_run(db, run.id)
     if updated is None:
@@ -84,6 +95,35 @@ async def approve_and_freeze(
         run_id=run.id,
     )
     return FreezeResult(run_id=run.id, spec_hash=spec_hash, branch=branch, commit_sha=commit_sha)
+
+
+async def _committed_proposal_head(
+    repo_path: Path, branch: str, run_id: str, proposal_text: str
+) -> str | None:
+    """Return the run-branch head if ``openspec/proposals/<run_id>.md`` is
+    already committed there with bytes identical to *proposal_text* (a prior
+    attempt crashed between the git commit and the DB writes). Return None
+    when the blob is absent; raise FreezeError when it exists but differs."""
+    blob = await run_host_cmd(
+        [
+            "git", "-C", str(repo_path), "cat-file", "blob",
+            f"refs/heads/{branch}:openspec/proposals/{run_id}.md",
+        ],
+        check=False,
+        timeout_s=30,
+    )
+    if blob.returncode != 0:
+        return None  # branch missing or no proposal blob yet: normal path
+    if blob.stdout != proposal_text:
+        raise FreezeError(
+            f"run {run_id}: proposal blob on branch {branch!r} differs from the"
+            " approved text — refusing to overwrite (tamper evidence);"
+            " inspect openspec/proposals and the run branch manually"
+        )
+    head = await run_host_cmd(
+        ["git", "-C", str(repo_path), "rev-parse", f"refs/heads/{branch}"], timeout_s=30
+    )
+    return head.stdout.strip()
 
 
 async def _resolve_base(repo_path: Path, branch: str) -> str:

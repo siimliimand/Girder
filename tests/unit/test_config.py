@@ -15,6 +15,14 @@ from girder.config import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _allow_no_roles(monkeypatch: pytest.MonkeyPatch) -> None:
+    # impl-plan §6.1: load_settings refuses an empty role registry. Most tests
+    # here exercise other settings with default (empty) roles, so opt out by
+    # default; the dedicated tests below delete this to pin the error.
+    monkeypatch.setenv("GIRDER_ALLOW_NO_ROLES", "1")
+
+
 def test_defaults_when_no_toml_found(tmp_path: Path) -> None:
     settings = load_settings(start_dir=tmp_path)
     assert settings.budget.run_cap_usd == 5.00
@@ -140,16 +148,41 @@ def test_load_secrets_0600_loads_cleanly(
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def test_empty_model_registry_warns_at_load(
+def test_empty_model_registry_refused_at_load(tmp_path: Path) -> None:
+    # impl-plan §6.1 (issue 16): girder.toml without [[models.roles]] is a hard
+    # configuration error at load time, the same ValueError the other Settings
+    # validations raise — not a silent pass with a mid-run failure later.
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.delenv("GIRDER_ALLOW_NO_ROLES", raising=False)
+        with pytest.raises(ValueError, match=r"\[\[models\.roles\]\]"):
+            load_settings(start_dir=tmp_path)
+    finally:
+        monkeypatch.undo()
+
+
+def test_empty_model_registry_opt_out_warns_at_load(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # issue 16: an empty registry must not silently pass — warn that model
-    # calls will fail.
+    # The documented CLI/test opt-out (GIRDER_ALLOW_NO_ROLES=1) still loads,
+    # but warns that model calls will fail.
     with caplog.at_level(logging.WARNING, logger="girder.config"):
         settings = load_settings(start_dir=tmp_path)
     assert settings.models.roles == []
     messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert any("no model roles configured" in m for m in messages)
+
+
+def test_empty_registry_error_lists_toml_fix(tmp_path: Path) -> None:
+    cfg = tmp_path / "girder.toml"
+    cfg.write_text('[project]\nname = "roleless"\n')
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.delenv("GIRDER_ALLOW_NO_ROLES", raising=False)
+        with pytest.raises(ValueError, match="GIRDER_ALLOW_NO_ROLES"):
+            load_settings(config_path=cfg)
+    finally:
+        monkeypatch.undo()
 
 
 def test_partial_registry_still_refused() -> None:

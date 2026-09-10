@@ -257,6 +257,57 @@ async def test_spend_extension_roles_and_violations(tmp_path: Path) -> None:
         ]
 
 
+async def test_spend_per_task_rollup(tmp_path: Path) -> None:
+    """plan.md Phase 5: the spend endpoint aggregates token_usage per task via
+    its attempts (prompt/completion/cost sums plus estimated_before_call)."""
+    app = make_app(tmp_path)
+    async with make_client(app) as client, app.router.lifespan_context(app):
+        db: Database = app.state.db
+        p = await make_project(db)
+        r = await make_run(db, p.id)
+        w0 = await repo.create_wave(db, r.id, 0)
+        t1 = await repo.create_task(
+            db, w0.id, 1, "First", TaskType.CODE_CHANGE, scope_globs=["src/**"]
+        )
+        t2 = await repo.create_task(db, w0.id, 2, "Second", TaskType.TEST_CHANGE)
+        a1 = await repo.create_attempt(db, t1.id, base_commit="deadbeef")
+        a2 = await repo.create_attempt(db, t1.id, base_commit="deadbee1")
+        a3 = await repo.create_attempt(db, t2.id, base_commit="deadbee2")
+
+        async def _usage(attempt_id: str | None, pt: int, ct: int, cost: float, est: float) -> None:
+            uid = await repo.insert_token_usage(
+                db,
+                run_id=r.id,
+                attempt_id=attempt_id,
+                model_role="builder",
+                model_id="claude-x",
+                estimated_before_call=est,
+            )
+            await repo.update_token_usage_actual(
+                db, uid, prompt_tokens=pt, completion_tokens=ct, cost_usd=cost
+            )
+
+        # two attempts on t1 roll up into one per_task row; a3 is t2's; the
+        # attemptless row (run-level overhead) belongs to no task.
+        await _usage(a1.id, 100, 50, 0.003, 0.02)
+        await _usage(a2.id, 10, 5, 0.002, 0.01)
+        await _usage(a3.id, 7, 3, 0.001, 0.005)
+        await _usage(None, 1, 1, 0.0005, 0.001)
+
+        body = (await client.get(f"/api/runs/{r.id}/spend")).json()
+        assert [row["task_id"] for row in body["per_task"]] == [t1.id, t2.id]
+        assert [row["title"] for row in body["per_task"]] == ["First", "Second"]
+        first, second = body["per_task"]
+        assert first["prompt_tokens"] == 110
+        assert first["completion_tokens"] == 55
+        assert first["cost_usd"] == 0.005
+        assert first["estimated_usd"] == 0.03
+        assert second["prompt_tokens"] == 7
+        assert second["completion_tokens"] == 3
+        assert second["cost_usd"] == 0.001
+        assert second["estimated_usd"] == 0.005
+
+
 # ---------------------------------------------------------------- merge queue
 
 

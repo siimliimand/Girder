@@ -268,6 +268,9 @@ async def test_edge_tables_match_implementation_plan(db) -> None:  # type: ignor
         ("merge_pending_human", "aborted"),
         ("merge_pending_human", "escalated"),
         ("budget_exhausted", "aborted"),
+        # §8.3: ceilings are per-cap, not per-run-lifetime — an operator
+        # raising budget_cap_usd resumes the run (WP-E defect 2).
+        ("budget_exhausted", "active"),
         # §5.1: escalated is a hard stop (D4 — human review at every tier);
         # only an explicit operator abort leaves it.
         ("escalated", "aborted"),

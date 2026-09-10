@@ -122,6 +122,13 @@ _PUMPABLE_RUN_STATUSES = frozenset(
         RunStatus.BASELINE_RUNNING,
         RunStatus.ACTIVE,
         *DELIVERY_STATUSES,
+        # R14: `escalated` is terminal except an explicit operator abort —
+        # POST /steer queues an abort in any status, so escalated runs stay
+        # pumpable solely to consume that abort (impl-plan R14).
+        RunStatus.ESCALATED,
+        # §8.3: budget hard ceilings are per-cap, not per-run-lifetime; the
+        # pump re-checks the (possibly raised) cap and resumes or re-parks.
+        RunStatus.BUDGET_EXHAUSTED,
     }
 )
 
@@ -209,7 +216,35 @@ class RunEngine:
 
         if run.status is RunStatus.AWAITING_AMENDMENT:
             return "awaiting_amendment"
+        if run.status is RunStatus.ESCALATED:
+            return await self._pump_escalated(run)
+        if run.status is RunStatus.BUDGET_EXHAUSTED:
+            return await self._pump_budget_exhausted(run)
         return str(run.status)
+
+    async def _pump_escalated(self, run: Run) -> str:
+        # R14: `escalated` is terminal except an explicit operator abort.
+        # Consume abort steering only — other queued kinds stay unconsumed for
+        # the post-review flow; without an abort the run parks unchanged
+        # (escalation never auto-aborts).
+        events = await repo.consume_steering_events(
+            self.db, run.id, kinds=[SteeringKind.ABORT.value]
+        )
+        if not events:
+            return "escalated"
+        return await self._abort_run(run)
+
+    async def _pump_budget_exhausted(self, run: Run) -> str:
+        # §8.3: hard ceilings are per-cap, not per-run-lifetime — an operator
+        # raising budget_cap_usd un-parks the run. The parked task is still
+        # `running`, so the resumed ACTIVE pump picks it straight back up.
+        if run.spend_usd >= run.budget_cap_usd:
+            return "budget_exhausted"
+        await transition_run(self.db, run.id, RunStatus.ACTIVE,
+                            payload={"reason": "budget cap raised"})
+        fresh = await repo.get_run(self.db, run.id)
+        assert fresh is not None
+        return await self._pump_active(fresh)
 
     async def run_to_completion(
         self, run_id: str, *, poll_s: float = 2.0, max_pumps: int = 500

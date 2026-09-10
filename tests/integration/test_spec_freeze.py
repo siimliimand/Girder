@@ -112,6 +112,77 @@ async def test_freeze_commits_and_transitions(frozen: Ctx) -> None:
     assert frozen_events
 
 
+async def test_freeze_resumes_after_crash_between_commit_and_db(
+    db: Database, git_repo: Path, tmp_path: Path
+) -> None:
+    """Crash invariance: if a prior attempt committed the proposal but died
+    before the DB writes (run still spec_pending, spec_hash NULL), a retry
+    must skip the duplicate commit, reconcile the DB, and set spec_hash
+    exactly once."""
+    project = await repo.create_project(db, "crash", str(git_repo))
+    run = await repo.create_run(db, project.id, "intent", "run/crash", 5.0)
+    await seed_run_status(db, run.id, RunStatus.SPEC_PENDING.value)
+    fresh = await repo.get_run(db, run.id)
+    assert fresh is not None
+
+    # Simulate the crash state using the module's own commit path.
+    wt_base = tmp_path / "wt"
+    from girder.specs.freeze import _commit_in_worktree, _resolve_base
+
+    base = await _resolve_base(git_repo, fresh.branch)
+    crashed_head = await _commit_in_worktree(
+        git_repo, wt_base / f"spec-{run.id}", fresh.branch, base, run.id, PROPOSAL
+    )
+    mid = await repo.get_run(db, run.id)
+    assert mid is not None and mid.status is RunStatus.SPEC_PENDING
+    assert mid.spec_hash is None
+
+    result = await approve_and_freeze(
+        db, project=project, run=fresh, proposal_text=PROPOSAL,
+        repo_path=git_repo, worktree_base=wt_base,
+    )
+    # No duplicate commit: retry reused the crashed attempt's head.
+    assert result.commit_sha == crashed_head
+    assert crashed_head in await _git(git_repo, "log", "--format=%H", fresh.branch)
+    subjects = await _git(git_repo, "log", "--format=%s", fresh.branch)
+    assert subjects.count(f"spec: freeze openspec proposal {run.id}") == 1
+
+    reconciled = await repo.get_run(db, run.id)
+    assert reconciled is not None
+    assert reconciled.spec_hash == hashlib.sha256(PROPOSAL.encode("utf-8")).hexdigest()
+    assert reconciled.status is RunStatus.SPEC_APPROVED
+
+
+async def test_freeze_refuses_differing_committed_proposal(
+    db: Database, git_repo: Path, tmp_path: Path
+) -> None:
+    """A blob already on the run branch that differs from the approved text is
+    tamper evidence: refuse, never overwrite silently."""
+    project = await repo.create_project(db, "tamper-blob", str(git_repo))
+    run = await repo.create_run(db, project.id, "intent", "run/tamper-blob", 5.0)
+    await seed_run_status(db, run.id, RunStatus.SPEC_PENDING.value)
+    fresh = await repo.get_run(db, run.id)
+    assert fresh is not None
+
+    wt_base = tmp_path / "wt"
+    from girder.specs.freeze import _commit_in_worktree, _resolve_base
+
+    base = await _resolve_base(git_repo, fresh.branch)
+    await _commit_in_worktree(
+        git_repo, wt_base / f"spec-{run.id}", fresh.branch, base, run.id,
+        PROPOSAL + "malicious edit\n",
+    )
+    with pytest.raises(FreezeError, match="differs"):
+        await approve_and_freeze(
+            db, project=project, run=fresh, proposal_text=PROPOSAL,
+            repo_path=git_repo, worktree_base=wt_base,
+        )
+    after = await repo.get_run(db, run.id)
+    assert after is not None
+    assert after.status is RunStatus.SPEC_PENDING
+    assert after.spec_hash is None
+
+
 async def test_double_freeze_refused(frozen: Ctx) -> None:
     again = await repo.get_run(frozen.db, frozen.run.id)
     assert again is not None

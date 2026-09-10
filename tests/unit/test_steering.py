@@ -26,6 +26,7 @@ from girder.guard.redact import Redactor
 from girder.guard.scope import TaskScopes
 from girder.orchestrator.run_engine import RunEngine
 from girder.sandbox.engine import ExecResult
+from girder.util import run_host_cmd
 from tests.conftest import seed_run_status
 from tests.unit.test_agent_runtime import FakeGateway, _resp, _tc
 from tests.unit.test_agent_tools import TASK, FakeSandbox
@@ -346,3 +347,88 @@ async def test_task_engine_folds_unconsumed_inject_into_guidance(harness: Harnes
 def test_build_directive_message_tags_and_strips() -> None:
     out = prompts.build_directive_message("  use small diffs  \n")
     assert out == "[TRUSTED] Steering directive (user-authored):\nuse small diffs"
+
+
+# ---------------------------------------------------- escalated / budget (WP-E)
+
+
+async def _unconsumed_steering(db: Database, run_id: str) -> list[dict[str, Any]]:
+    return [
+        dict(r)
+        for r in await db.fetchall(
+            "SELECT * FROM steering_events WHERE run_id = ? AND consumed_at IS NULL",
+            (run_id,),
+        )
+    ]
+
+
+async def test_escalated_run_aborts_on_operator_steering(harness: Harness) -> None:
+    h = harness
+    await _add_task(h, h.run_id, seq=1, scope_globs=["src/**"])
+    gateway = FakeGateway(responses=write_commit_complete())
+    await seed_run_status(h.db, h.run_id, RunStatus.ESCALATED.value)
+    await repo.insert_steering_event(h.db, h.run_id, SteeringKind.ABORT.value, {})
+
+    assert await h.engine(gateway).pump_once(h.run_id) == "aborted"
+    fresh = await repo.get_run(h.db, h.run_id)
+    assert fresh is not None and fresh.status is RunStatus.ABORTED
+    assert gateway.calls == []  # no model work — straight to teardown
+    # the abort was consumed exactly once
+    assert not await _unconsumed_steering(h.db, h.run_id)
+    # the ordinary abort teardown ran: worktrees pruned, branch reset, event
+    rows = await h.db.fetchall(
+        "SELECT payload_json FROM agent_events WHERE run_id = ? AND event_type = 'run_aborted'",
+        (h.run_id,),
+    )
+    assert len(rows) == 1
+    assert json.loads(rows[0]["payload_json"])["branch_reset_to"] is not None
+    branch = (
+        await run_host_cmd(
+            ["git", "-C", str(h.repo_path), "rev-parse", "run/steer1"], timeout_s=30
+        )
+    ).stdout.strip()
+    main = (
+        await run_host_cmd(["git", "-C", str(h.repo_path), "rev-parse", "main"], timeout_s=30)
+    ).stdout.strip()
+    assert branch == main
+
+
+async def test_escalated_run_without_abort_parks_unchanged(harness: Harness) -> None:
+    h = harness
+    await _add_task(h, h.run_id, seq=1, scope_globs=["src/**"])
+    gateway = FakeGateway(responses=write_commit_complete())
+    await seed_run_status(h.db, h.run_id, RunStatus.ESCALATED.value)
+
+    assert await h.engine(gateway).pump_once(h.run_id) == "escalated"
+    fresh = await repo.get_run(h.db, h.run_id)
+    assert fresh is not None and fresh.status is RunStatus.ESCALATED
+    assert gateway.calls == []  # no auto-abort, no model calls
+    task = (await h.db.fetchall("SELECT status FROM tasks"))[0]
+    assert task["status"] == TaskStatus.PENDING.value  # nothing consumed/executed
+
+
+async def test_budget_exhausted_resumes_when_cap_raised(harness: Harness) -> None:
+    h = harness
+    await _add_task(h, h.run_id, seq=1, scope_globs=["src/**"])
+    gateway = FakeGateway(responses=write_commit_complete())
+    await seed_run_status(h.db, h.run_id, RunStatus.BUDGET_EXHAUSTED.value)
+    # operator raised the cap: spend (1.0) is now under the new cap (5.0)
+    await repo.update_run_fields(h.db, h.run_id, spend_usd=1.0, budget_cap_usd=5.0)
+
+    assert await h.engine(gateway).pump_once(h.run_id) == "task_completed"
+    fresh = await repo.get_run(h.db, h.run_id)
+    assert fresh is not None and fresh.status is RunStatus.ACTIVE
+    assert len(gateway.calls) > 0  # the pump resumed the parked task
+
+
+async def test_budget_exhausted_still_over_cap_parks(harness: Harness) -> None:
+    h = harness
+    await _add_task(h, h.run_id, seq=1, scope_globs=["src/**"])
+    gateway = FakeGateway(responses=write_commit_complete())
+    await seed_run_status(h.db, h.run_id, RunStatus.BUDGET_EXHAUSTED.value)
+    await repo.update_run_fields(h.db, h.run_id, spend_usd=9.0, budget_cap_usd=5.0)
+
+    assert await h.engine(gateway).pump_once(h.run_id) == "budget_exhausted"
+    fresh = await repo.get_run(h.db, h.run_id)
+    assert fresh is not None and fresh.status is RunStatus.BUDGET_EXHAUSTED
+    assert gateway.calls == []

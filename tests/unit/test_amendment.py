@@ -10,7 +10,16 @@ import pytest
 
 from girder.db import repo
 from girder.db.engine import Database
-from girder.db.models import Attempt, Project, Run, RunStatus, Task, TaskStatus, TaskType
+from girder.db.models import (
+    Attempt,
+    AttemptStatus,
+    Project,
+    Run,
+    RunStatus,
+    Task,
+    TaskStatus,
+    TaskType,
+)
 from girder.fsm import transition_attempt, transition_run, transition_task
 from girder.specs.amendment import AmendmentError, request_spec_amendment, resolve_amendment
 from girder.specs.freeze import approve_and_freeze
@@ -107,6 +116,12 @@ async def _request(ctx: Ctx) -> repo.SpecAmendment:
         reason="spec slice is ambiguous",
         suggested_change="add explicit acceptance note to do-thing",
     )
+
+
+async def seed_task_status(db: Database, task_id: str, status: str) -> None:
+    """Deliberately bypasses the FSM — test-only seeding of a task's status."""
+    await db.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    await db.conn.commit()
 
 
 @dataclass
@@ -259,8 +274,10 @@ async def test_wrong_run_refused(ctx: Ctx) -> None:
 
 async def test_run_not_awaiting_refused(ctx: Ctx) -> None:
     amendment = await _request(ctx)
-    # knock the run out of awaiting_amendment (no legal edge back, so seed directly)
-    await seed_run_status(ctx.db, ctx.run.id, RunStatus.ACTIVE.value)
+    # knock the run out of awaiting_amendment into a non-recoverable state (no
+    # legal edge back, so seed directly). ACTIVE with a pending amendment IS
+    # recoverable now (crash-window path below) — FAILED is not.
+    await seed_run_status(ctx.db, ctx.run.id, RunStatus.FAILED.value)
     with pytest.raises(AmendmentError, match="awaiting_amendment"):
         await resolve_amendment(
             ctx.db, project=ctx.project, run=ctx.run, amendment=amendment, decision="approved"
@@ -286,4 +303,163 @@ async def test_failed_parking_does_not_leave_pending_row(ctx: Ctx) -> None:
     rows = await repo.list_amendments_for_run(ctx.db, ctx.run.id)
     assert len(rows) == 1
     assert rows[0].status == "aborted"
+    assert await repo.get_pending_amendment(ctx.db, ctx.run.id) is None
+
+
+# ---------------------------------------------------- crash-window recovery (D1)
+
+
+async def _crash_window_amendment(ctx: Ctx) -> repo.SpecAmendment:
+    """Simulate the crash: the durable amendment row is written BEFORE the
+    FSM parking, and the process dies between the two — the run stays ACTIVE
+    and the task stays RUNNING with a pending amendment."""
+    return await repo.create_spec_amendment(
+        ctx.db, ctx.run.id, "spec slice is ambiguous", "fix it", task_id=ctx.task.id
+    )
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected", "aborted"])
+async def test_resolve_from_active_crash_window(ctx: Ctx, decision: str) -> None:
+    """§8.7: a run left ACTIVE with a pending amendment must not be wedged —
+    Approve/Reject/Abort all stay reachable; resolution finishes the parking
+    itself."""
+    amendment = await _crash_window_amendment(ctx)
+    outcome = await resolve_amendment(
+        ctx.db, project=ctx.project, run=ctx.run, amendment=amendment, decision=decision
+    )
+    assert outcome.decision == decision
+    fresh_run = await repo.get_run(ctx.db, ctx.run.id)
+    assert fresh_run is not None
+    if decision == "aborted":
+        assert fresh_run.status is RunStatus.ABORTED
+    else:
+        assert fresh_run.status is RunStatus.ACTIVE
+
+
+async def test_crash_window_approve_repins_and_resumes(ctx: Ctx) -> None:
+    amendment = await _crash_window_amendment(ctx)
+    outcome = await resolve_amendment(
+        ctx.db, project=ctx.project, run=ctx.run, amendment=amendment, decision="approved"
+    )
+    fresh_run = await repo.get_run(ctx.db, ctx.run.id)
+    fresh_task = await repo.get_task(ctx.db, ctx.task.id)
+    assert fresh_run is not None and fresh_task is not None
+    assert fresh_run.spec_hash == outcome.new_spec_hash
+    assert fresh_task.status is TaskStatus.RUNNING
+
+
+# ------------------------------------------------------ scope widening (D2, M5)
+
+
+async def test_approve_with_scope_globs_unions_task_scope(ctx: Ctx) -> None:
+    """Approving with scope_globs unions them into tasks.scope_globs_json
+    (§8.4: approval may widen scope; it never narrows)."""
+    amendment = await _request(ctx)
+    await resolve_amendment(
+        ctx.db,
+        project=ctx.project,
+        run=ctx.run,
+        amendment=amendment,
+        decision="approved",
+        scope_globs=["docs/**", "src/**"],  # src/** already authorized -> dedup
+    )
+    fresh_task = await repo.get_task(ctx.db, ctx.task.id)
+    assert fresh_task is not None
+    assert fresh_task.scope_globs == ["src/**", "docs/**"]
+    stored = await repo.get_spec_amendment(ctx.db, amendment.id)
+    assert stored is not None
+    assert stored.scope_globs == ["docs/**", "src/**"]
+
+
+async def test_reject_ignores_scope_globs(ctx: Ctx) -> None:
+    amendment = await _request(ctx)
+    await resolve_amendment(
+        ctx.db,
+        project=ctx.project,
+        run=ctx.run,
+        amendment=amendment,
+        decision="rejected",
+        scope_globs=["docs/**"],
+    )
+    fresh_task = await repo.get_task(ctx.db, ctx.task.id)
+    assert fresh_task is not None
+    assert fresh_task.scope_globs == ["src/**"]
+    stored = await repo.get_spec_amendment(ctx.db, amendment.id)
+    assert stored is not None
+    assert stored.scope_globs == []
+
+
+async def test_invalid_scope_glob_refused_and_stays_pending(ctx: Ctx) -> None:
+    amendment = await _request(ctx)
+    with pytest.raises(AmendmentError, match="must not contain"):
+        await resolve_amendment(
+            ctx.db,
+            project=ctx.project,
+            run=ctx.run,
+            amendment=amendment,
+            decision="approved",
+            scope_globs=["../etc"],
+        )
+    stored = await repo.get_spec_amendment(ctx.db, amendment.id)
+    assert stored is not None
+    assert stored.status == "pending"
+    fresh_task = await repo.get_task(ctx.db, ctx.task.id)
+    assert fresh_task is not None
+    assert fresh_task.scope_globs == ["src/**"]
+
+
+@pytest.mark.parametrize(
+    "bad_glob", ["/abs/path", "../up", "a/../../b", ""]  # type: ignore[list-item]
+)
+async def test_scope_glob_rules_match_validator(ctx: Ctx, bad_glob: str) -> None:
+    amendment = await _request(ctx)
+    with pytest.raises(AmendmentError):
+        await resolve_amendment(
+            ctx.db,
+            project=ctx.project,
+            run=ctx.run,
+            amendment=amendment,
+            decision="approved",
+            scope_globs=[bad_glob],
+        )
+    stored = await repo.get_spec_amendment(ctx.db, amendment.id)
+    assert stored is not None
+    assert stored.status == "pending"
+
+
+async def test_request_persists_scope_globs(ctx: Ctx) -> None:
+    amendment = await request_spec_amendment(
+        ctx.db,
+        run=ctx.run,
+        task=ctx.task,
+        attempt=ctx.attempt,
+        reason="need the docs dir too",
+        suggested_change="widen scope",
+        scope_globs=["docs/**"],
+    )
+    stored = await repo.get_spec_amendment(ctx.db, amendment.id)
+    assert stored is not None
+    assert stored.scope_globs == ["docs/**"]
+
+
+# -------------------------------------------- partial-park residue (D3, L4 test)
+
+
+async def test_parking_failure_leaves_no_amendment_requested_residue(ctx: Ctx) -> None:
+    """§8.7: if a mid-park transition fails after the attempt was parked, no
+    attempt may stay stranded in the non-terminal amendment_requested state.
+    Parking is ordered run -> task -> attempt with compensation, so a failure
+    leaves the attempt untouched and reverses any parked task/run."""
+    # Make the task parking illegal (completed tasks cannot be parked) — the
+    # run parks first, then the failure hits.
+    await seed_task_status(ctx.db, ctx.task.id, TaskStatus.COMPLETED.value)
+    with pytest.raises(AmendmentError, match="cannot request amendment"):
+        await _request(ctx)
+    fresh_run = await repo.get_run(ctx.db, ctx.run.id)
+    fresh_task = await repo.get_task(ctx.db, ctx.task.id)
+    fresh_attempt = await repo.get_attempt(ctx.db, ctx.attempt.id)
+    assert fresh_run is not None and fresh_run.status is RunStatus.ACTIVE  # reversed
+    assert fresh_task is not None and fresh_task.status is TaskStatus.COMPLETED
+    assert fresh_attempt is not None
+    assert fresh_attempt.status is not AttemptStatus.AMENDMENT_REQUESTED
     assert await repo.get_pending_amendment(ctx.db, ctx.run.id) is None

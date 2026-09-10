@@ -234,6 +234,12 @@ def _check_run_command(cmd: str, scopes: TaskScopes) -> Verdict:
             return Verdict.VIOLATION
         if not _matches_any(rel, scopes.write_globs):
             return Verdict.VIOLATION
+    # §6.6 R2: EVERY read-shaped path token must be evaluated — returning on
+    # the first token would let a later protected/escaping path smuggle
+    # through ("cat src/a.py .github/workflows/ci.yml"). Track the worst
+    # verdict (VIOLATION > ALLOW_LOGGED > ALLOW) and hold the whole call on
+    # any violating token, mirroring apply_patch's diff-body policy.
+    worst = Verdict.ALLOW
     for raw in others:
         rel = resolve_path(raw, scopes.root)
         if rel is None:
@@ -247,8 +253,14 @@ def _check_run_command(cmd: str, scopes: TaskScopes) -> Verdict:
         # handled above. Existence is deliberately not probed on the host
         # filesystem — run_command executes in the guest, where the host
         # layout is meaningless (plan §8.5 / impl-plan §6.6 R2).
-        return Verdict.ALLOW_LOGGED
-    return Verdict.ALLOW
+        if scopes.strict_read_scope:
+            # strict_read_scope (§8.5 literal): mirror the read-tool branch —
+            # in-scope reads are ALLOW, out-of-scope reads are VIOLATIONS.
+            if not _matches_any(rel, scopes.write_globs):
+                return Verdict.VIOLATION
+        elif worst is Verdict.ALLOW:
+            worst = Verdict.ALLOW_LOGGED
+    return worst
 
 
 def diff_target_paths(diff: str) -> list[str]:
