@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import subprocess
 
 import pytest
 
-from girder.agent.tools import TOOL_SCHEMAS, CommandDenied, ToolRegistry, screen_command
+from girder.agent.tools import (
+    _MATCH_CAP,
+    TOOL_SCHEMAS,
+    CommandDenied,
+    ToolRegistry,
+    _summarize_junit,
+    screen_command,
+)
 from girder.config import LimitsConfig
 from girder.db import repo
 from girder.db.engine import Database
@@ -71,9 +80,7 @@ async def seeded(db: Database) -> tuple[Database, str, str]:
     return db, run.id, attempt.id
 
 
-def _registry(
-    sandbox: FakeSandbox, db: Database, run_id: str, attempt_id: str
-) -> ToolRegistry:
+def _registry(sandbox: FakeSandbox, db: Database, run_id: str, attempt_id: str) -> ToolRegistry:
     return ToolRegistry(
         sandbox=sandbox,
         container="ctr",
@@ -179,9 +186,7 @@ async def test_run_command_denied_vs_benign(seeded: tuple[Database, str, str]) -
 
     benign = await registry.execute("run_command", {"cmd": "python -m pytest -q"})
     assert benign.ok
-    assert ("ctr", ["sh", "-c", "python -m pytest -q"]) in [
-        (n, c) for n, c, _ in sandbox.execs
-    ]
+    assert ("ctr", ["sh", "-c", "python -m pytest -q"]) in [(n, c) for n, c, _ in sandbox.execs]
     rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
     held_rows = [r for r in rows if r["held"]]
     assert len(held_rows) == 1
@@ -235,9 +240,7 @@ async def test_run_command_protected_redirect_held(
 
 async def test_output_redacted_and_truncated(seeded: tuple[Database, str, str]) -> None:
     db, run_id, attempt_id = seeded
-    leaky = "\n".join(
-        ["key AKIAIOSFODNN7EXAMPLE here", *(f"line {i}" for i in range(25))]
-    )
+    leaky = "\n".join(["key AKIAIOSFODNN7EXAMPLE here", *(f"line {i}" for i in range(25))])
     sandbox = FakeSandbox(results=[ExecResult(0, leaky, "")])
     limits = LimitsConfig(tool_output_max_lines=5)
     registry = ToolRegistry(
@@ -303,9 +306,7 @@ async def test_tool_exception_becomes_output_not_raise(
         raise RuntimeError("container gone")
 
     sandbox = FakeSandbox(side_effects=[boom])
-    result = await _registry(sandbox, db, run_id, attempt_id).execute(
-        "read_file", {"path": "x"}
-    )
+    result = await _registry(sandbox, db, run_id, attempt_id).execute("read_file", {"path": "x"})
     assert not result.ok
     assert "error" in result.output
     rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
@@ -369,3 +370,436 @@ def test_read_file_description_documents_funnel_and_clipping() -> None:
     assert "view_symbol_outline" in desc
     assert "line_start" in desc and "line_end" in desc
     assert "truncated" in desc
+
+
+# ---------------------------------------------------------------------------
+# WP 7.1-7.5: new tools. RealSandbox actually executes argv in a tmpdir so
+# the python3 -c snippets and git plumbing are exercised for real; FakeSandbox
+# is used for gate/logging/script-shape assertions.
+# ---------------------------------------------------------------------------
+
+
+class RealSandbox(SandboxEngine):
+    """Executes argv via subprocess in a host tmpdir (no podman)."""
+
+    def __init__(self, cwd: object) -> None:
+        self.cwd = str(cwd)
+        self.execs: list[tuple[str, list[str], float]] = []
+
+    async def start(self, spec: ContainerSpec) -> str:
+        return "ctr"
+
+    async def exec(
+        self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
+    ) -> ExecResult:
+        self.execs.append((name, cmd, timeout_s))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=self.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        assert proc.returncode is not None
+        return ExecResult(proc.returncode, out.decode(), err.decode())
+
+    async def kill(self, name: str) -> None:
+        pass
+
+    async def exists(self, name: str) -> bool:
+        return True
+
+
+def _real_registry(
+    sandbox: RealSandbox, db: Database, run_id: str, attempt_id: str
+) -> ToolRegistry:
+    return ToolRegistry(
+        sandbox=sandbox,
+        container="ctr",
+        scopes=SCOPES,
+        limits=LIMITS,
+        redactor=Redactor(),
+        db=db,
+        attempt_id=attempt_id,
+        run_id=run_id,
+        task=TASK,
+    )
+
+
+_TOOL_NAMES = {t["function"]["name"] for t in TOOL_SCHEMAS}
+
+
+def test_tool_schemas_include_all_six_new_tools() -> None:
+    for name in (
+        "edit_file",
+        "list_directory",
+        "git_status",
+        "git_diff",
+        "run_tests",
+        "search_symbols",
+    ):
+        assert name in _TOOL_NAMES
+    assert len(_TOOL_NAMES) == 15  # 9 existing + 6 new
+
+
+def test_tool_description_audit_wp76() -> None:
+    by_name = {t["function"]["name"]: t["function"]["description"] for t in TOOL_SCHEMAS}
+    assert "fd" not in by_name["find_files"]  # no availability detail
+    assert "rg if available" not in by_name["ripgrep"]
+    assert "python" in by_name["view_symbol_outline"].lower()
+    assert "fall back" in by_name["view_symbol_outline"].lower()
+    for denied in ("curl", "wget", "nc", "ssh", "git push", "sudo", "podman", "docker", "mount"):
+        assert denied in by_name["run_command"]
+    # read_file description was already improved (Group C) — still funnel-shaped.
+    assert "view_symbol_outline" in by_name["read_file"]
+
+
+# ------------------------------------------------------------------ edit_file
+
+
+async def test_edit_file_replaces_middle_block_accurately(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    src = tmp_path / "src" / "a.py"  # type: ignore[attr-defined]
+    src.parent.mkdir()
+    src.write_text("line1\nline2\nline3\nline4\n")
+    sandbox = RealSandbox(tmp_path)
+    result = await _real_registry(sandbox, db, run_id, attempt_id).execute(
+        "edit_file",
+        {"path": "src/a.py", "start_line": 2, "end_line": 3, "replacement": "two\nthree"},
+    )
+    assert result.ok, result.output
+    assert src.read_text() == "line1\ntwo\nthree\nline4\n"
+
+
+async def test_edit_file_first_and_last_lines(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    src = tmp_path / "src" / "a.py"  # type: ignore[attr-defined]
+    src.parent.mkdir()
+    src.write_text("head\nmid\ntail\n")
+    sandbox = RealSandbox(tmp_path)
+    registry = _real_registry(sandbox, db, run_id, attempt_id)
+    assert (
+        await registry.execute(
+            "edit_file", {"path": "src/a.py", "start_line": 1, "end_line": 1, "replacement": "HEAD"}
+        )
+    ).ok
+    assert (
+        await registry.execute(
+            "edit_file", {"path": "src/a.py", "start_line": 3, "end_line": 3, "replacement": "TAIL"}
+        )
+    ).ok
+    assert src.read_text() == "HEAD\nmid\nTAIL\n"
+
+
+async def test_edit_file_preserves_untouched_crlf_lines(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    src = tmp_path / "src" / "a.txt"  # type: ignore[attr-defined]
+    src.parent.mkdir()
+    src.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    sandbox = RealSandbox(tmp_path)
+    result = await _real_registry(sandbox, db, run_id, attempt_id).execute(
+        "edit_file", {"path": "src/a.txt", "start_line": 2, "end_line": 2, "replacement": "TWO"}
+    )
+    assert result.ok, result.output
+    assert src.read_bytes() == b"one\r\nTWO\nthree\r\n"
+
+
+async def test_edit_file_out_of_range_fails_cleanly(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    src = tmp_path / "src" / "a.py"  # type: ignore[attr-defined]
+    src.parent.mkdir()
+    src.write_text("one\ntwo\n")
+    sandbox = RealSandbox(tmp_path)
+    registry = _real_registry(sandbox, db, run_id, attempt_id)
+    for bad in (
+        {"start_line": 1, "end_line": 9},  # end past EOF
+        {"start_line": 0, "end_line": 1},  # 0 is not a line
+        {"start_line": 3, "end_line": 2},  # end before start
+    ):
+        result = await registry.execute(
+            "edit_file", {"path": "src/a.py", **bad, "replacement": "x"}
+        )
+        assert not result.ok
+        assert "range" in result.output
+    assert src.read_text() == "one\ntwo\n"  # untouched
+
+
+async def test_edit_file_out_of_scope_is_held_as_write_violation(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox()
+    result = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "edit_file", {"path": "tests/test_x.py", "start_line": 1, "end_line": 2, "replacement": "x"}
+    )
+    assert not result.ok and result.held and result.scope_violation
+    assert sandbox.execs == []  # never executed
+    violations = await db.fetchall("SELECT kind FROM integrity_violations")
+    assert [v["kind"] for v in violations] == ["out_of_scope_write"]
+
+
+async def test_edit_file_protected_path_held(seeded: tuple[Database, str, str]) -> None:
+    db, run_id, attempt_id = seeded
+    result = await _registry(FakeSandbox(), db, run_id, attempt_id).execute(
+        "edit_file", {"path": ".github/w.yml", "start_line": 1, "end_line": 1, "replacement": "x"}
+    )
+    assert result.held and result.scope_violation
+
+
+# -------------------------------------------------------------- list_directory
+
+
+async def test_list_directory_entries_types_and_sizes(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    (tmp_path / "pkg").mkdir()  # type: ignore[attr-defined]
+    (tmp_path / "pkg" / "mod.py").write_text("x = 1\n")
+    (tmp_path / "README.md").write_text("hello\n")
+    sandbox = RealSandbox(tmp_path)
+    result = await _real_registry(sandbox, db, run_id, attempt_id).execute(
+        "list_directory", {"path": ".", "depth": 2}
+    )
+    assert result.ok, result.output
+    assert "./pkg [dir]" in result.output
+    assert "./pkg/mod.py [file 6 bytes]" in result.output
+    assert "./README.md [file 6 bytes]" in result.output
+
+
+async def test_list_directory_depth_and_git_pruned(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    base = tmp_path / "pkg" / "sub"  # type: ignore[attr-defined]
+    base.mkdir(parents=True)
+    (base / "deep.py").write_text("y = 2\n")
+    (tmp_path / ".git").mkdir()  # type: ignore[attr-defined]
+    (tmp_path / ".git" / "HEAD").write_text("ref\n")
+    sandbox = RealSandbox(tmp_path)
+    registry = _real_registry(sandbox, db, run_id, attempt_id)
+    shallow = await registry.execute("list_directory", {"path": "pkg", "depth": 1})
+    assert "sub" in shallow.output and "deep.py" not in shallow.output
+    deep = await registry.execute("list_directory", {"path": "pkg", "depth": 3})
+    assert "deep.py" in deep.output
+    assert ".git" not in deep.output
+
+
+async def test_list_directory_caps_output_and_errors_on_missing(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    for i in range(_MATCH_CAP + 20):
+        (tmp_path / f"f{i:04}.txt").write_text("x")  # type: ignore[attr-defined]
+    sandbox = RealSandbox(tmp_path)
+    registry = _real_registry(sandbox, db, run_id, attempt_id)
+    capped = await registry.execute("list_directory", {"path": "."})
+    assert "[truncated:" in capped.output
+    missing = await registry.execute("list_directory", {"path": "nope"})
+    assert not missing.ok and "not a directory" in missing.output
+
+
+async def test_list_directory_protected_path_held(seeded: tuple[Database, str, str]) -> None:
+    db, run_id, attempt_id = seeded
+    result = await _registry(FakeSandbox(), db, run_id, attempt_id).execute(
+        "list_directory", {"path": ".github"}
+    )
+    assert result.held and result.scope_violation
+
+
+# ------------------------------------------------------- git_status / git_diff
+
+
+async def test_git_status_short_format_and_allow_logged_verdict(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, " M src/a.py\n", "")])
+    result = await _registry(sandbox, db, run_id, attempt_id).execute("git_status", {})
+    assert result.ok and result.output == " M src/a.py\n"
+    assert sandbox.execs == [("ctr", ["git", "status", "--short"], 120.0)]
+    rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
+    assert rows[0]["verdict"] == "allow_logged" and not rows[0]["held"]
+
+
+async def test_git_diff_staged_and_path_arguments(seeded: tuple[Database, str, str]) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "diff\n", ""), ExecResult(0, "diff2\n", "")])
+    registry = _registry(sandbox, db, run_id, attempt_id)
+    assert (await registry.execute("git_diff", {})).ok
+    assert (await registry.execute("git_diff", {"path": "src/a.py", "staged": True})).ok
+    assert sandbox.execs[0][1] == ["git", "diff", "--"]
+    assert sandbox.execs[1][1] == ["git", "diff", "--cached", "--", "src/a.py"]
+
+
+async def test_git_status_and_diff_real_repo(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    env_git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*env_git, "init", "-q"], cwd=tmp_path, check=True)  # noqa: ASYNC221
+    (tmp_path / "a.txt").write_text("v1\n")  # type: ignore[attr-defined]
+    subprocess.run([*env_git, "add", "a.txt"], cwd=tmp_path, check=True)  # noqa: ASYNC221
+    subprocess.run([*env_git, "commit", "-qm", "init"], cwd=tmp_path, check=True)  # noqa: ASYNC221
+    (tmp_path / "a.txt").write_text("v2\n")  # type: ignore[attr-defined]
+    (tmp_path / "b.txt").write_text("new\n")  # type: ignore[attr-defined]
+    sandbox = RealSandbox(tmp_path)
+    registry = _real_registry(sandbox, db, run_id, attempt_id)
+    status = await registry.execute("git_status", {})
+    assert status.ok and " M a.txt" in status.output and "?? b.txt" in status.output
+    diff = await registry.execute("git_diff", {"path": "a.txt"})
+    assert diff.ok and "-v1" in diff.output and "+v2" in diff.output
+
+
+# ------------------------------------------------------------------ run_tests
+
+
+_JUNIT = (
+    "<testsuites><testsuite>"
+    '<testcase classname="tests.test_api" name="test_ok" file="tests/test_api.py"/>'
+    '<testcase classname="tests.test_api" name="test_bad" file="tests/test_api.py">'
+    "<failure>AssertionError</failure></testcase>"
+    '<testcase classname="tests.test_api" name="test_boom" file="tests/test_api.py">'
+    "<error>KeyError</error></testcase>"
+    '<testcase classname="tests.test_api" name="test_skip" file="tests/test_api.py">'
+    "<skipped/></testcase>"
+    "</testsuite></testsuites>"
+)
+
+
+def test_summarize_junit_counts_and_failure_list() -> None:
+    summary = _summarize_junit(_JUNIT)
+    assert summary is not None
+    first = summary.splitlines()[0]
+    assert first == "PASSED: 1  FAILED: 1  ERROR: 1  SKIPPED: 1"
+    assert "FAILURES:" in summary
+    assert "  tests/test_api.py::test_bad" in summary
+    assert "  tests/test_api.py::test_boom" in summary
+
+
+def test_summarize_junit_unparseable_returns_none() -> None:
+    assert _summarize_junit("not xml <") is None
+    assert _summarize_junit("<testsuite/>") is None  # zero testcases
+
+
+async def test_run_tests_builds_pytest_command_and_summary(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(1, "short output\n", ""), ExecResult(0, _JUNIT, "")])
+    result = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "run_tests", {"paths": ["tests/test_api.py"], "keyword": "rate_limit and not slow"}
+    )
+    pytest_cmd = sandbox.execs[0][1]
+    assert pytest_cmd[:5] == [
+        "pytest",
+        "--tb=short",
+        "--no-header",
+        "-q",
+        "--junitxml=/tmp/.girder-run-tests.xml",
+    ]
+    assert pytest_cmd[5:] == ["tests/test_api.py", "-k", "rate_limit and not slow"]
+    assert sandbox.execs[1][1] == ["cat", "/tmp/.girder-run-tests.xml"]
+    assert result.output.startswith("PASSED: 1  FAILED: 1  ERROR: 1  SKIPPED: 1")
+    assert "FAILURES:" in result.output
+    rows = await repo.list_tool_calls_for_attempt(db, attempt_id)
+    assert rows[0]["tool_name"] == "run_tests"
+
+
+async def test_run_tests_missing_report_falls_back_to_raw(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(
+        results=[ExecResult(2, "collection error\n", ""), ExecResult(1, "", "cat: no file")]
+    )
+    result = await _registry(sandbox, db, run_id, attempt_id).execute("run_tests", {})
+    assert not result.ok
+    assert "collection error" in result.output
+
+
+async def test_run_tests_out_of_scope_paths_held(seeded: tuple[Database, str, str]) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox()
+    # The run_command policy on the synthesized command applies: a denylisted
+    # -k expression is held without execution...
+    held = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "run_tests", {"keyword": "curl"}
+    )
+    assert not held.ok and held.held and held.scope_violation
+    assert sandbox.execs == []
+    # ...while ordinary test-path reads are allowed (reads are not write-gated).
+    ok = await _registry(sandbox, db, run_id, attempt_id).execute(
+        "run_tests", {"paths": ["tests/"]}
+    )
+    assert ok.ok
+
+
+async def test_run_tests_timeout_is_capped(seeded: tuple[Database, str, str]) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "", ""), ExecResult(1, "", "x")])
+    await _registry(sandbox, db, run_id, attempt_id).execute("run_tests", {"timeout_s": 99999})
+    assert sandbox.execs[0][2] == 600.0
+
+
+async def test_run_tests_real_pytest_subset(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    tests_dir = tmp_path / "tests"  # type: ignore[attr-defined]
+    tests_dir.mkdir()
+    (tests_dir / "test_t.py").write_text(
+        "def test_pass():\n    assert True\n\n\ndef test_fail():\n    assert 1 == 2\n"
+    )
+    sandbox = RealSandbox(tmp_path)
+    result = await _real_registry(sandbox, db, run_id, attempt_id).execute(
+        "run_tests", {"paths": ["tests/test_t.py"]}
+    )
+    assert result.output.splitlines()[0] == "PASSED: 1  FAILED: 1  ERROR: 0"
+    assert "  tests/test_t.py::test_fail" in result.output
+
+
+# -------------------------------------------------------------- search_symbols
+
+
+async def test_search_symbols_composes_rg_regex_per_kind(
+    seeded: tuple[Database, str, str],
+) -> None:
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "x\n", "") for _ in range(3)])
+    registry = _registry(sandbox, db, run_id, attempt_id)
+    await registry.execute("search_symbols", {"name": "RateLimiter", "kind": "definition"})
+    await registry.execute("search_symbols", {"name": "handle_request", "kind": "usage"})
+    await registry.execute("search_symbols", {"name": "mymod", "kind": "export", "path": "src"})
+    scripts = [cmd[2] for _, cmd, _ in sandbox.execs]
+    assert "^(async def|def|class)\\s+RateLimiter\\b" in scripts[0]
+    assert "\\bhandle_request\\s*\\(" in scripts[1]
+    assert "__all__" in scripts[2] and "*mymod*" in scripts[2] and "src" in scripts[2]
+
+
+async def test_search_symbols_rejects_unknown_kind(seeded: tuple[Database, str, str]) -> None:
+    db, run_id, attempt_id = seeded
+    result = await _registry(FakeSandbox(), db, run_id, attempt_id).execute(
+        "search_symbols", {"name": "x", "kind": "schema"}
+    )
+    assert not result.ok and "kind" in result.output
+
+
+async def test_search_symbols_real_definitions_and_usages(
+    seeded: tuple[Database, str, str], tmp_path: object
+) -> None:
+    db, run_id, attempt_id = seeded
+    (tmp_path / "m.py").write_text("class Foo:\n    pass\n\n\ndef bar():\n    return Foo()\n")
+    sandbox = RealSandbox(tmp_path)
+    registry = _real_registry(sandbox, db, run_id, attempt_id)
+    defs = await registry.execute("search_symbols", {"name": "Foo", "kind": "definition"})
+    assert "class Foo:" in defs.output and defs.output.endswith(":1:class Foo:\n")
+    uses = await registry.execute("search_symbols", {"name": "Foo", "kind": "usage"})
+    assert "return Foo()" in uses.output

@@ -59,7 +59,7 @@ _AST_OUTLINE_SNIPPET = (
     "import ast,sys;"
     "t=ast.parse(open(sys.argv[1]).read());"
     "[print(f\"{n.lineno}: {'class' if isinstance(n,ast.ClassDef) else 'function'}:"
-    " {n.name}\") for n in ast.walk(t)"
+    ' {n.name}") for n in ast.walk(t)'
     " if isinstance(n,(ast.ClassDef,ast.FunctionDef,ast.AsyncFunctionDef))]"
 )
 
@@ -71,39 +71,45 @@ _RUN_TESTS_JUNIT = "/tmp/.girder-run-tests.xml"
 # base64-argv replacement. Out-of-range ranges fail via assert — a silent
 # clamp would corrupt the wrong lines.
 _EDIT_SNIPPET = (
-    "import sys, pathlib, base64; "
-    "p = pathlib.Path(sys.argv[1]); "
-    "lines = p.read_text().splitlines(keepends=True); "
+    "import sys, base64; "
+    "p = sys.argv[1]; "
+    "lines = open(p, newline='').read().splitlines(keepends=True); "
     "s, e = int(sys.argv[2]) - 1, int(sys.argv[3]); "
     "repl = base64.b64decode(sys.argv[4]).decode(); "
     "assert 1 <= s + 1 <= e <= len(lines), ("
     "f'line range {s + 1}..{e} out of range: file has {len(lines)} lines'); "
     "lines[s:e] = [repl] if repl.endswith('\\n') else [repl + '\\n']; "
-    "p.write_text(''.join(lines))"
+    "open(p, 'w', newline='').write(''.join(lines))"
 )
 
 # list_directory (WP 7.2): os.walk with a depth limit; depth counts tree
 # levels (1 = direct children of `root`). Output lines are
 # "<path> [dir]" / "<path> [file N bytes]", .git pruned, entries sorted.
-_DIR_LIST_SNIPPET = (
-    "import os, sys; "
-    "root, maxd = sys.argv[1], max(1, min(3, int(sys.argv[2]))); "
-    "if not os.path.isdir(root): raise SystemExit('error: not a directory: ' + root); "
-    "base = os.path.normpath(root); "
-    "out = []; "
-    "for d, dirs, files in os.walk(root): "
-    "rel = os.path.relpath(d, base); "
-    "depth = 0 if rel == '.' else rel.count(os.sep) + 1; "
-    "dirs[:] = sorted(x for x in dirs if x != '.git'); "
-    "files = sorted(files); "
-    "out.extend(os.path.join(d, n) + ' [dir]' for n in dirs); "
-    "out.extend("
-    "os.path.join(d, n) + ' [file ' + str("
-    "os.path.getsize(os.path.join(d, n)) if os.path.exists(os.path.join(d, n)) else 0"
-    ") + ' bytes]' for n in files); "
-    "if depth + 1 >= maxd: dirs[:] = []; "
-    "print('\\n'.join(out))"
-)
+# (Multi-line: compound statements cannot be chained with semicolons —
+# still argv-only, no stdin.)
+_DIR_LIST_SNIPPET = """\
+import os, sys
+root, maxd = sys.argv[1], max(1, min(3, int(sys.argv[2])))
+if not os.path.isdir(root):
+    raise SystemExit("error: not a directory: " + root)
+base = os.path.normpath(root)
+out = []
+for d, dirs, files in os.walk(root):
+    rel = os.path.relpath(d, base)
+    depth = 0 if rel == "." else rel.count(os.sep) + 1
+    dirs[:] = sorted(x for x in dirs if x != ".git")
+    files = sorted(files)
+    out.extend(os.path.join(d, n) + " [dir]" for n in dirs)
+    out.extend(
+        os.path.join(d, n) + " [file " + str(
+            os.path.getsize(os.path.join(d, n))
+            if os.path.exists(os.path.join(d, n)) else 0
+        ) + " bytes]" for n in files
+    )
+    if depth + 1 >= maxd:
+        dirs[:] = []
+print("\\n".join(out))
+"""
 
 # New tools whose scope verdict is derived from an existing gate shape
 # (R-SP7 scope policy applied without touching guard/scope.py, which WS-01
@@ -387,7 +393,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "The ONLY way to finish your attempt. The worktree must be"
                 " CLEAN first: commit with `git add -A && git commit -m"
-                " \"<message>\"` BEFORE calling this — a dirty tree bounces"
+                ' "<message>"` BEFORE calling this — a dirty tree bounces'
                 " the call and wastes a turn. If the turn budget runs out"
                 " before you call this, the attempt is destroyed and all"
                 " uncommitted work is lost. Provide a short summary of what"
@@ -401,8 +407,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "no_changes": {
                         "type": "boolean",
                         "description": (
-                            "Set true only when you genuinely made no changes"
-                            " and none were needed."
+                            "Set true only when you genuinely made no changes and none were needed."
                         ),
                         "default": False,
                     },
@@ -498,13 +503,18 @@ def _gate_new_tool(name: str, args: dict[str, Any], scopes: TaskScopes) -> Verdi
         return Verdict.ALLOW_LOGGED
     if name == "run_tests":
         # Same policy as run_command on the equivalent pytest invocation.
-        paths = " ".join(shlex.quote(str(p)) for p in (args.get("paths") or []))
-        cmd = "pytest " + paths
-        keyword = str(args.get("keyword") or "")
-        if keyword:
-            cmd += " -k " + shlex.quote(keyword)
-        return check_tool_call("run_command", {"cmd": cmd}, scopes)
+        return check_tool_call("run_command", {"cmd": _run_tests_command(args)}, scopes)
     return Verdict.ALLOW
+
+
+def _run_tests_command(args: dict[str, Any]) -> str:
+    """The run_command-equivalent pytest invocation (gate + denylist input)."""
+    paths = " ".join(shlex.quote(str(p)) for p in (args.get("paths") or []))
+    cmd = "pytest " + paths
+    keyword = str(args.get("keyword") or "")
+    if keyword:
+        cmd += " -k " + shlex.quote(keyword)
+    return cmd
 
 
 def _summarize_junit(xml_text: str) -> str | None:
@@ -679,15 +689,11 @@ class ToolRegistry:
         if not ok:
             return False, ""
         committable = [
-            line
-            for line in out.splitlines()
-            if line.strip() and line[:2] not in _UNMERGED_XY_CODES
+            line for line in out.splitlines() if line.strip() and line[:2] not in _UNMERGED_XY_CODES
         ]
         return bool(committable), out
 
-    async def _exec(
-        self, cmd: list[str], *, timeout_s: float = 120.0
-    ) -> tuple[bool, str]:
+    async def _exec(self, cmd: list[str], *, timeout_s: float = 120.0) -> tuple[bool, str]:
         result = await self.sandbox.exec(self.container, cmd, timeout_s=timeout_s)
         if result.timed_out:
             return False, "error: timed out"
@@ -748,9 +754,7 @@ class ToolRegistry:
         path = str(args["path"])
         if path.endswith(".py"):
             return await self._exec(["python3", "-c", _AST_OUTLINE_SNIPPET, path])
-        return await self._exec(
-            ["grep", "-nE", r"^\s*(def|class|function)\b", path]
-        )
+        return await self._exec(["grep", "-nE", r"^\s*(def|class|function)\b", path])
 
     async def _run_command(self, args: dict[str, Any]) -> tuple[bool, str]:
         cmd = str(args["cmd"])
@@ -814,6 +818,7 @@ class ToolRegistry:
         keyword = str(args.get("keyword") or "")
         if keyword:
             cmd.extend(["-k", keyword])
+        screen_command(_run_tests_command(args))  # same denylist as run_command
         ok, raw = await self._exec(cmd, timeout_s=timeout)
         # The JUnit report lives inside the container; fetch it, then parse.
         xml_ok, xml_text = await self._exec(["cat", _RUN_TESTS_JUNIT])
