@@ -99,7 +99,7 @@ async def submit_clarification(
 ) -> HTMLResponse | RedirectResponse:
     app = request.app
     run = await require_run(db, rid)
-    base = await run_context(db, rid, redactor=app.state.redactor)
+    base = await run_context(db, rid, redactor_=app.state.redactor)
     session = await _latest_open_session(db, rid)
     if run.status != RunStatus.CLARIFYING or session is None:
         return render(
