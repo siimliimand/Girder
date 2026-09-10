@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 12 (WP 12.1, WP 12.2, WP 12.6) |
-| **Status** | Not started |
+| **Status** | Merged (wave 1, 2026-09-10) |
 | **Wave** | **1** — can run in parallel with WS-01, WS-03, WS-04, WS-05, WS-07A, WS-09 |
 | **Effort** | ~4–5 days · ~5 new tests |
 | **Owned files** | `src/girder/api/static/style.css`, `src/girder/api/static/diff.js` (new), `src/girder/api/templates/` (`base.html`, `run.html`, `postmortem.html`) |

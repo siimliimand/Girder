@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 8 · WP 8.4 |
-| **Status** | Not started |
+| **Status** | Merged (wave 1, 2026-09-10; repo/ + task_engine split ports at integration) |
 | **Wave** | **1** — can run in parallel with WS-01, WS-04, WS-05, WS-07A, WS-08, WS-09 |
 | **Effort** | ~4–5 days · ~8 new tests |
 | **Owned files** | `src/girder/index/` (new module), `migrations/014_codebase_index.sql` (new) |

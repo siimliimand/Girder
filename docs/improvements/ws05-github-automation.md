@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 9 (WP 9.1 – WP 9.4) |
-| **Status** | Not started |
+| **Status** | Merged (wave 1, 2026-09-10; webhook endpoints live in `api/routes/webhooks.py` post-split; delivery.py `pr_body` call-site enrichment still open) |
 | **Wave** | **1** — can run in parallel with WS-01, WS-03, WS-04, WS-07A, WS-08, WS-09 |
 | **Effort** | ~2 weeks · ~15 new tests |
 | **Owned files** | `src/girder/github/webhook.py` (new), `src/girder/notify/slack.py` (new), `src/girder/github/client.py` (PR body), `.github/workflows/ci.yml` (parity schedule) |

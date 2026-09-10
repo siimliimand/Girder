@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 11 (WP 11.1 – WP 11.4) |
-| **Status** | Not started |
+| **Status** | Part A — a parallel implementation landed on main directly (Python plugin + verify/outline routing); the fuller variant from this wave (Node/Go plugins, Dockerfiles, TS e2e fixture) is preserved on `wave1/ws07a-multi-stack` for follow-up. Part B — adopted via the same parallel work (outline routed through the stack plugin). |
 | **Wave** | **Part A (WP 11.1–11.3): wave 1.** **Part B (WP 11.4): wave 2, after WS-01 merges.** |
 | **Effort** | ~3 weeks total · ~25 new tests |
 | **Owned files (A)** | `src/girder/stacks/` (new), `container/Dockerfile.node-20` (new), `container/Dockerfile.go-1.23` (new), `tests/fixtures/e2e-target-ts/` (new) |

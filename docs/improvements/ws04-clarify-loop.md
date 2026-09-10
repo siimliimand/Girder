@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 8 · WP 8.5 |
-| **Status** | Not started |
+| **Status** | Merged (wave 1, 2026-09-10; clarify endpoints live in `api/routes/clarify.py` post-split) |
 | **Wave** | **1** — can run in parallel with WS-01, WS-03, WS-05, WS-07A, WS-08, WS-09 |
 | **Effort** | ~4–5 days · ~10 new tests |
 | **Owned files** | `src/girder/specs/generator.py` (clarification param), `src/girder/api/templates/clarify.html` (new), `migrations/015_clarification_sessions.sql` (new) |
