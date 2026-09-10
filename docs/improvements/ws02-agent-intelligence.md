@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 8 (WP 8.1 – WP 8.3) |
-| **Status** | Not started |
+| **Status** | Merged to main (c941db4) — pending dogfood validation of success rate / turns-per-success (operator task) |
 | **Wave** | **2** — starts after **WS-01 merges** (needs the WS-01 tool surface for planning-phase tool lists and scratchpad hooks) |
 | **Effort** | ~2 weeks · ~30 new tests |
 | **Owned files** | `src/girder/agent/prompts.py`, `src/girder/agent/runtime.py`, `src/girder/agent/context.py`, `src/girder/orchestrator/task_engine.py`, `src/girder/config.py` |
