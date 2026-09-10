@@ -79,6 +79,11 @@ async def _seed_old_run(db, run_id: str, status: str, days_old: int) -> None:  #
         " VALUES ('telegram', 'payload', 'sent', datetime('now'), ?)",
         (run.id,),
     )
+    await db.execute(
+        "INSERT INTO clarification_sessions (id, run_id, questions_json, answers_json,"
+        " created_at) VALUES (?, ?, '[]', NULL, datetime('now'))",
+        (f"clar-{run_id}", run.id),
+    )
     return run.id
 
 
@@ -110,6 +115,7 @@ async def test_prune_dry_run_deletes_nothing_and_reports_accurately(db) -> None:
         "integrity_violations": 1,
         "steering_events": 1,
         "notifications_log": 1,
+        "clarification_sessions": 1,
     }
     # nothing actually removed
     assert await _child_row_counts(db, "runs") == 1
@@ -148,6 +154,7 @@ async def test_prune_cascade_removes_all_child_rows(db) -> None:  # type: ignore
         "steering_events",
         "integrity_violations",
         "notifications_log",
+        "clarification_sessions",
     ):
         assert await _child_row_counts(db, table) == 1, table
 

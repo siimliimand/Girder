@@ -519,6 +519,7 @@ _PRUNE_TABLES: list[tuple[str, str]] = [
     ("integrity_violations", f"run_id IN ({_RUN_SCOPE})"),
     ("steering_events", f"run_id IN ({_RUN_SCOPE})"),
     ("notifications_log", f"run_id IN ({_RUN_SCOPE})"),
+    ("clarification_sessions", f"run_id IN ({_RUN_SCOPE})"),
 ]
 
 
