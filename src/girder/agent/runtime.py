@@ -280,6 +280,35 @@ class AgentRuntime:
                         turns_used,
                     )
                 if name == "mark_task_complete":
+                    # Terminal gate: a dirty worktree at "complete" is exactly
+                    # how verify kills the attempt (uncommitted-leftovers
+                    # audit) — bounce instead, the model can still commit
+                    # within this attempt. Probe failure fails open; verify
+                    # remains the backstop. (Dogfood fdee1ec1: 3/3 attempts
+                    # lost to a skipped commit step.)
+                    dirty, status_out = await self._registry.worktree_dirty_with_output()
+                    if dirty:
+                        await repo.insert_event(
+                            self.db,
+                            "terminal_bounced",
+                            {"tool": name, "status_out": status_out[-500:]},
+                            run_id=self.run_id,
+                            attempt_id=self.attempt.id,
+                        )
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "ATTEMPT NOT ACCEPTED — the worktree has uncommitted"
+                                    " changes. Run `git add -A && git commit -m"
+                                    " \"<short message>\"` to commit your work, then call"
+                                    " mark_task_complete again. (no_changes=true is only"
+                                    " valid on a clean tree.)"
+                                ),
+                            )
+                        )
+                        messages = self._maybe_compact(messages)
+                        continue
                     return await self._finish(
                         "succeeded",
                         str(args.get("summary", "")),

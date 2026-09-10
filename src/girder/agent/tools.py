@@ -54,6 +54,11 @@ _AST_OUTLINE_SNIPPET = (
 _PATCH_PREFIX = "/tmp/.girder-patch"
 _MATCH_CAP = 200  # rg / grep match cap before truncation
 
+# git-status --porcelain XY codes whose working tree is UNMERGED (conflict):
+# completing on top of these is judged downstream, never bounced (see
+# worktree_dirty_with_output).
+_UNMERGED_XY_CODES = {"UU", "AA", "DD", "AU", "UA", "DU", "UD"}
+
 # run_command denylist — word-boundary tokens plus explicit network verbs.
 _DENY_TOKENS = re.compile(r"\b(curl|wget|nc|ncat|netcat|ssh|scp|sftp|sudo|podman|docker|mount)\b")
 _TEST_SIGNAL = re.compile(r"(tests?/|test_|_test|conftest|pytest)", re.IGNORECASE)
@@ -174,8 +179,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "mark_task_complete",
             "description": (
-                "The ONLY way to finish your attempt. If the turn budget runs"
-                " out before you call this, the attempt is destroyed and all"
+                "The ONLY way to finish your attempt. The worktree must be"
+                " CLEAN first: commit with `git add -A && git commit -m"
+                " \"<message>\"` BEFORE calling this — a dirty tree bounces"
+                " the call and wastes a turn. If the turn budget runs out"
+                " before you call this, the attempt is destroyed and all"
                 " uncommitted work is lost. Provide a short summary of what"
                 " changed; set no_changes=true only when you genuinely made"
                 " no changes and none were needed."
@@ -374,6 +382,30 @@ class ToolRegistry:
         if name == "run_command":
             return await self._run_command(args)
         return False, f"error: unknown tool {name!r}"
+
+    async def worktree_dirty_with_output(self) -> tuple[bool, str]:
+        """``(bounce-worthy dirt, porcelain output)`` for the terminal-tool gate.
+
+        Best-effort: a failed probe yields ``(False, "")`` so the caller fails
+        open — the verify leftover audit remains the backstop. Unmerged
+        entries (``UU``/``AA``/…, e.g. the conflict resolver's pre-staged
+        ``merge --no-commit`` worktree) are NOT bounce-worthy: completing on
+        top of a conflict is a legitimate failure declaration the conflict
+        machinery judges — telling the model to "commit" would stage conflict
+        markers.
+        """
+        try:
+            ok, out = await self._exec(["git", "status", "--porcelain"])
+        except Exception:
+            return False, ""
+        if not ok:
+            return False, ""
+        committable = [
+            line
+            for line in out.splitlines()
+            if line.strip() and line[:2] not in _UNMERGED_XY_CODES
+        ]
+        return bool(committable), out
 
     async def _exec(
         self, cmd: list[str], *, timeout_s: float = 120.0

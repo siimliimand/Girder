@@ -163,7 +163,9 @@ async def test_scope_violation_holds_but_attempt_continues(
     sandbox = FakeSandbox()
     outcome = await _runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
     assert outcome.status == "succeeded"  # the held call did not abort the attempt
-    assert sandbox.execs == []  # the violating write never reached the sandbox
+    # the violating write never reached the sandbox (only the terminal gate's
+    # read-only dirty probe may run)
+    assert all(cmd[:2] == ["git", "status"] for _, cmd, _ in sandbox.execs)
     rows = await repo.list_tool_calls_for_attempt(db, attempt.id)
     bad = next(r for r in rows if r["tool_name"] == "write_file")
     assert bad["scope_violation"] and bad["held"]
@@ -426,3 +428,58 @@ async def test_tool_overshoot_ends_attempt_as_timeout(
     # the cancelled call never reached persistence (no post-hoc row)
     rows = await repo.list_tool_calls_for_attempt(db, attempt.id)
     assert rows == []
+
+
+async def test_dirty_worktree_bounces_terminal_until_clean(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """mark_task_complete on a dirty tree is bounced with a commit reminder
+    (verify's leftover audit would kill the attempt otherwise); after the
+    commit, completion is accepted. Dogfood fdee1ec1: 3/3 attempts lost to a
+    skipped commit step."""
+    db, run_id, _attempt, _ = seeded
+    sandbox = FakeSandbox(
+        results=[
+            ExecResult(0, " M README.md\n", ""),  # probe: dirty
+            ExecResult(0, "", ""),                # git add -A && git commit
+            ExecResult(0, "", ""),                # probe: clean
+        ]
+    )
+    gateway = FakeGateway(
+        responses=[
+            _resp(calls=[_tc("1", "mark_task_complete", '{"summary":"done"}')]),
+            _resp(
+                calls=[_tc("2", "run_command", '{"cmd":"git add -A && git commit -m work"}')]
+            ),
+            _resp(calls=[_tc("3", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
+
+    outcome = await _runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
+
+    assert outcome.status == "succeeded"
+    assert outcome.turns_used == 3
+    # the bounce reached the model before the commit turn
+    second_turn_messages = gateway.calls[1][1]
+    assert any("ATTEMPT NOT ACCEPTED" in m.content for m in second_turn_messages)
+    # and the bounce is observable in the audit trail
+    events = await db.fetchall(
+        "SELECT event_type FROM agent_events WHERE run_id = ?", (run_id,)
+    )
+    assert any(e["event_type"] == "terminal_bounced" for e in events)
+
+
+async def test_dirty_probe_failure_fails_open(
+    seeded: tuple[Database, str, Attempt, Task],
+) -> None:
+    """A failed probe (not a dirty tree) accepts completion — verify's
+    leftover audit stays the backstop; a flaky probe must not wedge attempts."""
+    _db, _run_id, _attempt, _ = seeded
+    sandbox = FakeSandbox(results=[ExecResult(1, "", "fatal: not a git repository")])
+    gateway = FakeGateway(
+        responses=[_resp(calls=[_tc("1", "mark_task_complete", '{"summary":"x"}')])]
+    )
+
+    outcome = await _runtime(seeded, gateway, sandbox).execute_attempt(spec_slice="s")
+
+    assert outcome.status == "succeeded"

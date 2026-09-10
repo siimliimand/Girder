@@ -583,40 +583,45 @@ async def test_budget_exhaustion_stops_before_any_dispatch(harness: Harness) -> 
     assert run_row is not None and run_row.status is RunStatus.BUDGET_EXHAUSTED
 
 
-async def test_uncommitted_attempt_retries_with_commit_guidance(harness: Harness) -> None:
-    """§5.2: forgetting to commit is an ordinary attempt failure, retried with
-    commit guidance — never an integrity violation."""
+async def test_uncommitted_complete_bounces_then_attempt_completes(harness: Harness) -> None:
+    """§5.2: forgetting to commit is never an integrity violation — the
+    terminal gate bounces the completion with commit guidance IN the same
+    attempt, and the attempt completes once committed (was: attempt death +
+    retry; dogfood runs lost 3/3 attempts to this)."""
     h = harness
     h.settings.sandbox.python_bin = "py3-custom"
     task = await _seed_task(h)
-    no_commit_responses = [
-        _resp(
-            calls=[
-                _tc(
-                    "1",
-                    "write_file",
-                    '{"path":"src/app.py","content":"def greet():\\n    return 1\\n"}',
-                )
-            ]
-        ),
-        _resp(calls=[_tc("3", "mark_task_complete", '{"summary":"done"}')]),
-    ]
-    gateway = FakeGateway(responses=[*no_commit_responses, *write_commit_complete()])
+    gateway = FakeGateway(
+        responses=[
+            _resp(
+                calls=[
+                    _tc(
+                        "1",
+                        "write_file",
+                        '{"path":"src/app.py","content":"def greet():\\n    return 1\\n"}',
+                    )
+                ]
+            ),
+            _resp(calls=[_tc("2", "mark_task_complete", '{"summary":"done"}')]),
+            _resp(calls=[_tc("3", "run_command", '{"cmd":"git add -A && git commit -m work"}')]),
+            _resp(calls=[_tc("4", "mark_task_complete", '{"summary":"done"}')]),
+        ]
+    )
     outcome = await h.engine(gateway).execute_task(h.run, task)
     assert outcome.kind == "completed"
 
     attempts = await _attempt_rows(h.db, task.id)
-    assert len(attempts) == 2
-    assert attempts[0]["status"] == AttemptStatus.FAILED.value
-    assert attempts[1]["status"] == AttemptStatus.SUCCEEDED.value
+    assert len(attempts) == 1  # no attempt burned
+    assert attempts[0]["status"] == AttemptStatus.SUCCEEDED.value
+    assert attempts[0]["turns_used"] == 4
 
-    # attempt 2's prompt carried the commit guidance
-    second_user = next(
-        m for m in gateway.calls[2] if getattr(m, "role", "") == "user"  # attempt 1 = 2 msgs
+    # the bounce reached the model as a user message carrying commit guidance
+    bounced = next(
+        m
+        for m in gateway.calls[2]
+        if getattr(m, "role", "") == "user" and "ATTEMPT NOT ACCEPTED" in m.content
     )
-    assert "git add -A && git commit" in second_user.content
-    # Group G: the retry close path persisted the agent's turn count
-    assert attempts[0]["turns_used"] == 2
+    assert "git add -A && git commit" in bounced.content
 
     # NOT an integrity violation: no rows, counter untouched
     viols = await h.db.fetchall("SELECT * FROM integrity_violations")
@@ -1056,16 +1061,22 @@ async def test_turn_cap_clean_worktree_gets_no_salvage(harness: Harness) -> None
 
 async def test_integrity_violation_dirty_worktree_still_force_pruned(harness: Harness) -> None:
     """Group B regression guard: integrity violations keep today's semantics —
-    dirty worktree is force-pruned, NO salvage commit is created."""
+    dirty worktree is force-pruned, NO salvage commit is created. The violation
+    and the terminal call share a turn, so the same-turn integrity check fires
+    BEFORE the dirty-tree bounce could help."""
     h = harness
     task = await _seed_task(h)  # scope src/** only → tests/ write is held
     gateway = FakeGateway(
         responses=[
-            # held (never executed) out-of-scope write → taints the attempt
-            _resp(calls=[_tc("1", "write_file", '{"path":"tests/evil.py","content":"x=1\\n"}')]),
-            # executed in-scope write left UNCOMMITTED when the attempt dies
-            _resp(calls=[_tc("2", "write_file", '{"path":"src/app.py","content":"y=2\\n"}')]),
-            _resp(calls=[_tc("3", "mark_task_complete", '{"summary":"done"}')]),
+            _resp(
+                calls=[
+                    # held (never executed) out-of-scope write → taints the turn
+                    _tc("1", "write_file", '{"path":"tests/evil.py","content":"x=1\\n"}'),
+                    # executed in-scope write left UNCOMMITTED when the attempt dies
+                    _tc("2", "write_file", '{"path":"src/app.py","content":"y=2\\n"}'),
+                    _tc("3", "mark_task_complete", '{"summary":"done"}'),
+                ]
+            ),
         ]
     )
     outcome = await h.engine(gateway).execute_task(h.run, task)
