@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 9 (WP 9.1 – WP 9.4) |
-| **Status** | Merged (wave 1, 2026-09-10; webhook endpoints live in `api/routes/webhooks.py` post-split; delivery.py `pr_body` call-site enrichment still open) |
+| **Status** | Merged (wave 1, 2026-09-10; webhook endpoints live in `api/routes/webhooks.py` post-split). WP 9.3 completed: `enter_delivery` now passes `run_id`/`tasks`/`total_attempts`, so real PRs render the PR template (003b9e3); legacy plain-text path retained for `run_id=None` callers. SC-19 covered by `tests/integration/test_webhook_sc19.py` (offline variant — assignment → run through the real HTTP route; the live-GitHub PR leg is exercised by the delivery-pump template tests). |
 | **Wave** | **1** — can run in parallel with WS-01, WS-03, WS-04, WS-07A, WS-08, WS-09 |
 | **Effort** | ~2 weeks · ~15 new tests |
 | **Owned files** | `src/girder/github/webhook.py` (new), `src/girder/notify/slack.py` (new), `src/girder/github/client.py` (PR body), `.github/workflows/ci.yml` (parity schedule) |
