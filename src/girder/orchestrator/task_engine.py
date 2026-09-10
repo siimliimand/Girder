@@ -63,7 +63,6 @@ from girder.orchestrator.verification import (
 )
 from girder.orchestrator.work_salvage import (
     salvage_dirty_worktree,
-    salvage_guidance,
     salvage_worktree,
 )
 from girder.sandbox.engine import ContainerSpec, SandboxEngine
@@ -113,17 +112,25 @@ def _build_retry_brief(
     turns_used: int,
     turn_budget: int,
     salvage: tuple[str, list[str]] | None,
+    failing_tests: tuple[str, ...] = (),
 ) -> str:
     """WP 8.3: a structured, trusted retry brief for attempt N+1.
 
     Surfaces what the orchestrator already knows about the dead attempt —
-    failure reason, turns spent, what was salvaged (Group B), scope
-    violations — instead of the old one-liner. The salvage machinery itself
-    lives in ``work_salvage``; this only *reports* it.
+    failure reason, turns spent, failing tests, what was salvaged (Group B),
+    scope violations — instead of the old one-liner. The salvage machinery
+    itself lives in ``work_salvage``; this only *reports* it. The brief OWNS
+    the salvage wording on both retry paths (B2/R4): callers must not append
+    a separate ``salvage_guidance`` sentence on top of it.
     """
     lines = [f"[TRUSTED] Retry brief (attempt {prev_attempt.attempt_num} failed):"]
     lines.append(f"- Failure reason: {prev_failure_reason or 'turn budget exhausted'}")
     lines.append(f"- Turns used: {turns_used} of {turn_budget}")
+    if failing_tests:
+        shown = ", ".join(failing_tests[:5])
+        if len(failing_tests) > 5:
+            shown += f" (and {len(failing_tests) - 5} more)"
+        lines.append(f"- Failing tests: {shown}")
     if salvage is not None:
         sha, files = salvage
         lines.append(f"- Files with changes: {', '.join(files) or 'none'}")
@@ -358,15 +365,21 @@ class TaskEngine:
                 if step is None:  # pragma: no cover - defensive
                     raise RuntimeError("succeeded outcome without a verify step")
                 if step.kind == "retry":
-                    guidance = f"Previous attempt failed verification: {step.detail}"
-                    retry_brief = guidance
-                    if step.salvage is not None:
-                        guidance = salvage_guidance(
-                            attempt.attempt_num,
-                            "failed verification with uncommitted work",
-                            step.salvage,
-                            guidance,
-                        )
+                    # WP 8.3 (B2): the verify-fail retry gets the same
+                    # structured brief as the turn-cap path — failure detail,
+                    # failing tests, salvage reference, violations — not the
+                    # thin one-liner. The brief owns the salvage wording on
+                    # BOTH paths; no separate salvage_guidance append (R4).
+                    retry_brief = _build_retry_brief(
+                        prev_attempt=attempt,
+                        prev_failure_reason=step.detail,
+                        prev_violations=await _violations_for_attempt(self.db, attempt.id),
+                        turns_used=outcome.turns_used,
+                        turn_budget=self.settings.limits.attempt_max_turns,
+                        salvage=step.salvage,
+                        failing_tests=step.failing_tests,
+                    )
+                    guidance = retry_brief
                     continue
                 return TaskOutcome(step.kind, step.detail, no_changes=step.no_changes)
 
@@ -398,10 +411,3 @@ class TaskEngine:
                 salvage=salvage,
             )
             guidance = f"{guidance}\n\n{retry_brief}"
-            if salvage is not None:
-                guidance = salvage_guidance(
-                    attempt.attempt_num,
-                    "ran out of turns after writing work",
-                    salvage,
-                    guidance,
-                )
