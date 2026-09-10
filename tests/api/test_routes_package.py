@@ -52,6 +52,9 @@ PRE_SPLIT_ROUTES: set[tuple[tuple[str, ...], str]] = {
     (("POST",), "/api/runs/{rid}/steer"),
     # Post-split additions (registered in app.py, not routes/):
     (("GET",), "/metrics"),  # WP 12.3 — operational side-channel (WS-09)
+    # Post-split additions (own package module, api/routes/webhooks.py):
+    (("POST",), "/api/webhooks/github"),  # WP 9.1 — HMAC-authenticated (WS-05)
+    (("POST",), "/api/webhooks/slack"),  # WP 9.2 — HMAC-authenticated (WS-05)
 }
 
 
