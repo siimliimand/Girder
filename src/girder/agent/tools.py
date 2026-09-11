@@ -215,10 +215,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "view_symbol_outline",
             "description": (
-                "List classes/functions with line numbers for a source file."
-                " Routing is per-stack via the project's stack plugin —"
-                " full support for Python (precise AST outlines); other"
-                " languages fall back to a line-based declaration grep."
+                "List classes/functions with line numbers for a source"
+                " file, using the project stack's native toolchain for"
+                " its own source files; other file types fall back to a"
+                " regex outline."
             ),
             "parameters": {
                 "type": "object",
@@ -520,7 +520,7 @@ def _summarize_junit(xml_text: str) -> str | None:
         PASSED: 42  FAILED: 2  ERROR: 0  [SKIPPED: 1]
 
         FAILURES:
-          tests/test_api.py::test_rate_limit
+          tests/test_api.py::test_rate_limit — AssertionError: expected 429, got 200
     """
     # Deferred import: girder.orchestrator.__init__ pulls in conflict.py ->
     # agent.runtime, which would make agent.tools -> orchestrator a cycle.
@@ -537,7 +537,9 @@ def _summarize_junit(xml_text: str) -> str | None:
     for r in results.values():
         counts[r.status] = counts.get(r.status, 0) + 1
         if r.status in ("failed", "error"):
-            failures.append(r.test_id)
+            failures.append(
+                f"{r.test_id} — {r.message}" if r.message else r.test_id
+            )
     head = (
         f"PASSED: {counts.get('passed', 0)}  "
         f"FAILED: {counts.get('failed', 0)}  "
@@ -549,7 +551,7 @@ def _summarize_junit(xml_text: str) -> str | None:
     if failures:
         lines.append("")
         lines.append("FAILURES:")
-        lines.extend(f"  {test_id}" for test_id in failures)
+        lines.extend(f"  {entry}" for entry in failures)
     return "\n".join(lines)
 
 
@@ -793,7 +795,7 @@ class ToolRegistry:
 
     async def _symbol_outline(self, args: dict[str, Any]) -> tuple[bool, str]:
         path = str(args["path"])
-        if path.endswith(".py"):
+        if path.lower().endswith(self.stack.symbol_outline_extensions()):
             return await self._exec(self.stack.symbol_outline_command(path))
         return await self._exec(
             ["grep", "-nE", r"^\s*(def|class|function|func|pub fn)\b", path]

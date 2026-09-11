@@ -67,6 +67,9 @@ class NodePlugin(StackPlugin):
     def symbol_outline_command(self, path: str) -> list[str]:
         return ["node", "-e", _TS_OUTLINE_SNIPPET, path]
 
+    def symbol_outline_extensions(self) -> tuple[str, ...]:
+        return (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
     def test_signal_patterns(self) -> list[str]:
         return list(TEST_SIGNAL_PATTERNS)
 

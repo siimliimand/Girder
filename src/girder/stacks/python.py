@@ -33,6 +33,9 @@ class PythonPlugin(StackPlugin):
     def symbol_outline_command(self, path: str) -> list[str]:
         return ["python3", "-c", _AST_OUTLINE_SNIPPET, path]
 
+    def symbol_outline_extensions(self) -> tuple[str, ...]:
+        return (".py",)
+
     def test_signal_patterns(self) -> list[str]:
         return [
             "tests/**",

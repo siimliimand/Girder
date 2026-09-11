@@ -44,6 +44,10 @@ class StackPlugin(ABC):
         """In-container command to list symbols in a source file."""
 
     @abstractmethod
+    def symbol_outline_extensions(self) -> tuple[str, ...]:
+        """Lowercase, dot-prefixed path suffixes this stack's outline command handles."""
+
+    @abstractmethod
     def test_signal_patterns(self) -> list[str]:
         """Glob patterns for test files (Layer-2 hash manifest)."""
 

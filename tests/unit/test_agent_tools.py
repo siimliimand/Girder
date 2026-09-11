@@ -25,7 +25,7 @@ from girder.db.models import Task, TaskStatus, TaskType
 from girder.guard.redact import Redactor
 from girder.guard.scope import TaskScopes
 from girder.sandbox.engine import ContainerSpec, ExecResult, SandboxEngine
-from girder.stacks import STACK_REGISTRY
+from girder.stacks import STACK_REGISTRY, StackPlugin
 
 
 class FakeSandbox(SandboxEngine):
@@ -89,6 +89,7 @@ def _registry(
     run_id: str,
     attempt_id: str,
     scratchpad: Scratchpad | None = None,
+    stack: StackPlugin | None = None,
 ) -> ToolRegistry:
     return ToolRegistry(
         sandbox=sandbox,
@@ -100,7 +101,7 @@ def _registry(
         attempt_id=attempt_id,
         run_id=run_id,
         task=TASK,
-        stack=STACK_REGISTRY["python-3.12"],
+        stack=stack or STACK_REGISTRY["python-3.12"],
         scratchpad=scratchpad,
     )
 
@@ -401,7 +402,7 @@ async def test_symbol_outline_dispatches_stack_plugin_argv(
 async def test_symbol_outline_non_python_fallback_pattern(
     seeded: tuple[Database, str, str],
 ) -> None:
-    """WS-07B: non-.py paths use the spec's grep fallback (Go/Rust included)."""
+    """WS-07B: extensions outside the stack's set use the spec's grep fallback."""
     db, run_id, attempt_id = seeded
     sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
     await _registry(sandbox, db, run_id, attempt_id).execute(
@@ -411,6 +412,38 @@ async def test_symbol_outline_non_python_fallback_pattern(
         (
             "ctr",
             ["grep", "-nE", r"^\s*(def|class|function|func|pub fn)\b", "src/a.go"],
+            120.0,
+        )
+    ]
+
+
+async def test_symbol_outline_routes_ts_through_node_stack(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """WS-07B WP 11.4: a .ts path under a node stack dispatches the node outline."""
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "1: function: foo\n", "")])
+    result = await _registry(
+        sandbox, db, run_id, attempt_id, stack=STACK_REGISTRY["node-20"]
+    ).execute("view_symbol_outline", {"path": "src/a.ts"})
+    assert result.ok
+    expected = STACK_REGISTRY["node-20"].symbol_outline_command("src/a.ts")
+    assert sandbox.execs == [("ctr", expected, 120.0)]
+
+
+async def test_symbol_outline_unknown_extension_greps_under_node_stack(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """WS-07B WP 11.4: .txt is outside every stack's extensions -> grep."""
+    db, run_id, attempt_id = seeded
+    sandbox = FakeSandbox(results=[ExecResult(0, "", "")])
+    await _registry(
+        sandbox, db, run_id, attempt_id, stack=STACK_REGISTRY["node-20"]
+    ).execute("view_symbol_outline", {"path": "notes.txt"})
+    assert sandbox.execs == [
+        (
+            "ctr",
+            ["grep", "-nE", r"^\s*(def|class|function|func|pub fn)\b", "notes.txt"],
             120.0,
         )
     ]
@@ -506,7 +539,7 @@ def test_tool_description_audit_wp76() -> None:
     by_name = {t["function"]["name"]: t["function"]["description"] for t in TOOL_SCHEMAS}
     assert "fd" not in by_name["find_files"]  # no availability detail
     assert "rg if available" not in by_name["ripgrep"]
-    assert "python" in by_name["view_symbol_outline"].lower()
+    assert "native toolchain" in by_name["view_symbol_outline"].lower()
     assert "fall back" in by_name["view_symbol_outline"].lower()
     for denied in ("curl", "wget", "nc", "ssh", "git push", "sudo", "podman", "docker", "mount"):
         assert denied in by_name["run_command"]
@@ -740,8 +773,32 @@ def test_summarize_junit_counts_and_failure_list() -> None:
     first = summary.splitlines()[0]
     assert first == "PASSED: 1  FAILED: 1  ERROR: 1  SKIPPED: 1"
     assert "FAILURES:" in summary
-    assert "  tests/test_api.py::test_bad" in summary
-    assert "  tests/test_api.py::test_boom" in summary
+    # WP 7.4: failure lines carry the failure message (em-dash + space).
+    assert (
+        "  tests/test_api.py::test_bad — AssertionError" in summary
+    )
+    assert "  tests/test_api.py::test_boom — KeyError" in summary
+    # Passed/skipped tests render no failure line at all.
+    assert "test_ok —" not in summary
+    assert "test_skip" not in summary
+
+
+def test_summarize_junit_message_attr_wins_multiline_body_first_line() -> None:
+    junit = (
+        "<testsuites><testsuite>"
+        '<testcase classname="tests.test_api" name="test_attr" file="tests/test_api.py">'
+        '<failure message="AssertionError: expected 429, got 200">'
+        "E   AssertionError: expected 429, got 200\nE   at api.py:12"
+        "</failure></testcase>"
+        "</testsuite></testsuites>"
+    )
+    summary = _summarize_junit(junit)
+    assert summary is not None
+    assert (
+        "  tests/test_api.py::test_attr — AssertionError: expected 429, got 200"
+        in summary
+    )
+    assert "api.py:12" not in summary  # first line only
 
 
 def test_summarize_junit_unparseable_returns_none() -> None:

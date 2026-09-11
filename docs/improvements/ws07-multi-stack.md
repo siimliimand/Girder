@@ -167,6 +167,7 @@ Schema and call signature of `view_symbol_outline` are unchanged (WS-01 was aske
 
 ## Coordination
 
+- **DONE (2026-09-11): WP 11.4 complete.** Outline routing is now extensions-based: `StackPlugin.symbol_outline_extensions()` declares which path suffixes each stack's outline command handles (python `(".py",)`, node `(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")`, go `(".go",)`); `_symbol_outline` dispatches the stack command for those and the grep fallback only for other/unknown extensions. This supersedes the earlier note that grep was the fallback for **all** non-`.py` files.
 - **task_engine.py `verify_cmd` resolution** is the one orchestrator touch — a small, contained change; WS-03's index hook is elsewhere in the file (wave-1 coexistence is fine, coordinate the rebase).
 - **Part B** must wait for WS-01 (both edit `agent/tools.py`).
 - Dockerfiles and cache-warm script changes should be verified against the sandbox runtime (`podman`) actually used in this environment.
