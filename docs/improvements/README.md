@@ -82,6 +82,7 @@ Rows are shared files; cells name the kind of touch. "owns" = exclusive owner fo
 - `mypy --strict` clean and **full test suite green** before any PR (701-test baseline and growing).
 - New agent tools must pass **scope gating, redaction, and tool-call logging** through the existing pipeline — no exceptions.
 - e2e **SC-01** must keep passing at every wave boundary; it's the cross-workstream regression sentinel.
+- Wave-boundary gates are **venv-independent** (since the sandbox/e2e harness fix): run `PYTHONPATH=<checkout>/src .venv/bin/python -m pytest` from any checkout (worktree-safe). The full suite must show **0 skipped** unless a genuine toolchain (e.g. node/npm for SC-20) is missing, and any remaining skip reason must be greppable in `-rs` output.
 - New DB work follows the existing migration style (read `001`–`013` first); never edit an applied migration.
 - Commit style: short imperative subject with a component prefix, matching repo history (e.g. `Agent tools: add edit_file with line-range replacement`).
 - Each workstream's PR description links back to its `ws*.md` doc and lists any coordination notes that materialized.

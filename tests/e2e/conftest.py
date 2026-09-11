@@ -2,8 +2,8 @@
 
 Everything here runs the REAL RunEngine/TaskEngine code paths against a real
 temp git repo (the copied ``tests/fixtures/e2e-target`` tree) with
-``LocalExecSandbox`` — baseline AND verify suites are REAL ``python -m pytest``
-runs on the host. The model is a scripted :class:`FakeGateway` (same idiom as
+``LocalExecSandbox`` — baseline AND verify suites are REAL pytest runs on the
+host, executed by the *running* interpreter (``sys.executable -m pytest``). The model is a scripted :class:`FakeGateway` (same idiom as
 ``tests/unit/test_task_engine.py``); SC-07 swaps in a real ``ModelGateway``
 over an ``httpx.MockTransport``. No podman, no network.
 """
@@ -14,6 +14,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,32 +54,54 @@ async def git(cwd: Path, *args: str, check: bool = True) -> str:
 
 
 def _host_pytest_usable() -> bool:
-    """The sandbox execs ``python -m pytest`` from PATH — it must exist."""
-    if shutil.which("python") is None:
-        return False
+    """The sandbox execs ``<python_bin> -m pytest``; python_bin is pinned to
+    the *running* interpreter below, so this can only fail if pytest itself
+    is not importable by the very interpreter running this suite — i.e. a
+    broken install, not a bare host. The skip it guards is a last resort."""
     probe = subprocess.run(
-        ["python", "-m", "pytest", "--version"], capture_output=True, text=True, timeout=60
+        [sys.executable, "-m", "pytest", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     return probe.returncode == 0
 
 
 
 
-class HostSuiteSandbox(LocalExecSandbox):
-    """LocalExecSandbox that also rewrites ``--flag=/workspace/...`` argv.
+def _host_interpreter_argv(cmd: list[str]) -> list[str]:
+    """Map a bare ``python``/``python3`` interpreter argv onto the running one.
 
-    The orchestrator's suite commands pass the junit report as a single
-    ``--junitxml=/workspace/.girder-*.xml`` argv element, which the base
-    rewrite (exact ``/workspace`` prefix) leaves untouched — the nested real
-    pytest would then try to write the host root. This subclass maps the path
-    inside such flags to the worktree, so the REAL pytest suite runs and its
-    report lands in the worktree, exactly as in a container.
+    The container runner image ships its own ``python3``; on a venv-only host
+    there is no global interpreter, so the local sandbox stand-in resolves the
+    bare name to :data:`sys.executable` (the image's interpreter equivalent).
+    Only an exact bare name is translated — paths and other argv are untouched.
+    """
+    if cmd and cmd[0] in ("python", "python3"):
+        return [sys.executable, *cmd[1:]]
+    return cmd
+
+
+class HostSuiteSandbox(LocalExecSandbox):
+    """LocalExecSandbox that also rewrites container-isms in argv.
+
+    Two rewrites, both mirroring what the real runner image provides:
+
+    * ``--flag=/workspace/...`` argv elements: the orchestrator's suite
+      commands pass the junit report as a single such element, which the base
+      rewrite (exact ``/workspace`` prefix) leaves untouched — the nested real
+      pytest would then try to write the host root. The path inside such flags
+      is mapped to the worktree, so the REAL pytest suite runs and its report
+      lands in the worktree, exactly as in a container.
+    * a bare ``python``/``python3`` argv head (e.g. ``write_file``'s
+      ``python3 -c`` decode snippet) is resolved to the running interpreter —
+      the image has one; a venv-only host does not.
     """
 
     async def exec(
         self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
     ) -> ExecResult:
-        rewritten = list(cmd)
+        rewritten = _host_interpreter_argv(cmd)
         for i, arg in enumerate(rewritten):
             if "=/workspace/" in arg:
                 flag, _, path = arg.partition("=")
@@ -257,7 +280,10 @@ def settings() -> Settings:
             attempt_wallclock_s=120,
             planning_turns=0,  # WP 8.1 phase is unit-tested; e2e scripts route on exact flow
         ),
-        sandbox=SandboxNetwork(),
+        # Pin the suite interpreter to the one running this suite: the nested
+        # baseline/verify pytest runs then work on any host regardless of what
+        # `python`/`python3` on PATH point at (venv-only installs).
+        sandbox=SandboxNetwork(python_bin=sys.executable),
     )
 
 
@@ -265,7 +291,10 @@ def settings() -> Settings:
 async def e2e_repo(tmp_path: Path) -> AsyncIterator[Path]:
     """The fixture project copied to tmp and committed on a real main branch."""
     if not _host_pytest_usable():
-        pytest.skip("host `python -m pytest` unavailable")
+        pytest.skip(
+            "host pytest unavailable: sys.executable cannot run `python -m pytest` "
+            "(broken environment — SC-01 sentinel not exercised)"
+        )
     repo_path = tmp_path / "repo"
     shutil.copytree(FIXTURE_SRC, repo_path)
     await git(repo_path, "init", "-b", "main")

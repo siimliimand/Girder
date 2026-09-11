@@ -169,7 +169,7 @@ def _npm_usable() -> bool:
 async def e2e_repo(tmp_path: Path) -> Path:  # shadows the conftest fixture on purpose
     """The TS fixture copied to tmp, node_modules installed, on a real main."""
     if not _npm_usable():
-        pytest.skip("host npm/npx unavailable")
+        pytest.skip("node toolchain not installed (npm/npx) — SC-20 requires it")
     repo_path = tmp_path / "repo"
     shutil.copytree(Path(__file__).parents[1] / "fixtures" / "e2e-target-ts", repo_path)
     install = await asyncio.to_thread(
