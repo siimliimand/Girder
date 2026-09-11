@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import subprocess
+import sys
 
 import pytest
 
@@ -421,7 +422,13 @@ async def test_symbol_outline_non_python_fallback_pattern(
 
 
 class RealSandbox(SandboxEngine):
-    """Executes argv via subprocess in a host tmpdir (no podman)."""
+    """Executes argv via subprocess in a host tmpdir (no podman).
+
+    Host-execution argv translation: the tools under test emit
+    container-conventional bare interpreters (``pytest``, ``python``,
+    ``python3``) that may not exist on the host PATH. Rewrite those to the
+    interpreter running this suite; every other argv is left untouched.
+    """
 
     def __init__(self, cwd: object) -> None:
         self.cwd = str(cwd)
@@ -430,12 +437,23 @@ class RealSandbox(SandboxEngine):
     async def start(self, spec: ContainerSpec) -> str:
         return "ctr"
 
+    @staticmethod
+    def _host_argv(cmd: list[str]) -> list[str]:
+        if not cmd:
+            return cmd
+        head = cmd[0]
+        if head == "pytest":
+            return [sys.executable, "-m", "pytest", *cmd[1:]]
+        if head in ("python", "python3"):
+            return [sys.executable, *cmd[1:]]
+        return cmd
+
     async def exec(
         self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
     ) -> ExecResult:
         self.execs.append((name, cmd, timeout_s))
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *self._host_argv(cmd),
             cwd=self.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
