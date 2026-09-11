@@ -229,6 +229,7 @@ class ConflictResolver:
                     strict_read_scope=self.settings.project.strict_read_scope,
                 ),
                 limits=self.settings.limits,
+                python_bin=self.settings.sandbox.python_bin,
                 redactor=self.redactor,
                 db=self.db,
                 run_id=run.id,

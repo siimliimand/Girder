@@ -152,6 +152,15 @@ def test_python_symbol_outline_command_byte_identical() -> None:
         _AST_OUTLINE_SNIPPET,
         "src/a.py",
     ]
+    # sandbox.python_bin override threads through (tool-exec interpreter).
+    override = STACK_REGISTRY["python-3.12"].symbol_outline_command(
+        "src/a.py", "/opt/py/bin/python3"
+    )
+    assert override[0] == "/opt/py/bin/python3" and override[1:] == [
+        "-c",
+        _AST_OUTLINE_SNIPPET,
+        "src/a.py",
+    ]
 
 
 def test_verify_xml_filename_unchanged() -> None:
@@ -170,6 +179,7 @@ def test_node_command_construction() -> None:
     assert plugin.test_command("python3") == cmd
     outline = plugin.symbol_outline_command("src/calculator.ts")
     assert outline[0] == "node" and "src/calculator.ts" in outline
+    assert plugin.symbol_outline_command("src/calculator.ts", "python3") == outline
 
 
 def test_node_patterns_and_caches() -> None:
@@ -193,6 +203,10 @@ def test_go_command_construction() -> None:
         "-all",
         "pkg/calc/calc.go",
     ]
+    assert (
+        plugin.symbol_outline_command("pkg/calc/calc.go", "python3")
+        == plugin.symbol_outline_command("pkg/calc/calc.go")
+    )  # python_bin ignored
 
 
 def test_go_patterns_and_caches() -> None:

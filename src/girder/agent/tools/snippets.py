@@ -2,7 +2,8 @@
 
 Split out of the former monolithic ``agent/tools.py`` (origin SHA a698868).
 No stdin: every in-container write goes through base64-encoded argv decoded by
-a ``python3 -c`` one-liner — no shell-quoting hazards. These strings are
+a ``-c`` one-liner run under the configured interpreter
+(``sandbox.python_bin``) — no shell-quoting hazards. These strings are
 pinned by unit tests; do not reword.
 """
 

@@ -30,8 +30,8 @@ class PythonPlugin(StackPlugin):
             "no:cacheprovider",
         ]
 
-    def symbol_outline_command(self, path: str) -> list[str]:
-        return ["python3", "-c", _AST_OUTLINE_SNIPPET, path]
+    def symbol_outline_command(self, path: str, python_bin: str | None = None) -> list[str]:
+        return [python_bin or "python3", "-c", _AST_OUTLINE_SNIPPET, path]
 
     def symbol_outline_extensions(self) -> tuple[str, ...]:
         return (".py",)

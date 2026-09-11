@@ -214,6 +214,7 @@ def build_runtime(
             strict_read_scope=engine.settings.project.strict_read_scope,
         ),
         limits=engine.settings.limits,
+        python_bin=engine.settings.sandbox.python_bin,
         redactor=engine.redactor,
         db=engine.db,
         run_id=run.id,

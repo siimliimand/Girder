@@ -90,12 +90,14 @@ def _registry(
     attempt_id: str,
     scratchpad: Scratchpad | None = None,
     stack: StackPlugin | None = None,
+    python_bin: str = "python3",
 ) -> ToolRegistry:
     return ToolRegistry(
         sandbox=sandbox,
         container="ctr",
         scopes=SCOPES,
         limits=LIMITS,
+        python_bin=python_bin,
         redactor=Redactor(),
         db=db,
         attempt_id=attempt_id,
@@ -260,6 +262,7 @@ async def test_output_redacted_and_truncated(seeded: tuple[Database, str, str]) 
         container="ctr",
         scopes=SCOPES,
         limits=limits,
+        python_bin="python3",
         redactor=Redactor(),
         db=db,
         attempt_id=attempt_id,
@@ -447,6 +450,29 @@ async def test_symbol_outline_unknown_extension_greps_under_node_stack(
             120.0,
         )
     ]
+
+
+async def test_python_bin_config_threads_to_snippet_and_outline_execs(
+    seeded: tuple[Database, str, str],
+) -> None:
+    """``sandbox.python_bin`` — not a hardcoded "python3" — runs the snippet
+    execs and the python stack's outline command, so a host (or image) whose
+    interpreter lives elsewhere is a config change, not a code change."""
+    db, run_id, attempt_id = seeded
+    custom = "/opt/py/bin/python3"
+    sandbox = FakeSandbox(results=[ExecResult(0, "sym\n", "") for _ in range(4)])
+    registry = _registry(sandbox, db, run_id, attempt_id, python_bin=custom)
+    await registry.execute("write_file", {"path": "src/new.py", "content": "x = 1\n"})
+    await registry.execute("edit_file", {"path": "src/new.py", "start_line": 1, "end_line": 1})
+    await registry.execute("list_directory", {"path": "src"})
+    await registry.execute("view_symbol_outline", {"path": "src/new.py"})
+    # mkdir (write_file's parent prep) is the only non-interpreter exec.
+    heads = [argv[0] for _ctr, argv, _t in sandbox.execs]
+    assert heads == ["mkdir", custom, custom, custom, custom]
+    # The outline argv is the stack command with the configured interpreter.
+    assert sandbox.execs[4][1] == STACK_REGISTRY["python-3.12"].symbol_outline_command(
+        "src/new.py", custom
+    )
 # ---------------------------------------------------------------------------
 # WP 7.1-7.5: new tools. RealSandbox actually executes argv in a tmpdir so
 # the python3 -c snippets and git plumbing are exercised for real; FakeSandbox
@@ -457,10 +483,11 @@ async def test_symbol_outline_unknown_extension_greps_under_node_stack(
 class RealSandbox(SandboxEngine):
     """Executes argv via subprocess in a host tmpdir (no podman).
 
-    Host-execution argv translation: the tools under test emit
-    container-conventional bare interpreters (``pytest``, ``python``,
-    ``python3``) that may not exist on the host PATH. Rewrite those to the
-    interpreter running this suite; every other argv is left untouched.
+    Host-execution argv translation: snippet execs now carry the configured
+    ``python_bin`` (``_real_registry`` pins it to ``sys.executable``), but
+    ``run_tests`` still emits container-conventional bare ``pytest`` — rewrite
+    that head (and any leftover bare python) to the interpreter running this
+    suite; every other argv is left untouched.
     """
 
     def __init__(self, cwd: object) -> None:
@@ -510,6 +537,9 @@ def _real_registry(
         container="ctr",
         scopes=SCOPES,
         limits=LIMITS,
+        # The snippet execs run on THIS host: config, not a hardcoded
+        # "python3", is what makes them work on a venv-only machine.
+        python_bin=sys.executable,
         redactor=Redactor(),
         db=db,
         attempt_id=attempt_id,

@@ -64,7 +64,8 @@ class NodePlugin(StackPlugin):
         # = /workspace/.girder-verify.xml.
         return ["npx", "jest", "--ci", "--reporters=default", "--reporters=jest-junit"]
 
-    def symbol_outline_command(self, path: str) -> list[str]:
+    def symbol_outline_command(self, path: str, python_bin: str | None = None) -> list[str]:
+        # python_bin is meaningless on this stack — ignored, not errored.
         return ["node", "-e", _TS_OUTLINE_SNIPPET, path]
 
     def symbol_outline_extensions(self) -> tuple[str, ...]:

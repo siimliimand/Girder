@@ -17,6 +17,8 @@ State lives in one SQLite database, default `~/.local/share/girder/girder.db` (t
 
 **The CWD-walk-up gotcha.** `girder.toml` is discovered by walking **up from the current working directory** (`config._find_project_toml`). The girder.toml of the directory you *launch* from governs settings for **all projects in the process** — launch the daemon and the web console from the directory that holds the girder.toml you want (typically the repo root of your deployment config), not from `$HOME` or `/`. In systemd terms: set `WorkingDirectory=` correctly. Environment variables (`GIRDER_*`, `__` nesting, e.g. `GIRDER_BUDGET__RUN_CAP_USD=9.5`) override girder.toml values.
 
+**The interpreter knob: `[sandbox] python_bin`** (default `python3`). This is the interpreter *inside the runner image* — it runs the baseline/verify pytest suites, the rerun probes, and the agent tools' in-container snippet execs (`write_file`/`apply_patch`/`edit_file`/`list_directory`, plus the Python stack's symbol outline). The stock runner images ship `python3` on `PATH`; if your custom image keeps the interpreter elsewhere (e.g. `/opt/py/bin/python3`), set the key rather than patching code. When using `girder daemon --sandbox local` on a host without a global `python3` (venv-only installs), point it at a real interpreter or tool execs will fail with `FileNotFoundError`.
+
 ---
 
 ## 1. Systemd service units

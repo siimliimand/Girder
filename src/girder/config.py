@@ -113,7 +113,9 @@ class SandboxNetwork(BaseModel):
     cpus: float = 2.0
     pids_limit: int = 512
     runtime: str = "podman"  # podman | docker (identical flag surface)
-    # Interpreter used to run project test suites (baseline + verify loop).
+    # Interpreter used to run project test suites (baseline + verify loop) and
+    # the agent tools' in-container snippet execs (write_file/apply_patch/
+    # edit_file/list_directory/view_symbol_outline on the Python stack).
     # "python3" is the portable default; the CI parity image may pin another.
     python_bin: str = "python3"
     # Host package-cache root bound read-only into every attempt container

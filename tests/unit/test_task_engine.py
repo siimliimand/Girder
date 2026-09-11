@@ -8,6 +8,7 @@ rerun) with scripted results — no podman.
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -86,12 +87,16 @@ class ScriptSandbox(LocalExecSandbox):
         self._suite_results = list(suite_results)
         self._suite_xml = suite_xml
         self.suite_cmds: list[list[str]] = []
+        # Configured python_bin values the host cannot resolve (the runner
+        # image would ship them): mapped onto the running interpreter for the
+        # REAL host execs — tool snippets now carry settings.sandbox.python_bin.
+        self.host_missing_interpreters: set[str] = set()
 
     async def exec(
         self, name: str, cmd: list[str], *, timeout_s: float = 120.0, user: str | None = None
     ) -> ExecResult:
         if any(".girder-" in arg and ".xml" in arg for arg in cmd):
-            self.suite_cmds.append(cmd)
+            self.suite_cmds.append(cmd)  # pre-mapping: pins the configured bin threading
             result = self._suite_results.pop(0) if self._suite_results else ExecResult(0, "", "")
             worktree = self.worktree_of(name)
             report = next(
@@ -101,6 +106,8 @@ class ScriptSandbox(LocalExecSandbox):
                 rel = report.removeprefix("/workspace/")
                 (worktree / rel).write_text(self._suite_xml)
             return result
+        if cmd and cmd[0] in self.host_missing_interpreters:
+            cmd = [sys.executable, *cmd[1:]]
         return await super().exec(name, cmd, timeout_s=timeout_s, user=user)
 
 
@@ -669,6 +676,9 @@ async def test_uncommitted_complete_bounces_then_attempt_completes(harness: Harn
     retry; dogfood runs lost 3/3 attempts to this)."""
     h = harness
     h.settings.sandbox.python_bin = "py3-custom"
+    # Tool snippets now exec the configured bin; teach the host sandbox that
+    # this one exists only inside the (simulated) runner image.
+    h.sandbox.host_missing_interpreters.add("py3-custom")
     task = await _seed_task(h)
     gateway = FakeGateway(
         responses=[

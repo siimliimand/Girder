@@ -292,6 +292,7 @@ async def test_inject_absorbed_mid_turn_as_trusted_message(db: Database) -> None
         container="ctr",
         scopes=TaskScopes(write_globs=["src/**"]),
         limits=LimitsConfig(attempt_max_turns=3, planning_turns=0),
+        python_bin="python3",
         redactor=Redactor(),
         db=db,
         run_id=run.id,

@@ -3,8 +3,9 @@
 Two hard constraints shape every implementation:
 
 * **No stdin.** ``SandboxEngine.exec`` takes only argv, so every in-container
-  write goes through ``base64``-encoded argv decoded by a ``python3 -c``
-  one-liner — no shell-quoting hazards, no temp files on the host.
+  write goes through ``base64``-encoded argv decoded by a one-liner run under
+  the configured interpreter (``sandbox.python_bin``, default ``python3``) —
+  no shell-quoting hazards, no temp files on the host.
 * **Nothing raw escapes.** Every output is truncated to the configured line /
   token budget, then redacted via the §8.6 pipeline, then persisted to
   ``tool_calls`` — in that order — before the caller ever sees it.
@@ -141,6 +142,7 @@ class ToolRegistry:
         container: str,
         scopes: TaskScopes,
         limits: LimitsConfig,
+        python_bin: str,
         redactor: Redactor,
         db: Database,
         attempt_id: str,
@@ -153,6 +155,10 @@ class ToolRegistry:
         self.container = container
         self.scopes = scopes
         self.limits = limits
+        # Interpreter for the base64-argv snippet execs (write_file/apply_patch/
+        # edit_file/list_directory) and the stack's python outline command.
+        # Always threaded from settings.sandbox.python_bin — never hardcoded.
+        self.python_bin = python_bin
         self.redactor = redactor
         self.db = db
         self.attempt_id = attempt_id
@@ -323,13 +329,19 @@ class ToolRegistry:
         if not ok1:
             return False, f"error: mkdir failed: {out1}"
         return await self._exec(
-            ["python3", "-c", _B64_DECODE_SNIPPET, path, _b64(str(args.get("content", "")))]
+            [self.python_bin, "-c", _B64_DECODE_SNIPPET, path, _b64(str(args.get("content", "")))]
         )
 
     async def _apply_patch(self, args: dict[str, Any]) -> tuple[bool, str]:
         patch_path = f"{_PATCH_PREFIX}-{self.attempt_id[-8:]}.diff"
         ok1, out1 = await self._exec(
-            ["python3", "-c", _B64_DECODE_SNIPPET, patch_path, _b64(str(args["unified_diff"]))]
+            [
+                self.python_bin,
+                "-c",
+                _B64_DECODE_SNIPPET,
+                patch_path,
+                _b64(str(args["unified_diff"])),
+            ]
         )
         if not ok1:
             return False, f"error: staging patch failed: {out1}"
@@ -356,7 +368,7 @@ class ToolRegistry:
     async def _symbol_outline(self, args: dict[str, Any]) -> tuple[bool, str]:
         path = str(args["path"])
         if path.lower().endswith(self.stack.symbol_outline_extensions()):
-            return await self._exec(self.stack.symbol_outline_command(path))
+            return await self._exec(self.stack.symbol_outline_command(path, self.python_bin))
         return await self._exec(
             ["grep", "-nE", r"^\s*(def|class|function|func|pub fn)\b", path]
         )
@@ -378,7 +390,7 @@ class ToolRegistry:
             return False, f"error: invalid line range: {s}..{e} (1-indexed, end >= start)"
         return await self._exec(
             [
-                "python3",
+                self.python_bin,
                 "-c",
                 _EDIT_SNIPPET,
                 path,
@@ -394,7 +406,7 @@ class ToolRegistry:
             depth = max(1, min(3, int(args.get("depth") or 1)))
         except (TypeError, ValueError) as exc:
             return False, f"error: invalid depth: {exc}"
-        ok, out = await self._exec(["python3", "-c", _DIR_LIST_SNIPPET, root, str(depth)])
+        ok, out = await self._exec([self.python_bin, "-c", _DIR_LIST_SNIPPET, root, str(depth)])
         lines = out.splitlines()
         if len(lines) > _MATCH_CAP:
             dropped = len(lines) - _MATCH_CAP

@@ -40,8 +40,12 @@ class StackPlugin(ABC):
         """
 
     @abstractmethod
-    def symbol_outline_command(self, path: str) -> list[str]:
-        """In-container command to list symbols in a source file."""
+    def symbol_outline_command(self, path: str, python_bin: str | None = None) -> list[str]:
+        """In-container command to list symbols in a source file.
+
+        ``python_bin`` only matters for the Python stack (interpreter
+        override, mirroring :meth:`test_command`); other stacks ignore it.
+        """
 
     @abstractmethod
     def symbol_outline_extensions(self) -> tuple[str, ...]:

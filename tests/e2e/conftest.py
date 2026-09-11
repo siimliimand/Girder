@@ -93,9 +93,11 @@ class HostSuiteSandbox(LocalExecSandbox):
       pytest would then try to write the host root. The path inside such flags
       is mapped to the worktree, so the REAL pytest suite runs and its report
       lands in the worktree, exactly as in a container.
-    * a bare ``python``/``python3`` argv head (e.g. ``write_file``'s
-      ``python3 -c`` decode snippet) is resolved to the running interpreter —
-      the image has one; a venv-only host does not.
+    * a bare ``python``/``python3`` argv head is resolved to the running
+      interpreter. Tool-exec snippets now thread the configured
+      ``sandbox.python_bin`` (pinned to ``sys.executable`` by the settings
+      fixture), so this is a fallback for model-driven ``run_command`` argv
+      and any path that still emits a bare interpreter name.
     """
 
     async def exec(
