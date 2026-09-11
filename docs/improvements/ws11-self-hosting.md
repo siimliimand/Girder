@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Source spec** | `docs/improvements-plan.md` v1.0 · Sprint 13 (WP 13.1, WP 13.4) |
-| **Status** | In progress — WP 13.1 done (docs/deployment.md); WP 13.4 blocked on WS-05 (webhooks) + WS-10 (auth/prune) |
+| **Status** | In progress — WP 13.1 done (docs/deployment.md, restored after being lost in a merge); WP 13.4 still blocked — webhooks + auth/prune are merged, remaining: `girder-ready` label gating, GitHub App creation, the girder-on-girder run itself |
 | **Wave** | **4** — requires **WS-05** (webhooks) deployed and **WS-10** (auth, prune) merged. WP 13.1 (deployment docs) is pure documentation and may be pulled forward to wave 1. |
 | **Effort** | ~1 week · ~5 new tests (mostly ops/config) |
 | **Owned files** | `docs/deployment.md` (new), repo-root `girder.toml` |
