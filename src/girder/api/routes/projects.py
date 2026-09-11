@@ -14,7 +14,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from girder.api.app import dispatch_generation, render
-from girder.api.deps import Db
+from girder.api.deps import Db, SettingsDeps
 from girder.api.routes._shared import (
     require_project,
     review_window_message,
@@ -59,10 +59,12 @@ async def create_project(
 
 
 @router.get("/projects/{pid}", response_class=HTMLResponse)
-async def project_page(request: Request, db: Db, pid: str) -> HTMLResponse:
+async def project_page(
+    request: Request, db: Db, settings: SettingsDeps, pid: str
+) -> HTMLResponse:
     project = await require_project(db, pid)
     runs = await repo.list_runs_for_project(db, pid)
-    review_window = await review_window_state(db, request.app.state.settings, project)
+    review_window = await review_window_state(db, settings, project)
     return render(
         request,
         "project.html",

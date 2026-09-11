@@ -12,7 +12,8 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from girder.api.app import render
-from girder.api.deps import Db
+from girder.api.deps import Db, NotifierDeps
+from girder.notify.notifier import Notifier
 from girder.api.routes._shared import (
     excerpt,
     panel_context,
@@ -29,21 +30,28 @@ router = APIRouter()
 
 @router.post("/api/runs/{rid}/amendments/{aid}/approve", response_model=None)
 async def approve_amendment(
-    request: Request, db: Db, rid: str, aid: str, scope_globs: str = Form("")
+    request: Request, db: Db, notifier: NotifierDeps, rid: str, aid: str, scope_globs: str = Form("")
 ) -> HTMLResponse | RedirectResponse:
     # §8.4: an approval may widen the amended task's write scope. Globs arrive
     # newline/comma-separated; blank input means "no scope change".
     raw = [g.strip() for chunk in scope_globs.splitlines() for g in chunk.split(",")]
     globs = [g for g in raw if g] or None
-    return await _resolve_amendment_route(request, db, rid, aid, "approved", scope_globs=globs)
+    return await _resolve_amendment_route(
+        request, db, rid, aid, "approved", scope_globs=globs, notifier=notifier
+    )
 
 
 @router.post("/api/runs/{rid}/amendments/{aid}/reject", response_model=None)
 async def reject_amendment(
-    request: Request, db: Db, rid: str, aid: str, guidance: str = Form("")
+    request: Request,
+    db: Db,
+    aid: str,
+    notifier: NotifierDeps,
+    rid: str,
+    guidance: str = Form(""),
 ) -> HTMLResponse | RedirectResponse:
     return await _resolve_amendment_route(
-        request, db, rid, aid, "rejected", guidance=guidance.strip() or None
+        request, db, rid, aid, "rejected", guidance=guidance.strip() or None, notifier=notifier
     )
 
 
@@ -63,6 +71,7 @@ async def _resolve_amendment_route(
     *,
     guidance: str | None = None,
     scope_globs: list[str] | None = None,
+    notifier: Notifier | None = None,
 ) -> HTMLResponse | RedirectResponse:
     base = await run_context(db, rid)
     run: Run = base["run"]  # type: ignore[assignment]
@@ -79,7 +88,7 @@ async def _resolve_amendment_route(
             decision=decision,
             guidance=guidance,
             scope_globs=scope_globs,
-            notifier=request.app.state.notifier,
+            notifier=notifier,
         )
     except AmendmentError as exc:
         return render(
