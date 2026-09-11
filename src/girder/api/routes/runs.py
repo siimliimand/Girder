@@ -16,7 +16,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from girder.api.app import render
-from girder.api.deps import Db
+from girder.api.deps import Db, RedactorDeps
 from girder.api.routes._shared import (
     panel_context,
     redact,
@@ -39,8 +39,8 @@ router = APIRouter()
 
 
 @router.get("/runs/{rid}", response_class=HTMLResponse)
-async def run_page(request: Request, db: Db, rid: str) -> HTMLResponse:
-    ctx = await run_context(db, rid, redactor_=request.app.state.redactor)
+async def run_page(request: Request, db: Db, redactor: RedactorDeps, rid: str) -> HTMLResponse:
+    ctx = await run_context(db, rid, redactor_=redactor)
     run: Run = ctx["run"]  # type: ignore[assignment]
     from girder.api.routes.specs import _estimate_ctx
 
@@ -51,10 +51,12 @@ async def run_page(request: Request, db: Db, rid: str) -> HTMLResponse:
 
 
 @router.get("/runs/{rid}/panel", response_class=HTMLResponse)
-async def run_panel(request: Request, db: Db, rid: str) -> HTMLResponse:
+async def run_panel(
+    request: Request, db: Db, redactor: RedactorDeps, rid: str
+) -> HTMLResponse:
     from girder.api.routes.specs import _estimate_ctx
 
-    base = await run_context(db, rid, redactor_=request.app.state.redactor)
+    base = await run_context(db, rid, redactor_=redactor)
     base.update(_estimate_ctx(request.app, base["run"], base["project"]))  # type: ignore[arg-type]
     return render(request, "_run_panel.html", panel_context(base["run"], base))  # type: ignore[arg-type]
 
@@ -77,10 +79,11 @@ async def run_json(request: Request, db: Db, rid: str) -> JSONResponse:
 
 
 @router.get("/api/runs/{rid}/diffs")
-async def run_diffs(request: Request, db: Db, rid: str) -> JSONResponse:
+async def run_diffs(
+    request: Request, db: Db, redactor: RedactorDeps, rid: str
+) -> JSONResponse:
     """Persisted attempt diffs of a run (§10 diff viewer), re-redacted through
     the same redactor as the live event stream (plan §10)."""
-    redactor: Redactor = request.app.state.redactor
     await require_run(db, rid)
     diffs = await repo.list_attempt_diffs_for_run(db, rid)
     return JSONResponse(
@@ -179,6 +182,7 @@ def _event_class(event_type: str) -> str:
 async def run_events(
     request: Request,
     db: Db,
+    redactor: RedactorDeps,
     rid: str,
     after_id: int = 0,
     poll_s: float = 1.0,
@@ -193,7 +197,6 @@ async def run_events(
     """
     await require_run(db, rid)
     poll = max(poll_s, 0.05)
-    redactor: Redactor = request.app.state.redactor
 
     async def gen() -> AsyncIterator[str]:
         last = after_id

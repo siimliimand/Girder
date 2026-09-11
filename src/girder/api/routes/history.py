@@ -12,7 +12,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from girder.api.app import render
-from girder.api.deps import Db
+from girder.api.deps import Db, RedactorDeps
 from girder.api.routes._shared import (
     excerpt,
     redact,
@@ -60,10 +60,9 @@ async def history_page(request: Request, db: Db) -> HTMLResponse:
 
 
 @router.get("/runs/{rid}/postmortem", response_class=HTMLResponse)
-async def postmortem(request: Request, db: Db, rid: str) -> HTMLResponse:
+async def postmortem(request: Request, db: Db, redactor: RedactorDeps, rid: str) -> HTMLResponse:
     """Historical post-mortem view (WP 6.5). Every dynamic string is re-run
     through the redactor before rendering (plan §10)."""
-    redactor: Redactor = request.app.state.redactor
     run = await require_run(db, rid)
     project = await require_project(db, run.project_id)
     events = await repo.list_events_for_run(db, rid, after_id=0, limit=100000)

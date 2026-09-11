@@ -11,7 +11,8 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from girder.api.app import render
-from girder.api.deps import Db
+from girder.api.deps import Db, SettingsDeps
+from girder.config import Settings
 from girder.api.routes._shared import (
     load_merge_queue,
     merged_rows,
@@ -25,8 +26,9 @@ from girder.db.models import Project
 router = APIRouter()
 
 
-async def _tier_context(db: Database, request: Request, project: Project) -> dict[str, Any]:
-    settings = request.app.state.settings
+async def _tier_context(
+    db: Database, settings: Settings, request: Request, project: Project
+) -> dict[str, Any]:
     queue = [
         q
         for q in await load_merge_queue(db)
@@ -43,19 +45,20 @@ async def _tier_context(db: Database, request: Request, project: Project) -> dic
 
 
 @router.get("/projects/{pid}/tier", response_class=HTMLResponse)
-async def tier_page(request: Request, db: Db, pid: str) -> HTMLResponse:
+async def tier_page(
+    request: Request, db: Db, settings: SettingsDeps, pid: str
+) -> HTMLResponse:
     project = await require_project(db, pid)
-    return render(request, "tier.html", await _tier_context(db, request, project))
+    return render(request, "tier.html", await _tier_context(db, settings, request, project))
 
 
 @router.post("/api/projects/{pid}/tier", response_model=None)
 async def set_tier(
-    request: Request, db: Db, pid: str, tier: str = Form(...)
+    request: Request, db: Db, settings: SettingsDeps, pid: str, tier: str = Form(...)
 ) -> HTMLResponse | RedirectResponse:
     """Autonomy-tier override (plan.md §2.3). Demotion is instant; promotion to
     T2 is gated on the project's clean-merge streak."""
     project = await require_project(db, pid)
-    settings = request.app.state.settings
     try:
         value = int(tier)
     except ValueError:
@@ -64,7 +67,7 @@ async def set_tier(
         return render(
             request,
             "tier.html",
-            {**await _tier_context(db, request, project),
+            {**await _tier_context(db, settings, request, project),
              "error": f"invalid tier {tier!r}: must be 0, 1 or 2."},
             status_code=400,
         )
@@ -76,7 +79,7 @@ async def set_tier(
                 request,
                 "tier.html",
                 {
-                    **await _tier_context(db, request, project),
+                    **await _tier_context(db, settings, request, project),
                     "error": (
                         f"cannot promote to T2: clean merge streak "
                         f"{project.clean_merge_streak} is below the required {required}."

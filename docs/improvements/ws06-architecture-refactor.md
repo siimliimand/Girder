@@ -176,6 +176,7 @@ Annotate the most-called repo functions first; `mypy --strict` surfaces the rema
 
 - **WS-08/WS-09/WS-10** touch the route/template surface — land them before this wave, or rebase their additions into the new module layout.
 - **WS-10's auth middleware** is designed against the post-split layout (`deps.py`), which is why WS-10 follows this workstream.
+- **deps.py adoption landed (2026-09-11):** 9 handlers across 5 route modules (amendments, history, projects, runs, tiers) now source settings/redactor/notifier via the Annotated DI aliases instead of `request.app.state` — zero behavior change. Residual: `steering.py` `github_factory` getattr, a deliberate test seam left as-is.
 
 ### Implementation record (2026-09-10, wave 3 merged out of order)
 
