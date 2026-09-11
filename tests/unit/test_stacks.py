@@ -39,6 +39,23 @@ BUILTINS = ["python-3.12", "node-20", "go-1.23"]
 # ---------------------------------------------------------------- registry
 
 
+def test_symbol_outline_extensions_per_stack() -> None:
+    """WP 11.4: each stack declares which suffixes its outline command handles."""
+    assert STACK_REGISTRY["python-3.12"].symbol_outline_extensions() == (".py",)
+    assert STACK_REGISTRY["node-20"].symbol_outline_extensions() == (
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+    )
+    assert STACK_REGISTRY["go-1.23"].symbol_outline_extensions() == (".go",)
+    for plugin in STACK_REGISTRY.values():
+        for ext in plugin.symbol_outline_extensions():
+            assert ext.startswith(".") and ext == ext.lower()
+
+
 def test_registry_contains_builtins() -> None:
     for name in BUILTINS:
         assert name in STACK_REGISTRY

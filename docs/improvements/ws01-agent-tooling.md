@@ -253,6 +253,7 @@ Review all existing tool descriptions in `TOOL_SCHEMAS` against actual dogfood b
 
 ## Coordination
 
+- **DONE (2026-09-11):** WP 7.4 FAILURES-detail gap closed — `PerTestResult` gained an optional `message` field (first line of the junit `<failure>`/`<error>` message attribute or body, capped at 200 chars, populated by `parse_junit_xml`), and `run_tests` now renders each failure line as `{test_id} — {message}` (bare id when no message).
 - **WS-02** (agent intelligence, wave 2) will hook the tool-execution layer to record `files_read` / `files_written` / `test_results` for the structured scratchpad. Keep the tool dispatch a clean registry (name → handler) and keep `run_tests` output parseable.
 - **WS-07B** (WP 11.4, wave 2) will replace `view_symbol_outline` internals with stack-plugin commands — do **not** change its schema or call signature in this workstream.
 

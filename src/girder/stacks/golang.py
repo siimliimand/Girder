@@ -35,6 +35,9 @@ class GoPlugin(StackPlugin):
     def symbol_outline_command(self, path: str) -> list[str]:
         return ["go", "doc", "-all", path]
 
+    def symbol_outline_extensions(self) -> tuple[str, ...]:
+        return (".go",)
+
     def test_signal_patterns(self) -> list[str]:
         return list(TEST_SIGNAL_PATTERNS)
 

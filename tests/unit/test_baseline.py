@@ -282,6 +282,41 @@ def test_parse_empty_returns_no_testcases() -> None:
     assert parse_junit_xml('<testsuite name="pytest" tests="0"></testsuite>') == {}
 
 
+def test_parse_failure_message_attribute_and_multiline_text() -> None:
+    text = (
+        '<testsuite name="pytest" tests="3">'
+        '<testcase classname="tests.test_a.TestA" name="test_bad" file="tests/test_a.py">'
+        '<failure message="AssertionError: expected 429, got 200">'
+        "E   AssertionError: expected 429, got 200\n"
+        "E   at test_a.py:12\n"
+        "</failure></testcase>"
+        '<testcase classname="tests.test_a.TestA" name="test_err" file="tests/test_a.py">'
+        "<error>boom\nmore</error></testcase>"
+        '<testcase classname="tests.test_a.TestA" name="test_ok" file="tests/test_a.py">'
+        "</testcase></testsuite>"
+    )
+    results = parse_junit_xml(text)
+    bad = results["tests/test_a.py::TestA::test_bad"]
+    err = results["tests/test_a.py::TestA::test_err"]
+    ok = results["tests/test_a.py::TestA::test_ok"]
+    # message attribute wins over body; first line only
+    assert bad.message == "AssertionError: expected 429, got 200"
+    # no message attribute -> stripped first line of the body
+    assert err.message == "boom"
+    assert ok.status == "passed" and ok.message is None
+
+
+def test_parse_failure_message_capped_at_200_chars() -> None:
+    long_msg = "x" * 500
+    text = (
+        '<testsuite name="pytest" tests="1">'
+        '<testcase classname="test_mod" name="t_big" file="t.py">'
+        f'<failure message="{long_msg}">body</failure></testcase></testsuite>'
+    )
+    results = parse_junit_xml(text)
+    assert results["t.py::t_big"].message == "x" * 200
+
+
 # ------------------------------------------------------------------- runner tests
 
 

@@ -55,6 +55,7 @@ class PerTestResult:
     status: str  # "passed" | "failed" | "error" | "skipped"
     rerun_status: str | None = None
     flaky: bool = False
+    message: str | None = None  # first line of the junit <failure>/<error> message/text, if any
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,18 @@ def _testcase_status(tc: ET.Element) -> str:
     return "passed"
 
 
+def _failure_message(child: ET.Element) -> str | None:
+    """First line of a junit <failure>/<error> element, capped at 200 chars.
+
+    Prefers the ``message`` attribute; falls back to the element's stripped
+    text (e.g. gotestsum puts the assertion in the body).
+    """
+    raw = child.get("message") or (child.text or "").strip()
+    if not raw:
+        return None
+    return raw.splitlines()[0].strip()[:200]
+
+
 def parse_junit_xml(text: str) -> dict[str, PerTestResult]:
     """Parse a JUnit XML report into ``{test_id: PerTestResult}``.
 
@@ -117,7 +130,15 @@ def parse_junit_xml(text: str) -> dict[str, PerTestResult]:
             if not name:
                 continue
             test_id = normalize_test_id(tc.get("classname"), name, tc.get("file"))
-            results[test_id] = PerTestResult(test_id=test_id, status=_testcase_status(tc))
+            status = _testcase_status(tc)
+            message = None
+            if status in ("failed", "error"):
+                for child in tc:
+                    tag = child.tag.rsplit("}", 1)[-1]
+                    if tag in ("failure", "error"):
+                        message = _failure_message(child)
+                        break
+            results[test_id] = PerTestResult(test_id=test_id, status=status, message=message)
     return results
 
 
