@@ -49,6 +49,8 @@ Serial total from the original plan is ~12 weeks; the wave structure compresses 
 
 **Status (2026-09-10):** waves 1 and 3 both merged the same day, **wave 3 first** (WS-06 + WS-10 landed out of order — owner-approved; waves 1–2 were then integrated on top of the split layout). Per-workstream status lives in each doc's **Status** field; wave-3 landing details and adaptation notes are in the ws06/ws10 Coordination sections. Wave 2 (WS-02, WS-07B) and WS-11 remain open.
 
+**Status (2026-09-11, full-plan validation + fix pass):** a 6-auditor validation of every workstream against its doc confirmed all waves substantively complete and closed the last gaps: WP 11.4 completed (per-stack outline routing), WP 7.4 FAILURES detail restored (junit messages), `docs/deployment.md` restored (WP 13.1 — the earlier draft was lost to merge churn), deps.py adopted across routes, ≤600-line DoD extended repo-wide (`tools`/`cli`/`delivery` packages split; `run_engine.py` documented exception — see ws06), and the test harness made venv-independent (see Conventions). Remaining open: WS-02 dogfood validation, WS-11 WP 13.4.
+
 ## Migration-number pre-allocation
 
 All migrations live in repo-root `migrations/`; latest is `013`. Numbers are assigned up front so parallel workstreams never collide:

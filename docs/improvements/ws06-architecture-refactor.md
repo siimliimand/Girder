@@ -198,6 +198,17 @@ Five-reviewer re-read of the merged workstreams at HEAD (post wave-1/WS-02 integ
 - Guard-contract test (`tests/unit/test_payloads_and_guards.py`) no longer raises its own RuntimeError — it now drives the real re-fetch guard in `RunEngine._pump_budget_exhausted` and fails if the guard is reverted to an `-O`-strippable assert or removed.
 - `BudgetEventPayload` completed with the gateway audit keys (`model_call_completed`, `budget_tripwire` shapes).
 
+### ≤600-line DoD extended repo-wide (2026-09-11 fix pass)
+
+The full-plan validation found the literal DoD ("any single module ≤ 600 lines") breached by four modules outside the refactor's original scope. PM decision: the limit is now **repo-wide policy**; the four breaches were closed by no-behavior-change splits, with one documented exception:
+
+- `agent/tools.py` (988→ after wave-2 additions ~1020) → `agent/tools/` package (`registry`, `schemas`, `gating`, `snippets`; import + monkeypatch surface preserved).
+- `cli.py` (946) → `cli/` package (`engine`, `ops`, `prune`, `validate`, `_common`; `girder.cli:main` entry point and every patch target — `load_settings`/`load_secrets`/`_open_db` — preserved via call-time package-namespace indirection; `--help` output byte-identical).
+- `github/delivery.py` (778) → `github/delivery/` package (`engine` + `suite`/`postmerge` mixins; `DeliveryEngine` lazy-import in run_engine preserved).
+- **Documented exception:** `orchestrator/run_engine.py` (886) intentionally NOT split — the abort-race machinery (`_run_attempt_with_abort_watch`, `_Inflight`, exactly-once abort semantics) is the most regression-sensitive code in the orchestrator and is stable; split is scheduled for its next functional touch, not as churn.
+
+Also landed in the same pass: `run_tests` FAILURES detail (junit messages rendered, WP 7.4), WP 11.4 completed (extensions-based per-stack outline routing), deps.py adoption (above), and a venv-independent test harness (e2e no longer silently skips without a global `python`/`pytest` on PATH).
+
 ## Relevant resolution log decision
 
 - **R-SP10-1:** `repo.py` split via re-export `__init__.py` — zero call-site changes; backward-compatible migration.
